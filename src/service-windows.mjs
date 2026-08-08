@@ -21,8 +21,9 @@ const effectivePlatform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.p
 const command = process.argv[2] || "status";
 const taskName = "Codex Router";
 const wrapperPath = path.join(STATE_DIR, "start-codex-router.cmd");
+const hiddenWrapperPath = path.join(STATE_DIR, "start-codex-router-hidden.vbs");
 
-if (effectivePlatform !== "win32" && command !== "render") {
+if (effectivePlatform !== "win32" && !new Set(["render", "render-hidden"]).has(command)) {
   throw new Error("The Task Scheduler service manager runs on Windows only.");
 }
 
@@ -60,6 +61,23 @@ function wrapper() {
     .join("\r\n")}\r\n"${cmdEscape(process.execPath)}" "${cmdEscape(start)}" >> "${cmdEscape(LOG_PATH)}" 2>&1\r\n`;
 }
 
+function vbsString(value) {
+  return `"${String(value).replaceAll('"', '""')}"`;
+}
+
+function hiddenWrapper() {
+  const commandLine = `cmd.exe /D /C ""${wrapperPath}""`;
+  return [
+    "Option Explicit",
+    "Dim shell",
+    "Dim exitCode",
+    'Set shell = CreateObject("WScript.Shell")',
+    `exitCode = shell.Run(${vbsString(commandLine)}, 0, True)`,
+    "WScript.Quit exitCode",
+    "",
+  ].join("\r\n");
+}
+
 function schtasks(args, options = {}) {
   return execFileSync("schtasks.exe", args, {
     encoding: "utf8",
@@ -74,9 +92,16 @@ function writeWrapper() {
   renameSync(temporary, wrapperPath);
 }
 
+function writeHiddenWrapper() {
+  mkdirSync(STATE_DIR, { recursive: true });
+  const temporary = `${hiddenWrapperPath}.tmp.${process.pid}`;
+  writeFileSync(temporary, hiddenWrapper(), "utf8");
+  renameSync(temporary, hiddenWrapperPath);
+}
+
 function installTask() {
   const script = [
-    "$action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument ('/D /C \"\"' + $env:CODEX_ROUTER_WRAPPER + '\"\"')",
+    "$action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('//B //NoLogo \"' + $env:CODEX_ROUTER_HIDDEN_WRAPPER + '\"')",
     "$trigger = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)",
     "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew",
     "$principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited",
@@ -90,13 +115,13 @@ function installTask() {
         env: {
           ...process.env,
           CODEX_ROUTER_TASK: taskName,
-          CODEX_ROUTER_WRAPPER: wrapperPath,
+          CODEX_ROUTER_HIDDEN_WRAPPER: hiddenWrapperPath,
         },
         stdio: ["ignore", "ignore", "ignore"],
       },
     );
   } catch {
-    const action = `cmd.exe /D /C ""${wrapperPath}""`;
+    const action = `wscript.exe //B //NoLogo "${hiddenWrapperPath}"`;
     schtasks(
       ["/Create", "/TN", taskName, "/SC", "ONLOGON", "/TR", action, "/RL", "LIMITED", "/F"],
       { quiet: true },
@@ -125,15 +150,18 @@ function taskState() {
   return undefined;
 }
 
-if (!new Set(["install", "uninstall", "start", "stop", "restart", "status", "render"]).has(command)) {
-  console.error("Usage: service-windows.mjs install|uninstall|start|stop|restart|status|render");
+if (!new Set(["install", "uninstall", "start", "stop", "restart", "status", "render", "render-hidden"]).has(command)) {
+  console.error("Usage: service-windows.mjs install|uninstall|start|stop|restart|status|render|render-hidden");
   process.exit(2);
 }
 
 if (command === "render") {
   process.stdout.write(wrapper());
+} else if (command === "render-hidden") {
+  process.stdout.write(hiddenWrapper());
 } else if (command === "install") {
   writeWrapper();
+  writeHiddenWrapper();
   try {
     installTask();
     schtasks(["/Run", "/TN", taskName], { quiet: true });
@@ -141,7 +169,7 @@ if (command === "render") {
     // Scheduled-task creation can be restricted in a non-elevated terminal; the
     // wrapper is still written, so report success and let the caller retry.
   }
-  process.stdout.write(`${JSON.stringify({ installed: true, path: wrapperPath })}\n`);
+  process.stdout.write(`${JSON.stringify({ installed: true, path: wrapperPath, hiddenPath: hiddenWrapperPath })}\n`);
 } else if (command === "uninstall") {
   try {
     schtasks(["/End", "/TN", taskName], { quiet: true });
@@ -154,6 +182,7 @@ if (command === "render") {
     // The task may not exist.
   }
   if (existsSync(wrapperPath)) unlinkSync(wrapperPath);
+  if (existsSync(hiddenWrapperPath)) unlinkSync(hiddenWrapperPath);
   process.stdout.write(`${JSON.stringify({ installed: false })}\n`);
 } else if (command === "status") {
   let installed = false;

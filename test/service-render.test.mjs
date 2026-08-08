@@ -8,9 +8,9 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-function render(script, platform, testRoot, target = "codex", sourceRoot = root) {
+function render(script, platform, testRoot, target = "codex", sourceRoot = root, command = "render") {
   const nodeArgs = sourceRoot === root ? [] : ["--preserve-symlinks", "--preserve-symlinks-main"];
-  return execFileSync(process.execPath, [...nodeArgs, path.join(sourceRoot, "src", script), "render"], {
+  return execFileSync(process.execPath, [...nodeArgs, path.join(sourceRoot, "src", script), command], {
     cwd: sourceRoot,
     encoding: "utf8",
     env: {
@@ -45,6 +45,12 @@ test("background service definitions render for macOS, Linux, and Windows", () =
     // console code page is not UTF-8 (see service-windows.mjs).
     assert.match(windows, /set "PYTHONIOENCODING=utf-8"/);
     assert.match(windows, /set "PYTHONUTF8=1"/);
+
+    const hiddenWindows = render("service-windows.mjs", "win32", testRoot, "codex", root, "render-hidden");
+    assert.match(hiddenWindows, /WScript\.Shell/);
+    assert.match(hiddenWindows, /Run\(/);
+    assert.match(hiddenWindows, /, 0, True\)/);
+    assert.match(hiddenWindows, /start-codex-router\.cmd/);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }
