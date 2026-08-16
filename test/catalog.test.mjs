@@ -1,16 +1,27 @@
 import assert from "node:assert/strict";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
   AUTO_ANNOUNCE_WINDOW_MS,
   annotateNewModelAnnouncements,
-  applyAllMultiAgent,
   buildMergedCatalog,
   buildLoginFreeCatalog,
   clampModelEfforts,
   codexEffortVocabulary,
   nativeCatalogIsReusable,
+  deriveBaseInstructions,
+  mergeNativeCatalogs,
+  mergeNativeModel,
   promoteNativeMultiAgent,
+  routedCatalogConfigured,
   routedModel,
 } from "../src/catalog.mjs";
 
@@ -30,6 +41,7 @@ const template = {
     },
   },
   apply_patch_tool_type: "freeform",
+  default_service_tier: "priority",
 };
 
 const grok = {
@@ -45,6 +57,88 @@ const grok = {
   compHash: "grok-oauth-grok-4-5-v1",
   multiAgentVersion: "v2",
 };
+
+test("routed catalog is exposed only when the active provider reaches the router", () => {
+  // An absent base URL is the first-install case: setup has not written the
+  // caller capability yet, but the catalog still needs to be buildable.
+  assert.equal(routedCatalogConfigured(""), true);
+  assert.equal(routedCatalogConfigured('model_provider = "openai"\n'), true);
+  assert.equal(
+    routedCatalogConfigured('openai_base_url = "https://foreign.invalid/v1"\n'),
+    false,
+  );
+  assert.equal(
+    routedCatalogConfigured(`model_provider = "openai"
+openai_base_url = "https://foreign.invalid/v1"
+`),
+    false,
+  );
+  assert.equal(
+    routedCatalogConfigured(`model_provider = "openai"
+openai_base_url = "http://127.0.0.1:4102/_codex-router/test-caller-secret-with-sufficient-length/v1"
+`),
+    true,
+  );
+  assert.equal(
+    routedCatalogConfigured(`model_provider = "openai"
+note = """
+[fake.table]
+"""
+openai_base_url = "https://foreign.invalid/v1"
+`),
+    false,
+  );
+  assert.equal(
+    routedCatalogConfigured(`model_provider = "openai"
+note = '''
+[fake.table]
+'''
+openai_base_url = "https://foreign.invalid/v1"
+`),
+    false,
+  );
+  assert.equal(routedCatalogConfigured('model_provider = "custom"\n'), false);
+  assert.equal(
+    routedCatalogConfigured(`model_provider = "custom"
+
+[model_providers.custom]
+base_url = "http://127.0.0.1:4102/_codex-router/test-caller-secret-with-sufficient-length/v1"
+wire_api = "responses"
+`),
+    true,
+  );
+  assert.equal(
+    routedCatalogConfigured(`model_provider = "custom"
+note = """
+[model_providers.custom]
+base_url = "http://127.0.0.1:4102/_codex-router/test-caller-secret-with-sufficient-length/v1"
+"""
+
+[model_providers.custom]
+base_url = "https://foreign.invalid/v1"
+wire_api = "responses"
+`),
+    false,
+  );
+  assert.equal(
+    routedCatalogConfigured(`model_provider = "custom]id"
+
+[model_providers."custom]id"]
+base_url = "http://127.0.0.1:4102/_codex-router/test-caller-secret-with-sufficient-length/v1"
+wire_api = "responses"
+`),
+    true,
+  );
+  assert.equal(
+    routedCatalogConfigured(`model_provider = "openai"
+note = """
+[fake.table]
+`),
+    false,
+  );
+  assert.equal(routedCatalogConfigured('model_provider = "custom"\n', "1"), true);
+  assert.equal(routedCatalogConfigured('model_provider = "custom"\n', "0"), false);
+});
 
 test("routed models rewrite GPT identity text to the external model name", () => {
   const model = routedModel(template, grok);
@@ -79,6 +173,16 @@ test("routed models advertise reasoning summaries only when the registry opts in
   assert.equal(summarized.default_reasoning_summary, "auto");
 });
 
+test("ClinePass routed models omit the unsupported reasoning-effort selector", () => {
+  const clinepass = routedModel(template, { ...grok, requestProfile: "clinepass" });
+  assert.equal("default_reasoning_level" in clinepass, false);
+  assert.equal("supported_reasoning_levels" in clinepass, false);
+
+  const normal = routedModel(template, grok);
+  assert.equal(normal.default_reasoning_level, "high");
+  assert.deepEqual(normal.supported_reasoning_levels, grok.reasoningLevels);
+});
+
 test("routed models advertise search and image detail only when the registry opts in", () => {
   // Defaults stay off: external models must not claim capabilities untested.
   const plain = routedModel(template, grok);
@@ -91,6 +195,42 @@ test("routed models advertise search and image detail only when the registry opt
   });
   assert.equal(capable.supports_search_tool, true);
   assert.equal(capable.supports_image_detail_original, true);
+  const standalone = routedModel(template, {
+    ...grok,
+    searchTool: { mode: "standalone" },
+  });
+  assert.equal(standalone.supports_search_tool, true);
+});
+
+test("routed models can explicitly narrow inherited tool capabilities", () => {
+  const plain = routedModel(template, grok);
+  assert.equal("supports_parallel_tool_calls" in plain, false);
+  assert.equal("experimental_supported_tools" in plain, false);
+
+  const narrowed = routedModel(template, {
+    ...grok,
+    supportsParallelToolCalls: false,
+    experimentalSupportedTools: [],
+  });
+  assert.equal(narrowed.supports_parallel_tool_calls, false);
+  assert.deepEqual(narrowed.experimental_supported_tools, []);
+});
+
+test("routed service tiers are explicit and never inherit a paid default", () => {
+  const plain = routedModel(template, grok);
+  assert.deepEqual(plain.service_tiers, []);
+  assert.equal(plain.default_service_tier, null);
+
+  const tiered = routedModel(template, {
+    ...grok,
+    serviceTiers: [
+      { id: " priority ", name: " Fast ", description: " Guaranteed throughput. " },
+    ],
+  });
+  assert.deepEqual(tiered.service_tiers, [
+    { id: "priority", name: "Fast", description: "Guaranteed throughput." },
+  ]);
+  assert.equal(tiered.default_service_tier, null);
 });
 
 test("routed models inherit apply_patch unless the registry opts out", () => {
@@ -184,19 +324,6 @@ test("unverified routed models retain conservative v1 collaboration", () => {
   assert.equal(model.multi_agent_version, "v1");
 });
 
-test("all-models multi-agent mode promotes every selected model to v2", () => {
-  const models = [
-    { slug: "opencode-go/deepseek-v4-flash" },
-    { slug: "qwen-plan/qwen3.8-max", multiAgentVersion: "v1" },
-  ];
-  const promoted = applyAllMultiAgent(models, true);
-  assert.deepEqual(
-    promoted.map((model) => model.multiAgentVersion),
-    ["v2", "v2"],
-  );
-  assert.equal(applyAllMultiAgent(models, false), models);
-});
-
 test("merged catalog preserves native GPT identity while rewriting routed models", () => {
   const merged = buildMergedCatalog({ models: [template] }, [grok]);
   const bySlug = new Map(merged.map((model) => [model.slug, model]));
@@ -273,6 +400,88 @@ test("login-free catalog keeps overflow models visible under their own slugs", (
   const bySlug = new Map(models.map((model) => [model.slug, model]));
   assert.equal(bySlug.get("kimi-oauth/kimi-for-coding").visibility, "list");
   assert.equal(bySlug.get("grok-oauth/grok-4.5").visibility, "hide");
+});
+
+function withCredentialEnvironment(kimiHome, run) {
+  const previousKimi = process.env.KIMI_CODE_HOME;
+  const previousGrok = process.env.GROK_AUTH_PATH;
+  const dir = mkdtempSync(path.join(os.tmpdir(), "catalog-login-free-"));
+  if (kimiHome === "unconfigured") {
+    process.env.KIMI_CODE_HOME = path.join(dir, "kimi-home");
+  } else {
+    const credentialsDir = path.join(dir, "kimi-home", "credentials");
+    mkdirSync(credentialsDir, { recursive: true });
+    writeFileSync(
+      path.join(credentialsDir, "kimi-code.json"),
+      JSON.stringify({
+        access_token: "access-value",
+        refresh_token: "refresh-value",
+        expires_at: Math.floor(Date.now() / 1000) + 3600,
+        scope: "kimi-code",
+      }),
+      { mode: 0o600 },
+    );
+    process.env.KIMI_CODE_HOME = path.join(dir, "kimi-home");
+  }
+  process.env.GROK_AUTH_PATH = path.join(dir, "grok", "auth.json");
+  try {
+    return run();
+  } finally {
+    if (previousKimi === undefined) delete process.env.KIMI_CODE_HOME;
+    else process.env.KIMI_CODE_HOME = previousKimi;
+    if (previousGrok === undefined) delete process.env.GROK_AUTH_PATH;
+    else process.env.GROK_AUTH_PATH = previousGrok;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("login-free catalog does not assign slots to unauthenticated providers", () => {
+  const kimi = {
+    ...grok,
+    slug: "kimi-oauth/k3",
+    provider: "kimi-oauth",
+    displayName: "Kimi K3 (OAuth)",
+    priority: 2,
+    compHash: "kimi-oauth-k3-v1",
+  };
+  withCredentialEnvironment("unconfigured", () => {
+    // The credential file does not exist under this KIMI_CODE_HOME, so
+    // kimi-oauth is not configured; its model must not take a slot.
+    const { models, aliases } = buildLoginFreeCatalog(
+      { models: [template] },
+      [kimi],
+    );
+    assert.deepEqual(aliases, {});
+    assert.deepEqual(models, []);
+  });
+});
+
+test("login-free catalog assigns slots to models of credentialed providers", () => {
+  const kimi = {
+    ...grok,
+    slug: "kimi-oauth/k3",
+    provider: "kimi-oauth",
+    displayName: "Kimi K3 (OAuth)",
+    priority: 2,
+    compHash: "kimi-oauth-k3-v1",
+  };
+  const unauthenticatedGrok = {
+    ...grok,
+    provider: "grok-oauth",
+  };
+  withCredentialEnvironment("configured", () => {
+    // kimi-oauth has a live credential, grok-oauth does not: only the kimi
+    // model may take the whitelist slot.
+    const { models, aliases } = buildLoginFreeCatalog(
+      { models: [template] },
+      [kimi, unauthenticatedGrok],
+    );
+    assert.deepEqual(aliases, { "gpt-5.5": "kimi-oauth/k3" });
+    const bySlug = new Map(models.map((model) => [model.slug, model]));
+    assert.equal(bySlug.get("gpt-5.5").display_name, "Kimi K3 (OAuth)");
+    assert.equal(bySlug.get("gpt-5.5").visibility, "list");
+    assert.equal(bySlug.get("kimi-oauth/k3").visibility, "hide");
+  });
 });
 
 test("effort vocabulary follows the installed codex build's enum history", () => {
@@ -352,10 +561,23 @@ test("models stay untouched when the installed build understands their efforts",
 });
 
 test("native catalog cache is reusable only for the codex build that captured it", () => {
-  const captured = { captured_with: "codex-cli 0.142.5", models: [template] };
+  const captured = {
+    captured_with: "codex-cli 0.142.5",
+    native_source_fingerprint: "account-a",
+    models: [template],
+  };
 
   assert.equal(nativeCatalogIsReusable(captured, "codex-cli 0.142.5"), true);
   assert.equal(nativeCatalogIsReusable(captured, "codex-cli 0.146.1"), false);
+  // Account catalogs change independently of the binary version.
+  assert.equal(
+    nativeCatalogIsReusable(captured, "codex-cli 0.142.5", "account-b"),
+    false,
+  );
+  assert.equal(
+    nativeCatalogIsReusable(captured, "codex-cli 0.142.5", "account-a"),
+    true,
+  );
   // Unknown current version: no binary to re-ask, so keep what we have.
   assert.equal(nativeCatalogIsReusable(captured, undefined), true);
   // Un-stamped caches predate version tracking; re-capture when we can ask.
@@ -364,6 +586,213 @@ test("native catalog cache is reusable only for the codex build that captured it
   // Invalid or empty caches are never reusable.
   assert.equal(nativeCatalogIsReusable(undefined, undefined), false);
   assert.equal(nativeCatalogIsReusable({ models: [] }, "codex-cli 0.146.1"), false);
+});
+
+test("native catalog merge preserves account visibility and bundled-only models", () => {
+  const accountMini = {
+    slug: "gpt-mini",
+    visibility: "list",
+    source: "account",
+    model_messages: { instructions_template: "account instructions" },
+  };
+  const merged = mergeNativeCatalogs(
+    {
+      models: [
+        accountMini,
+        {
+          slug: "gpt-spark",
+          visibility: "list",
+          model_messages: { instructions_template: "spark instructions" },
+        },
+      ],
+    },
+    {
+      models: [
+        {
+          slug: "gpt-mini",
+          visibility: "hide",
+          source: "bundled",
+          base_instructions: "bundled instructions",
+        },
+        { slug: "gpt-bundled-only", visibility: "list" },
+      ],
+    },
+  );
+  assert.deepEqual(merged.models, [
+    {
+      ...accountMini,
+      base_instructions: "bundled instructions",
+    },
+    {
+      slug: "gpt-spark",
+      visibility: "list",
+      model_messages: { instructions_template: "spark instructions" },
+      base_instructions: "spark instructions",
+    },
+    { slug: "gpt-bundled-only", visibility: "list" },
+  ]);
+});
+
+test("native catalog merge never loses non-empty bundled metadata", () => {
+  const merged = mergeNativeModel(
+    {
+      slug: "gpt-5.6-luna",
+      additional_speed_tiers: [],
+      service_tiers: [],
+      input_modalities: [],
+      experimental_supported_tools: [],
+      include_apps_usage_instructions: undefined,
+      model_messages: {},
+    },
+    {
+      slug: "gpt-5.6-luna",
+      additional_speed_tiers: ["fast"],
+      service_tiers: [
+        { id: "priority", name: "Fast", description: "1.5x speed" },
+      ],
+      input_modalities: ["text", "image"],
+      experimental_supported_tools: ["web_search"],
+      include_apps_usage_instructions: true,
+      model_messages: { instructions_template: "bundled instructions" },
+    },
+  );
+  assert.deepEqual(merged.additional_speed_tiers, ["fast"]);
+  assert.deepEqual(merged.service_tiers, [
+    { id: "priority", name: "Fast", description: "1.5x speed" },
+  ]);
+  assert.deepEqual(merged.input_modalities, ["text", "image"]);
+  assert.deepEqual(merged.experimental_supported_tools, ["web_search"]);
+  assert.equal(merged.include_apps_usage_instructions, true);
+  assert.deepEqual(merged.model_messages, {
+    instructions_template: "bundled instructions",
+  });
+  assert.equal(
+    mergeNativeModel(
+      { slug: "gpt-5.6-luna", visibility: "list" },
+      { slug: "gpt-5.6-luna", visibility: "hide" },
+    ).visibility,
+    "list",
+  );
+});
+
+test("bundled backfill is an allowlist, not every empty account field", () => {
+  const merged = mergeNativeModel(
+    {
+      slug: "gpt-5.6-luna",
+      // An account that lost its effort ladder is expressing exactly that;
+      // resurrecting bundled's ladder would offer efforts it cannot spend.
+      supported_reasoning_levels: [],
+      // Unknown fields never backfill: the allowlist is the whole contract,
+      // so a future schema field starts account-authoritative by default.
+      some_future_field: "",
+      // Empty on both sides stays empty rather than inventing a value.
+      additional_speed_tiers: [],
+    },
+    {
+      slug: "gpt-5.6-luna",
+      supported_reasoning_levels: ["low", "high"],
+      some_future_field: "bundled-value",
+      additional_speed_tiers: [],
+    },
+  );
+  assert.deepEqual(merged.supported_reasoning_levels, []);
+  assert.equal(merged.some_future_field, "");
+  assert.deepEqual(merged.additional_speed_tiers, []);
+});
+
+test("account-only models satisfy the strict custom-catalog instruction schema", () => {
+  const [spark] = mergeNativeCatalogs(
+    {
+      models: [
+        {
+          slug: "gpt-spark",
+          visibility: "list",
+          model_messages: { instructions_template: "spark instructions" },
+        },
+      ],
+    },
+    { models: [{ slug: "other", base_instructions: "other instructions" }] },
+  ).models;
+  assert.equal(spark.base_instructions, "spark instructions");
+});
+
+// The bundled catalog's base_instructions equals the account template with
+// `{{ personality }}` replaced by `instructions_variables.personality_default`
+// (verified against codex-cli for gpt-5.4, gpt-5.4-mini, and gpt-5.5).
+// Account-only models must get the same treatment: the literal placeholder
+// must never reach a system prompt.
+test("derived base_instructions substitutes template variable defaults", () => {
+  assert.equal(
+    deriveBaseInstructions({
+      instructions_template: "You are Codex.\n{{ personality }}\nBe fast.",
+      instructions_variables: {
+        personality_default: "# Personality\nStay neutral.",
+        personality_friendly: "# Personality\nBe warm.",
+      },
+    }),
+    "You are Codex.\n# Personality\nStay neutral.\nBe fast.",
+  );
+  // No default for the placeholder: strip it rather than leaking the token.
+  assert.equal(
+    deriveBaseInstructions({
+      instructions_template: "Intro {{ tone }} outro.",
+      instructions_variables: {},
+    }),
+    "Intro  outro.",
+  );
+  assert.equal(
+    deriveBaseInstructions({ instructions_template: "plain" }),
+    "plain",
+  );
+  assert.equal(deriveBaseInstructions(undefined), undefined);
+});
+
+test("no template placeholder survives into any merged base_instructions", () => {
+  const merged = mergeNativeCatalogs(
+    {
+      models: [
+        {
+          slug: "gpt-spark",
+          model_messages: {
+            instructions_template: "Spark. {{ personality }} End.",
+            instructions_variables: { personality_default: "Calm." },
+          },
+        },
+        {
+          slug: "gpt-undefaulted",
+          model_messages: {
+            instructions_template: "Head {{ mystery }} tail.",
+            instructions_variables: {
+              // A default may itself carry a placeholder; it must be stripped,
+              // not substituted recursively.
+              mystery_default: "nested {{ personality }} token",
+            },
+          },
+        },
+      ],
+    },
+    undefined,
+  );
+  for (const model of merged.models) {
+    assert.equal(typeof model.base_instructions, "string");
+    assert.doesNotMatch(model.base_instructions, /\{\{[\s\S]*?\}\}/);
+  }
+  assert.equal(merged.models[0].base_instructions, "Spark. Calm. End.");
+});
+
+test("duplicate account slugs collapse to the first occurrence", () => {
+  const merged = mergeNativeCatalogs(
+    {
+      models: [
+        { slug: "gpt-dupe", visibility: "list", base_instructions: "first" },
+        { slug: "gpt-dupe", visibility: "hide", base_instructions: "second" },
+      ],
+    },
+    { models: [{ slug: "gpt-dupe", base_instructions: "bundled" }] },
+  );
+  assert.equal(merged.models.length, 1);
+  assert.equal(merged.models[0].base_instructions, "first");
+  assert.equal(merged.models[0].visibility, "list");
 });
 
 test("native listed models follow the local subagent opt-in", () => {
@@ -412,14 +841,80 @@ test("selected subagent mode only promotes the chosen native models", () => {
   assert.equal(promoted[1].multi_agent_version, "v1");
 });
 
-test("proven subagent mode leaves the native catalog untouched", () => {
-  const native = [{ slug: "gpt-5.6-luna", visibility: "list", multi_agent_version: "v1" }];
+test("proven subagent mode still promotes upstream-verified v2-backend slugs", () => {
+  // gpt-5.6-luna is shipped as v1 by upstream but runs on the v2 backend, so
+  // it must be promoted even in the conservative proven mode; an unverified
+  // native slug keeps its upstream value.
+  const native = [
+    { slug: "gpt-5.6-luna", visibility: "list", multi_agent_version: "v1" },
+    { slug: "gpt-5.4", visibility: "list", multi_agent_version: "v1" },
+  ];
   const promoted = promoteNativeMultiAgent(native, {
     mode: "proven",
     enabled: [],
     disabled: [],
   });
-  assert.deepEqual(promoted, native);
+  assert.equal(promoted[0].multi_agent_version, "v2");
+  assert.equal(promoted[1].multi_agent_version, "v1");
+});
+
+test("an upstream-verified slug still honours disabled and picker-hidden", () => {
+  const native = [{ slug: "gpt-5.6-luna", visibility: "list", multi_agent_version: "v1" }];
+  const promoted = promoteNativeMultiAgent(
+    native,
+    { mode: "proven", enabled: [], disabled: ["gpt-5.6-luna"] },
+  );
+  assert.equal(promoted[0].multi_agent_version, "v1");
+  const hidden = promoteNativeMultiAgent(
+    native,
+    { mode: "proven", enabled: [], disabled: [] },
+    new Set(["gpt-5.6-luna"]),
+  );
+  assert.equal(hidden[0].multi_agent_version, "v1");
+});
+
+test("a ChatGPT-plan model drives the same advertisement as a routed engine", async () => {
+  const { applyVisionBridge, nativeVisionCandidates, resolveVisionEngine } = await import(
+    "../src/vision-bridge.mjs"
+  );
+  const deepseek = {
+    ...grok,
+    slug: "deepseek/deepseek-v4-flash",
+    displayName: "DeepSeek V4 Flash",
+    gatewayModel: "deepseek-v4-flash",
+    inputModalities: ["text"],
+    compHash: "deepseek-v4-flash-native-bridge-v1",
+  };
+  // The native capture is snake_case, the registry is camelCase, and both have
+  // to reach the same advertisement rule.
+  const capture = [
+    {
+      slug: "gpt-5.6-luna",
+      display_name: "GPT-5.6-Luna",
+      visibility: "list",
+      priority: 3,
+      input_modalities: ["text", "image"],
+    },
+  ];
+
+  const engine = resolveVisionEngine(() => nativeVisionCandidates(capture), {
+    enabled: true,
+    engine: "gpt-5.6-luna",
+  });
+  const [bridged] = applyVisionBridge([deepseek], engine);
+  assert.deepEqual(routedModel(template, bridged).input_modalities, ["text", "image"]);
+
+  // A model the operator took out of the picker is not theirs to spend, so it
+  // cannot resolve, and the advertisement goes with it.
+  const hidden = resolveVisionEngine(
+    () => nativeVisionCandidates(capture, new Set(["gpt-5.6-luna"])),
+    { enabled: true, engine: "gpt-5.6-luna" },
+  );
+  assert.equal(hidden, undefined);
+  assert.deepEqual(
+    routedModel(template, applyVisionBridge([deepseek], hidden)[0]).input_modalities,
+    ["text"],
+  );
 });
 
 test("a bridged text-only model advertises image input, and only through the bridge", async () => {

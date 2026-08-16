@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { PROVIDERS } from "./model-registry.mjs";
+import { PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
 import { cliSessionDescriptor } from "./cli-session-credential.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
@@ -17,6 +17,7 @@ import {
   refreshTargetPickerIfInstalled,
   targetCli,
   targetPickerName,
+  targetRestartHint,
 } from "./target-integration.mjs";
 
 // One entry per OAuth vendor keeps adding a provider a registry-plus-map
@@ -30,7 +31,9 @@ function configured(provider) {
   if (provider.kind === "oauth") {
     return Boolean(SIGN_IN_STATUS[provider.id]?.status().configured);
   }
-  return credentialStatus(provider, { persistent: true }).configured;
+  return providerNeedsNoKey(provider)
+    ? true
+    : credentialStatus(provider, { persistent: true }).configured;
 }
 
 function list() {
@@ -91,7 +94,7 @@ function main() {
     ? `is enabled, but ships no preselected models so the ${targetPickerName()} model picker stays empty`
     : `is now ${command === "enable" ? "shown" : "hidden"} in the ${targetPickerName()} model picker`;
   process.stdout.write(
-    `${provider.displayName} ${visibility}. Enabled providers: ${providers.join(", ") || "none"}.${refreshed ? ` Fully quit and reopen ${targetPickerName()}.` : ""}\n`,
+    `${provider.displayName} ${visibility}. Enabled providers: ${providers.join(", ") || "none"}.${refreshed ? ` ${targetRestartHint()}` : ""}\n`,
   );
   if (command === "enable" && provider.planNote) {
     process.stdout.write(`${provider.planNote}\n`);

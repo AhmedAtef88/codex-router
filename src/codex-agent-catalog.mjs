@@ -1,8 +1,10 @@
 import {
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
@@ -24,6 +26,26 @@ function tomlString(value) {
   return JSON.stringify(String(value));
 }
 
+// Only files matching this belong to the sync. Everything else in the agents
+// directory is the user's own and is never read or removed here.
+const MANAGED_AGENT_FILE = /^router-model-[a-z0-9-]+\.toml$/;
+
+function managedAgentFiles(agentsDir) {
+  try {
+    return readdirSync(agentsDir).filter((entry) => MANAGED_AGENT_FILE.test(entry));
+  } catch {
+    return [];
+  }
+}
+
+function writeManagedAgent(target, contents) {
+  const temporary = `${target}.tmp.${process.pid}`;
+  writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
+  protectPrivateFile(temporary);
+  renameSync(temporary, target);
+  protectPrivateFile(target);
+}
+
 export function routedAgentDefinition(model) {
   const slug = String(model?.slug || "").trim();
   if (!slug || !slug.includes("/")) {
@@ -42,6 +64,9 @@ export function routedAgentDefinition(model) {
     'developer_instructions = """',
     "Complete the bounded task assigned by the parent agent.",
     "Respect repository instructions, keep changes surgical, and run relevant verification.",
+    "For inspection or review claims, cite the exact file and line. Before claiming that something is absent, search the relevant names and paths; before finishing, reopen every cited location and drop any claim that does not hold.",
+    "Use only tool names, agent types, and model overrides offered by the current tool schema. Never invent or reuse a stale name; omit an optional override when no offered value fits.",
+    "Do not stop after merely announcing a next action. Execute it when it is within scope, or report the exact blocker or decision needed.",
     "Return a concise summary of work completed, checks run, and remaining risks.",
     '"""',
     "",
@@ -49,20 +74,65 @@ export function routedAgentDefinition(model) {
   return { agentName, fileName: `${fileStem}.toml`, contents };
 }
 
+// Writes one definition per model, and removes the definitions of models that
+// are no longer passed in. Codex offers every file in the agents directory by
+// name, so a definition left behind keeps a model spawnable through
+// `agent_type` after the settings stopped allowing it.
 export function syncRoutedCodexAgents(models, agentsDir = CODEX_AGENTS_DIR) {
   mkdirSync(agentsDir, { recursive: true, mode: 0o700 });
+  const previous = new Map(
+    managedAgentFiles(agentsDir).map((entry) => [
+      entry,
+      readFileSync(path.join(agentsDir, entry), "utf8"),
+    ]),
+  );
   const written = [];
-  for (const model of models) {
-    const definition = routedAgentDefinition(model);
-    const target = path.join(agentsDir, definition.fileName);
-    const temporary = `${target}.tmp.${process.pid}`;
-    writeFileSync(temporary, definition.contents, { encoding: "utf8", mode: 0o600 });
-    protectPrivateFile(temporary);
-    renameSync(temporary, target);
-    protectPrivateFile(target);
-    written.push({ model: model.slug, agent: definition.agentName, path: target });
+  const keep = new Set();
+  try {
+    for (const model of models) {
+      const definition = routedAgentDefinition(model);
+      const target = path.join(agentsDir, definition.fileName);
+      writeManagedAgent(target, definition.contents);
+      keep.add(definition.fileName);
+      written.push({ model: model.slug, agent: definition.agentName, path: target });
+    }
+    const removed = [];
+    for (const entry of managedAgentFiles(agentsDir)) {
+      if (keep.has(entry)) continue;
+      try {
+        unlinkSync(path.join(agentsDir, entry));
+        removed.push(entry);
+      } catch {
+        // A definition that cannot be removed is reported by the doctor check
+        // rather than failing the catalog write.
+      }
+    }
+    return { written, removed };
+  } catch (error) {
+    const restoreErrors = [];
+    for (const entry of managedAgentFiles(agentsDir)) {
+      if (previous.has(entry)) continue;
+      try {
+        unlinkSync(path.join(agentsDir, entry));
+      } catch (restoreError) {
+        restoreErrors.push(restoreError);
+      }
+    }
+    for (const [entry, contents] of previous) {
+      try {
+        writeManagedAgent(path.join(agentsDir, entry), contents);
+      } catch (restoreError) {
+        restoreErrors.push(restoreError);
+      }
+    }
+    if (restoreErrors.length) {
+      throw new AggregateError(
+        [error, ...restoreErrors],
+        "Routed agent catalog update failed and its previous files could not be restored.",
+      );
+    }
+    throw error;
   }
-  return written;
 }
 
 export function routedCodexAgentStatus(models, agentsDir = CODEX_AGENTS_DIR) {
@@ -72,10 +142,13 @@ export function routedCodexAgentStatus(models, agentsDir = CODEX_AGENTS_DIR) {
     missing: [],
     stale: [],
     unprotected: [],
+    extra: [],
   };
+  const expectedFiles = new Set();
   for (const model of models) {
     const definition = routedAgentDefinition(model);
     const target = path.join(agentsDir, definition.fileName);
+    expectedFiles.add(definition.fileName);
     if (!existsSync(target)) {
       status.missing.push(model.slug);
       continue;
@@ -97,8 +170,16 @@ export function routedCodexAgentStatus(models, agentsDir = CODEX_AGENTS_DIR) {
     }
     status.current += 1;
   }
+  status.extra = managedAgentFiles(agentsDir).filter((entry) => !expectedFiles.has(entry));
   return {
     ...status,
-    ok: status.expected > 0 && status.current === status.expected,
+    // A leftover definition is as much a drift as a missing one: it keeps a
+    // model spawnable that the settings no longer allow. An install with every
+    // model switched off is a valid state, so an empty set stays ok.
+    ok:
+      status.current === status.expected &&
+      status.stale.length === 0 &&
+      status.unprotected.length === 0 &&
+      status.extra.length === 0,
   };
 }

@@ -6,6 +6,8 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import {
+  applyKeepAliveTimeouts,
+  formatErrorChain,
   httpErrorStatus,
   readRequestBody,
   requireInternalAuth,
@@ -15,7 +17,11 @@ import { PORTS } from "./paths.mjs";
 import { MODELS } from "./model-registry.mjs";
 import { ensureFreshGrokOAuthToken } from "./grok-oauth-session.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
+import { normalizeSchemaLiterals, objectRootToolSchema } from "./tool-schema-root.mjs";
 import { VERSION } from "./version.mjs";
+import { installStableFetchTransport } from "./fetch-transport.mjs";
+
+installStableFetchTransport();
 
 // LiteLLM speaks OpenAI Chat Completions to this forwarder. It reuses the
 // official Grok CLI OAuth session and translates to xAI's Responses proxy.
@@ -105,10 +111,11 @@ function messageContentParts(content, textType) {
   return parts.length ? parts : [{ type: textType, text: "" }];
 }
 
-function mapEffort(effort) {
+function mapEffort(effort, model) {
   if (effort === "minimal") return "low";
   if (["none", "low"].includes(effort)) return "low";
-  if (["xhigh", "max"].includes(effort)) return "high";
+  if (effort === "xhigh") return model === "grok-4.6" ? "xhigh" : "high";
+  if (effort === "max") return "high";
   return ["medium", "high"].includes(effort) ? effort : undefined;
 }
 
@@ -174,7 +181,7 @@ export function toResponsesRequest(chat, options = {}) {
 
   const request = { model: chat.model, input, stream: true, store: false };
   if (instructions) request.instructions = instructions;
-  const effort = mapEffort(chat.reasoning_effort);
+  const effort = mapEffort(chat.reasoning_effort, chat.model);
   if (effort) request.reasoning = { effort };
   const clientTools = Array.isArray(chat.tools)
     ? chat.tools
@@ -183,7 +190,17 @@ export function toResponsesRequest(chat, options = {}) {
           type: "function",
           name: tool.function.name,
           description: tool.function.description,
-          parameters: tool.function.parameters || { type: "object", properties: {} },
+          // xAI 400s the whole request over a union-rooted parameter schema,
+          // which Codex's own `automation_update` app tool ships. It rejects
+          // every non-object root, so this keeps objectRootToolSchema's full
+          // collapse rather than the narrower providerToolSchema the shared
+          // relay uses -- and additionally drops literals that contradict their
+          // declared type, which the relay now does for every provider.
+          parameters: objectRootToolSchema(
+            normalizeSchemaLiterals(
+              tool.function.parameters || { type: "object", properties: {} },
+            ),
+          ),
           strict: false,
         }))
     : [];
@@ -483,7 +500,11 @@ if (isMain) {
   const server = http.createServer((request, response) => {
     handleRequest(request, response).catch((error) => {
       const status = httpErrorStatus(error);
-      console.error("[grok-oauth] request failed");
+      // Names and codes only: a refresh failure can wrap upstream response
+      // text in its message, and bodies never belong in the log (#171).
+      console.error(
+        `[grok-oauth] request failed: ${formatErrorChain(error, { messages: false })}`,
+      );
       if (!response.headersSent) {
         writeJson(response, status, {
           error: {
@@ -497,6 +518,7 @@ if (isMain) {
     });
   });
 
+  applyKeepAliveTimeouts(server);
   server.listen(LISTEN_PORT, LISTEN_HOST, () => {
     console.error("[grok-oauth] listening");
   });

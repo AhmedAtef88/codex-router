@@ -47,6 +47,11 @@ function isolatedEnvironment(testRoot) {
     XAI_API_KEY: "",
     GROK_API_KEY: "",
     ANTHROPIC_API_KEY: "",
+    COPILOT_GITHUB_TOKEN: "",
+    GH_TOKEN: "",
+    GITHUB_TOKEN: "",
+    CLINE_API_KEY: "",
+    CHUTES_API_KEY: "",
   };
 }
 
@@ -67,6 +72,25 @@ test("provider onboarding reports install, login, and API key actions without se
     assert.equal(byId["grok-api"].action, "add-key");
     assert.equal(byId["anthropic-api"].action, "add-key");
     assert.equal(byId["minimax-token-plan"].action, "add-key");
+    assert.equal(byId["github-copilot"].action, "add-key");
+    assert.equal(byId["github-copilot"].credentialLabel, "GitHub token");
+    assert.equal("credentialLabel" in byId["deepseek"], false);
+    assert.equal(byId.clinepass.action, "add-key");
+    assert.equal(byId.chutes.action, "add-key");
+    for (const id of ["opencode-free", "kilo-free"]) {
+      assert.equal(byId[id].kind, "anonymous");
+      assert.equal(byId[id].configured, true);
+      assert.equal(byId[id].action, "anonymous");
+      assert.equal(byId[id].credentialLabel, "No API key");
+      assert.match(byId[id].anonymousNote, /No API key/);
+    }
+    // A per-model-endpoint container must never offer a key field: a secret
+    // stored against it would be read by nothing.
+    assert.equal(byId.custom.kind, "per-model");
+    assert.equal(byId.custom.configured, true);
+    assert.equal(byId.custom.action, "per-model");
+    assert.equal(byId.custom.credentialLabel, "Per-model endpoints");
+    assert.match(byId.custom.perModelNote, /own endpoint/);
     assert.equal("source" in byId["kimi-api"], false);
   } finally {
     rmSync(testRoot, { recursive: true, force: true });

@@ -1,6 +1,6 @@
 {
   "name": "codex-model-router",
-  "version": "0.4.0-beta.2",
+  "version": "0.4.0-beta.4",
   "private": true,
   "type": "module",
   "description": "Extensible local model router for Codex and Cursor",
@@ -12,6 +12,7 @@
     "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
-    "proper-lockfile": "4.1.2"
+    "proper-lockfile": "4.1.2",
+    "undici": "8.10.0"
   }
 }

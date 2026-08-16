@@ -6,9 +6,9 @@ import path from "node:path";
 import { cliSessionDescriptor } from "./cli-session-credential.mjs";
 import { detectLegacyInstallations, applyKnownMigrations, rollbackLatestMigration } from "./legacy-migration.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
-import { PROVIDERS } from "./model-registry.mjs";
+import { PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
-import { SOURCE_ROOT } from "./paths.mjs";
+import { SOURCE_ROOT, TARGET } from "./paths.mjs";
 import { credentialStatus } from "./provider-credentials.mjs";
 import {
   hasSignInCli,
@@ -19,34 +19,41 @@ import {
 } from "./provider-onboarding.mjs";
 import { renderProviderChoices, stepHeader, toggleSelection } from "./setup-ui.mjs";
 import {
-  configuredProviderIds,
+  defaultProviderIds,
   selectedConfiguredListedModels,
   validateProviderIds,
   writeProviderSelection,
 } from "./provider-selection.mjs";
+import { writeDiscoveryMode } from "./discovery-mode.mjs";
 import { trayBundleDir, trayDecision } from "./tray-install.mjs";
 import { resolveVisionEngine } from "./vision-bridge.mjs";
 import {
-  setVisionBridgeEnabled,
+  readVisionBridgeSettings,
   visionBridgeConfigured,
 } from "./vision-bridge-state.mjs";
 
 const args = process.argv.slice(2);
 const guided = args.includes("--guided");
 const migrateKnown = args.includes("--migrate-known");
+const adoptNativeCatalog = args.includes("--adopt-native-catalog");
 const runSmoke = args.includes("--smoke-test");
 const selectionOnly = args.includes("--selection-only");
 const withTray = args.includes("--with-tray");
 const noTray = args.includes("--no-tray");
+const noProvider = args.includes("--no-provider");
+const noDiscovery = args.includes("--no-discovery");
 
 const flagOptions = new Set([
   "--guided",
   "--auto",
   "--migrate-known",
+  "--adopt-native-catalog",
   "--smoke-test",
   "--selection-only",
   "--with-tray",
   "--no-tray",
+  "--no-provider",
+  "--no-discovery",
   "--help",
 ]);
 let setupArgumentError;
@@ -62,6 +69,35 @@ for (let index = 0; index < args.length; index += 1) {
     setupArgumentError = `Unknown setup option: ${argument}`;
     break;
   }
+}
+if (!setupArgumentError && migrateKnown && adoptNativeCatalog) {
+  setupArgumentError =
+    "--adopt-native-catalog cannot be combined with --migrate-known.";
+}
+// An idle install is exactly "no providers": naming providers, answering the
+// guided picker, or pasting keys alongside it is a contradiction to report,
+// not to guess about. And --no-discovery without --no-provider would select
+// providers that can never authenticate, so the narrower flag requires the
+// wider one.
+if (!setupArgumentError && noProvider && (guided || args.includes("--providers"))) {
+  setupArgumentError = `--no-provider cannot be combined with ${
+    guided ? "--guided" : "--providers"
+  }.`;
+}
+if (!setupArgumentError && noDiscovery && !noProvider) {
+  setupArgumentError = "--no-discovery requires --no-provider.";
+}
+// Children (bin/install, the catalog build, the doctor) must honor the choice
+// before the marker file exists -- and a re-run without the flag must clear a
+// stale environment value just as writeDiscoveryMode clears the marker.
+process.env.CODEX_ROUTER_NO_DISCOVERY = noDiscovery ? "1" : "0";
+// Both act on Codex's own configuration: one replaces an older router's
+// managed block, the other adopts the ChatGPT-plan catalog Codex reads. The
+// harness integration is one settings section and has neither.
+if (!setupArgumentError && TARGET !== "codex" && (migrateKnown || adoptNativeCatalog)) {
+  setupArgumentError = `${
+    migrateKnown ? "--migrate-known" : "--adopt-native-catalog"
+  } applies only to the Codex target.`;
 }
 
 function option(name) {
@@ -95,10 +131,14 @@ Options:
   --auto               Use already configured credentials (default)
   --providers LIST     Comma-separated provider ids
   --migrate-known      Safely migrate recognized earlier Codex Router installs
+  --adopt-native-catalog  Use an existing user-owned native Codex catalog as the merge base
   --smoke-test         Make one small live request per enabled provider
   --selection-only     Save provider selection without installing (development)
   --with-tray          Also build and launch the desktop companion app
   --no-tray            Never offer the desktop companion app
+  --no-provider        Install idle, with no provider selected or configured
+  --no-discovery       With --no-provider: never read credentials, the
+                       Keychain, or other CLIs' sessions; refuse traffic locally
   --help               Show this help
 
 Providers: ${[...PROVIDERS.values()].filter((provider) => !provider.variantOf).map((provider) => provider.id).join(", ")}
@@ -162,7 +202,9 @@ function providerConfigured(provider) {
     if (provider.id === "grok-oauth") return grokOAuthStatus().configured;
     return false;
   }
-  return credentialStatus(provider, { persistent: true }).configured;
+  return providerNeedsNoKey(provider)
+    ? true
+    : credentialStatus(provider, { persistent: true }).configured;
 }
 
 const colorEnabled = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
@@ -193,13 +235,16 @@ function guidedSelection() {
 }
 
 function requestedSelection() {
+  // The idle install asks for nothing, so nothing is scanned to find it: the
+  // defaultProviderIds() fallback below is itself a full credential sweep.
+  if (noProvider) return [];
   const requested = option("--providers");
   if (requested) {
-    if (requested === "configured") return configuredProviderIds();
+    if (requested === "configured") return defaultProviderIds();
     if (requested === "all") return [...PROVIDERS.keys()];
     return validateProviderIds(requested.split(","));
   }
-  return guided ? guidedSelection() : configuredProviderIds();
+  return guided ? guidedSelection() : defaultProviderIds();
 }
 
 function run(command, commandArgs, options = {}) {
@@ -246,11 +291,13 @@ function configureProvider(provider) {
       throw incomplete(`${provider.displayName} sign-in did not produce a usable credential.`);
     }
   } else {
+    if (["anonymous", "per-model"].includes(provider.authMode)) return;
     // A provider whose CLI mints its key in the browser gets that offer first,
     // because most people have an account long before they have a key. Saying
     // no falls through to the key prompt rather than failing the install.
     if (session && hasSignInCli(provider.id) && signInToProvider(provider)) return;
-    if (!confirm(`Enter a ${provider.displayName} key securely now?`)) {
+    const prompt = provider.credential?.prompt || `${provider.displayName} API key`;
+    if (!confirm(`Enter ${prompt} securely now?`)) {
       throw incomplete(`${provider.displayName} setup was cancelled.`);
     }
     run(process.execPath, [path.join(SOURCE_ROOT, "src", "provider-key.mjs"), provider.id, "set"]);
@@ -289,6 +336,23 @@ function installTray() {
       run(path.join(SOURCE_ROOT, "scripts", "build-macos-tray-app.sh"), [bundleDir]);
       run("open", [bundleDir]);
       process.stdout.write(`Menu-bar companion installed at ${bundleDir} and opened.\n`);
+    } else if (process.platform === "win32") {
+      // Windows had no path through here at all: the tray was built by hand or
+      // not at all, and nothing brought it back after a reboot. `tray install`
+      // builds when the sources moved, stamps the build, and registers the
+      // logon task that starts it now and at every logon -- the same entry
+      // point a user runs by hand, so the sequence exists once instead of
+      // drifting between the installer and the CLI.
+      run("powershell.exe", [
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        path.join(SOURCE_ROOT, "codex-router.ps1"),
+        "tray",
+        "install",
+      ]);
     } else {
       run(path.join(SOURCE_ROOT, "bin", "model-router-tray"), []);
       process.stdout.write("Desktop companion built and launched.\n");
@@ -299,7 +363,13 @@ function installTray() {
         (process.platform === "darwin"
           ? "Recent macOS SDKs need the full Xcode app (not only the Command Line Tools) to build the menu-bar companion's SwiftUI macros.\n"
           : "") +
-        "The router itself is installed; retry later with ./bin/model-router-tray.\n",
+        (process.platform === "win32"
+          ? "The router itself is installed; retry later with .\\codex-router.ps1 tray,\n" +
+            "or .\\codex-router.ps1 companion for the Electron build, which needs no Rust.\n"
+          : "The router itself is installed; retry later with ./bin/model-router-tray.\n") +
+        // Nothing to build and nothing to download, so it is the one suggestion
+        // that cannot fail for the same reason this just did.
+        "The companion also runs in a browser: .\\codex-router.ps1 panel (./bin/panel on macOS and Linux).\n",
     );
   }
 }
@@ -307,7 +377,10 @@ function installTray() {
 async function main() {
   if (setupArgumentError) throw incomplete(setupArgumentError);
   const legacy = detectLegacyInstallations();
-  if (legacy.unknownConflict) {
+  if (
+    legacy.unknownConflict &&
+    !(adoptNativeCatalog && legacy.adoptableNativeCatalog)
+  ) {
     throw incomplete(
       `An unknown model router owns ${legacy.config.modelCatalogJson}; automatic setup will not replace it.`,
     );
@@ -332,7 +405,7 @@ async function main() {
       ? error
       : incomplete(error instanceof Error ? error.message : String(error));
   }
-  if (providers.length === 0) {
+  if (providers.length === 0 && !noProvider) {
     throw incomplete(
       "No configured provider was found. Run `./bin/setup --guided` or pass `--providers` after configuring credentials.",
     );
@@ -357,27 +430,29 @@ async function main() {
     }
   }
   writeProviderSelection(providers);
+  // Written on every run, not only idle ones: re-running setup without
+  // --no-discovery is the exit path from idle mode, so a normal install must
+  // clear the marker just as an idle install sets it.
+  writeDiscoveryMode(noDiscovery);
 
-  // Make pasted images just work for text-only models on a fresh install. When
-  // the operator already enabled a vision-capable provider, turn the bridge on
-  // before the catalog is built (so the picker advertises image input from the
-  // first launch) using that model -- no download, no extra step. This only
-  // fires when the bridge was never configured, so re-running the installer
-  // never overrides someone who turned it off on purpose. With no vision
-  // provider, it stays off and the summary points at the local-model setup.
-  let visionBridge;
-  if (!visionBridgeConfigured()) {
-    const engine = resolveVisionEngine(selectedConfiguredListedModels(), {
-      enabled: true,
-      engine: null,
-    });
-    if (engine) {
-      setVisionBridgeEnabled(true);
-      visionBridge = { enabled: true, engine: engine.slug };
-    } else {
-      visionBridge = { enabled: false, engine: null };
-    }
-  }
+  // Pasted images just work for text-only models: the bridge is on by default,
+  // so the installer no longer writes anything here. It used to auto-enable
+  // once when a vision-capable provider happened to be selected, which both
+  // left the state file's mere presence meaning "the installer ran" and left
+  // every other install needing a command nobody knew about. Reporting is all
+  // that is left to do -- and only for an install that has not answered the
+  // question itself, so a re-run never claims credit for a machine the operator
+  // already configured.
+  const visionBridge = visionBridgeConfigured()
+    ? undefined
+    : {
+        enabled: readVisionBridgeSettings().enabled,
+        engine:
+          resolveVisionEngine(
+            () => selectedConfiguredListedModels(),
+            readVisionBridgeSettings(),
+          )?.slug || null,
+      };
 
   let migration;
   if (legacy.installations.length) {
@@ -397,12 +472,16 @@ async function main() {
   }
 
   nextStep("Review and install");
+  const dshTarget = TARGET === "dsh";
   if (guided) {
     process.stdout.write(
       `\nReady to install:\n` +
-        `  Providers: ${providers.join(", ")}\n` +
+        `  Providers: ${providers.length ? providers.join(", ") : "none (idle install)"}\n` +
         `  Migration: ${migration ? "recognized older router (rollback snapshot kept)" : "none needed"}\n` +
-        `  Changes: per-user background service and the managed Codex config block\n`,
+        (dshTarget
+          ? `  Changes: per-user background service and one provider route in the harness settings document\n`
+          : `  Native catalog: ${adoptNativeCatalog ? "adopt existing user catalog" : "capture from Codex"}\n` +
+            `  Changes: per-user background service and the managed Codex config block\n`),
     );
     if (!confirm("Proceed?")) {
       throw incomplete("Setup was cancelled before installing the service.");
@@ -418,9 +497,13 @@ async function main() {
         "-File",
         path.join(SOURCE_ROOT, "install.ps1"),
         "-CheckoutInstall",
+        ...(adoptNativeCatalog ? ["-AdoptNativeCatalog"] : []),
       ]);
     } else {
-      run(path.join(SOURCE_ROOT, "bin", "install"), []);
+      run(
+        path.join(SOURCE_ROOT, "bin", "install"),
+        adoptNativeCatalog ? ["--adopt-native-catalog"] : [],
+      );
     }
   } catch (error) {
     if (migration?.migrated) rollbackLatestMigration();
@@ -436,20 +519,28 @@ async function main() {
   }
 
   if (runSmoke || (guided && confirm("Run one small live request per enabled provider?", false))) {
-    run(process.execPath, [path.join(SOURCE_ROOT, "src", "smoke-test.mjs")]);
+    run(process.execPath, [path.join(SOURCE_ROOT, "src", "smoke-test.mjs"), "--yes"]);
   }
   run(process.execPath, [path.join(SOURCE_ROOT, "src", "doctor.mjs")]);
+  const providerSummary = providers.length
+    ? providers.join(", ")
+    : "no providers (idle install; traffic gets a local error until one is enabled)";
   process.stdout.write(
-    `\nCodex Router is ready with: ${providers.join(", ")}\nFully quit Codex, reopen it, and start a new task.\n`,
+    dshTarget
+      ? `\nDeepSeek Harness is ready with: ${providerSummary}\n` +
+        `It reloads its settings document on the next request, so there is nothing to restart.\n`
+      : `\nCodex Router is ready with: ${providerSummary}\nFully quit Codex, reopen it, and start a new task.\n`,
   );
-  if (visionBridge?.enabled) {
+  if (visionBridge?.enabled && visionBridge.engine) {
     process.stdout.write(
-      `\nVision: text-only models can now read pasted images, via ${visionBridge.engine}.\n`,
+      `\nVision: text-only models can now read pasted images, via ${visionBridge.engine}.\n` +
+        `  It spends that provider's quota. Turn it off with: ./bin/control vision-bridge off\n`,
     );
-  } else if (visionBridge && !visionBridge.enabled) {
+  } else if (visionBridge?.enabled) {
     process.stdout.write(
-      `\nVision: no image-capable provider is enabled, so text-only models cannot read images yet.\n` +
-        `  Free local option: ./bin/control vision-bridge setup   (uses a small local model)\n`,
+      `\nVision: no enabled provider offers a model that reads images.\n` +
+        `  Signed in to ChatGPT? Codex's own vision model will read them, on the plan you already pay for.\n` +
+        `  Otherwise, free local option: ./bin/control vision-bridge setup   (uses a small local model)\n`,
     );
   }
   if (pendingCredentials.length) {

@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,16 +11,23 @@ import {
 import { cliSessionPath, cliSessionStatus } from "./cli-session-credential.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { KIMI_CLI_NPM_PACKAGE } from "./kimi-oauth-onboarding.mjs";
-import { MODELS, PROVIDERS } from "./model-registry.mjs";
+import { MODELS, PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
 import { STATE_DIR } from "./paths.mjs";
 import {
   apiProvider,
+  credentialLabel,
   credentialStatus,
   removeProviderCredential,
   writeProviderCredential,
 } from "./provider-credentials.mjs";
 import { disableProvider } from "./provider-selection.mjs";
+import {
+  npmGlobalBinary,
+  npmInstallGlobal,
+  spawnEnvironment,
+} from "./npm-global-install.mjs";
+import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
 
 const SIGN_IN_CLIS = Object.freeze({
   "kimi-oauth": {
@@ -50,50 +57,10 @@ const SIGN_IN_CLIS = Object.freeze({
   },
 });
 
-// Resolved at most once per process: the tray refreshes its provider snapshot
-// on a timer, and an npm spawn per unconfigured provider per refresh would be
-// felt. `undefined` is a real answer here, so the miss is cached too.
-let npmGlobalBinDir;
-function npmGlobalBinary(executable) {
-  if (npmGlobalBinDir === undefined) {
-    npmGlobalBinDir = readNpmGlobalBinDir() ?? "";
-  }
-  if (!npmGlobalBinDir) return undefined;
-  const candidate = path.join(npmGlobalBinDir, executable);
-  return existsSync(candidate) ? candidate : undefined;
-}
-
-function readNpmGlobalBinDir() {
-  const npm = npmPath();
-  if (!npm) return undefined;
-  try {
-    const prefix = execFileSync(npm, ["prefix", "-g"], {
-      encoding: "utf8",
-      env: spawnEnvironment(),
-      timeout: 15_000,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    if (!prefix) return undefined;
-    // npm drops binaries straight into the prefix on Windows and into
-    // prefix/bin everywhere else.
-    return process.platform === "win32" ? prefix : path.join(prefix, "bin");
-  } catch {
-    return undefined;
-  }
-}
-
 function commandPath(name) {
-  const finder = process.platform === "win32" ? "where.exe" : "which";
-  try {
-    return execFileSync(finder, [name], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-      .trim()
-      .split(/\r?\n/)[0];
-  } catch {
-    return undefined;
-  }
+  // Not the finder's first line: on Windows that is the extensionless npm
+  // shim, and every caller here goes on to spawn what it gets back.
+  return commandOnPath(name);
 }
 
 // A registry entry can declare a CLI session before anyone teaches this module
@@ -159,17 +126,39 @@ export function providerOnboardingSnapshot() {
                 : "login",
         };
       }
-      const configured = credentialStatus(provider, { persistent: true }).configured;
+      const configured = providerNeedsNoKey(provider)
+        ? true
+        : credentialStatus(provider, { persistent: true }).configured;
       const entry = {
         id: provider.id,
         displayName: provider.displayName,
         kind: "api",
+        ...(provider.credential?.label ? { credentialLabel: credentialLabel(provider) } : {}),
         configured,
         action: configured ? "ready" : "add-key",
         // Carried to the tray so the plan requirement is visible at the
         // moment someone decides to connect, not after Codex 403s.
         ...(provider.planNote ? { planNote: provider.planNote } : {}),
       };
+      // A container has no key field of its own. Saying so is the whole card:
+      // an "Add Key" button here would store a secret nothing ever reads.
+      if (provider.authMode === "per-model") {
+        entry.kind = "per-model";
+        entry.action = "per-model";
+        entry.credentialLabel = "Per-model endpoints";
+        entry.perModelNote =
+          "Each model here names its own endpoint and its own auth. Enabling this provider costs nothing.";
+        return entry;
+      }
+      if (provider.authMode === "anonymous") {
+        entry.kind = "anonymous";
+        // Guided setup pre-checks every `ready` row. An off-box endpoint must
+        // be chosen explicitly even though it needs no API key.
+        entry.action = "anonymous";
+        entry.credentialLabel = "No API key";
+        entry.anonymousNote = provider.anonymousNote;
+        return entry;
+      }
       // A provider whose CLI mints its key through a browser sign-in keeps the
       // key field (people with a Studio key still paste it) and gains a second
       // route. The tray needs both states to label the row honestly: whether
@@ -194,37 +183,6 @@ export function providerOnboardingSnapshot() {
 // `env: node: No such file or directory` behind a generic "could not install".
 // Whatever node is running this file is by definition a working one, so put
 // its directory in front for the child.
-function spawnEnvironment() {
-  const nodeDir = path.dirname(process.execPath);
-  const existing = process.env.PATH || "";
-  if (existing.split(path.delimiter).includes(nodeDir)) return process.env;
-  return { ...process.env, PATH: existing ? `${nodeDir}${path.delimiter}${existing}` : nodeDir };
-}
-
-function npmPath() {
-  const discovered = commandPath("npm");
-  if (discovered) return discovered;
-  const candidates = [
-    path.join(os.homedir(), ".npm-global", "bin", "npm"),
-    path.join(os.homedir(), ".local", "bin", "npm"),
-    "/opt/homebrew/bin/npm",
-    "/usr/local/bin/npm",
-  ];
-  return candidates.find((candidate) => existsSync(candidate));
-}
-
-// npm prints its diagnosis over several lines and ends with log-file paths
-// that mean nothing in a tray dialog; the last real line is the useful one.
-function installFailureDetail(result) {
-  if (result.error) return result.error.message;
-  const lines = `${result.stderr || ""}`
-    .split(/\r?\n/)
-    .map((line) => line.replace(/^npm (error|ERR!)\s*/i, "").trim())
-    .filter((line) => line && !/^[A-Za-z]?:?[\\/].*\.log$/.test(line));
-  const detail = lines[lines.length - 1];
-  return detail ? `npm said: ${detail}` : `npm exited with status ${result.status}.`;
-}
-
 export function installOauthCli(providerId) {
   const cli = SIGN_IN_CLIS[providerId];
   if (!cli) throw new Error(`Unknown OAuth provider: ${providerId}`);
@@ -237,20 +195,7 @@ export function installOauthCli(providerId) {
   } else if (oauthCliPath(providerId)) {
     return;
   }
-  const npm = npmPath();
-  if (!npm) throw new Error("Node.js and npm are required to install this provider CLI.");
-  const result = spawnSync(npm, ["install", "-g", cli.npmPackage], {
-    encoding: "utf8",
-    env: spawnEnvironment(),
-  });
-  if (result.error || result.status !== 0) {
-    // The reason matters more than the fact: "EACCES on /usr/local/lib" and
-    // "network unreachable" need opposite fixes, and a bare "could not
-    // install" sent the last one of these into a debugging session.
-    throw new Error(
-      `Could not install the official ${cli.executable} CLI. ${installFailureDetail(result)}`.trim(),
-    );
-  }
+  npmInstallGlobal(cli.npmPackage, { label: `the official ${cli.executable} CLI` });
   if (providerId === "grok-oauth") {
     const preflight = grokCliPreflight();
     if (!preflight.runnable) throw new Error(grokCliFailureMessage(preflight));
@@ -347,7 +292,9 @@ export function loginOauthProvider(providerId) {
   }
   // The CLI itself is another `#!/usr/bin/env node` script, so signing in needs
   // the same PATH repair the install did.
-  const result = spawnSync(executable, oauthLoginArgs(providerId), {
+  const login = spawnableCommand(executable, oauthLoginArgs(providerId));
+  const result = spawnSync(login.command, login.args, {
+    ...login.options,
     encoding: "utf8",
     env: spawnEnvironment(),
     timeout: LOGIN_TIMEOUT_MS,

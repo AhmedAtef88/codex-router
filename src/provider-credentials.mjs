@@ -15,14 +15,23 @@ import {
   cliSessionDescriptor,
   readCliSessionCredential,
 } from "./cli-session-credential.mjs";
+import { discoveryDisabled } from "./discovery-mode.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
 import { LEGACY_STATE_DIRS, STATE_DIR, TARGET } from "./paths.mjs";
 import { targetCli } from "./target-integration.mjs";
 import { PROVIDERS } from "./model-registry.mjs";
+import {
+  assertGitHubCopilotCredential,
+  githubCopilotCredentialProblem,
+} from "./github-copilot-session.mjs";
 
 export function apiProvider(providerId) {
   const provider = PROVIDERS.get(providerId);
-  if (!provider || provider.kind !== "openai-compatible") {
+  if (
+    !provider ||
+    provider.kind !== "openai-compatible" ||
+    ["anonymous", "per-model"].includes(provider.authMode)
+  ) {
     throw new Error(`Unknown API-key provider: ${providerId}`);
   }
   return provider;
@@ -47,26 +56,110 @@ export function credentialPaths(provider) {
   return [...new Set(candidates)];
 }
 
+// Every other source this module consults is a `statSync`/`readFileSync` pair
+// costing microseconds. This one spawns a process, and it is the only reason
+// resolving credentials is expensive at all: on this tree a full pass over the
+// registry is 26 keychain services, measured at ~9ms per spawn -- 235ms of a
+// 235.5ms scan. Because `execFileSync` is synchronous, that quarter second is
+// spent with the event loop stopped, so a single routed turn that resolves
+// credentials stalls every other in-flight request too.
+//
+// So the spawn is memoized, and only the spawn. Scope is the point: the router
+// **never writes a Keychain item** -- `writeProviderCredential` below writes a
+// protected file in the state directory, `kimi login` and `grok login` write
+// their own OAuth files, and `command-code login` writes its own session file.
+// All three of those stay live on every call, and files are checked *before*
+// the Keychain, so a key the operator adds through any documented path is
+// visible immediately. What can go stale is only a key some other tool put in
+// the login keychain behind the router's back, which nothing in this repository
+// does. Thirty seconds is the ceiling on noticing that; see `resetKeychainCache`
+// for the same-process paths that shorten it to zero.
+//
+// The cached entry holds the secret in memory for that window. That is not a
+// new exposure: the value is already read into memory on every resolve and
+// forwarded upstream, and it is never logged or written out from here.
+const KEYCHAIN_CACHE_TTL_MS = 30_000;
+const keychainCache = new Map();
+let keychainProbes = 0;
+
+// Test-visible evidence that the memo is doing its job, without resorting to a
+// timing threshold. Counts actual `/usr/bin/security` spawns.
+export function keychainProbeCount() {
+  return keychainProbes;
+}
+
+// Anything that changes what this process believes about stored credentials
+// drops the memo, so a write followed by a read inside one process is never
+// served a stale answer. In practice credentials are written by short-lived CLI
+// processes (`provider-key set`, `bin/control credential`) rather than by the
+// long-running router, so this is a correctness backstop for same-process
+// sequences -- installer and tray flows that store a key and then immediately
+// rebuild the catalog -- and the TTL is what governs the router itself.
+export function resetKeychainCache() {
+  keychainCache.clear();
+}
+
+function keychainSecret(service, now) {
+  const cached = keychainCache.get(service);
+  if (cached && now - cached.at < KEYCHAIN_CACHE_TTL_MS) return cached.result;
+  keychainProbes += 1;
+  let result = null;
+  try {
+    const value = execFileSync(
+      "/usr/bin/security",
+      ["find-generic-password", "-s", service, "-a", "default", "-w"],
+      { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] },
+    ).trim();
+    if (value) result = { value, source: `macOS Keychain (${service})` };
+  } catch {
+    // No such item, or the keychain refused. Either way: nothing here.
+  }
+  // A miss is cached as deliberately as a hit. The absent case is both the
+  // common one and the expensive one -- a machine with no keychain items pays
+  // the full 26 spawns every pass -- so caching only hits would have left the
+  // cost exactly where it was.
+  keychainCache.set(service, { at: now, result });
+  return result;
+}
+
 function keyFromKeychain(provider) {
   if (process.platform !== "darwin" || TARGET !== "codex") return undefined;
+  const now = Date.now();
   for (const service of provider.credential.keychainServices || []) {
-    try {
-      const value = execFileSync(
-        "/usr/bin/security",
-        ["find-generic-password", "-s", service, "-a", "default", "-w"],
-        { encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"] },
-      ).trim();
-      if (value) return { value, source: `macOS Keychain (${service})` };
-    } catch {
-      // Try the next compatible service name.
-    }
+    const found = keychainSecret(service, now);
+    if (found) return found;
+    // Otherwise try the next compatible service name.
   }
   return undefined;
 }
 
+function resolvedCredential(provider, value, source, persistent) {
+  if (provider.authProfile === "github-copilot" && githubCopilotCredentialProblem(value)) {
+    return undefined;
+  }
+  return { value, source, persistent };
+}
+
 export function resolveProviderCredential(providerOrId, options = {}) {
   const provider =
-    typeof providerOrId === "string" ? apiProvider(providerOrId) : providerOrId;
+    typeof providerOrId === "string" ? PROVIDERS.get(providerOrId) : providerOrId;
+  if (!provider || provider.kind !== "openai-compatible") {
+    throw new Error(`Unknown API-key provider: ${typeof providerOrId === "string" ? providerOrId : "unknown"}`);
+  }
+  // Anonymous providers deliberately carry no secret. Returning a persistent
+  // marker makes them participate in the same configured/selected/catalog
+  // flow as local Ollama without ever creating a credential file or header.
+  if (provider.authMode === "anonymous") {
+    return { value: undefined, source: "official anonymous endpoint", persistent: true };
+  }
+  // A per-model-endpoint provider holds no credential of its own: each of its
+  // models resolves through this same function with its own endpoint
+  // descriptor. Answering "configured" here is what lets the container take
+  // part in selection, health, and the catalog; a model whose own endpoint
+  // needs a key still reports that against the key it actually wants.
+  if (provider.authMode === "per-model") {
+    return { value: undefined, source: "per-model endpoints", persistent: true };
+  }
   // Nothing to resolve for a loopback provider: it authenticates no one. The
   // placeholder keeps the forwarder's header shape uniform, and the registry
   // guarantees keyless providers are loopback-only, so it never leaves the
@@ -74,27 +167,44 @@ export function resolveProviderCredential(providerOrId, options = {}) {
   if (provider.keyless) {
     return { value: "local", source: "local endpoint (no key required)", persistent: true };
   }
+  // The --no-discovery promise: no environment sniffing, no credential files,
+  // no Keychain spawn, no other CLI's session file. The guard sits here, after
+  // the anonymous and keyless returns, because those two read nothing -- and
+  // before everything that does.
+  if (discoveryDisabled()) return undefined;
   if (!options.persistent) {
     for (const name of provider.credential.environment) {
       const value = process.env[name]?.trim();
-      if (value) return { value, source: `environment (${name})`, persistent: false };
+      if (value) {
+        const credential = resolvedCredential(provider, value, `environment (${name})`, false);
+        if (credential) return credential;
+      }
     }
   }
   for (const candidate of credentialPaths(provider)) {
     if (!existsSync(candidate)) continue;
     const value = readFileSync(candidate, "utf8").trim();
     if (value) {
-      return { value, source: `protected file (${candidate})`, persistent: true };
+      const credential = resolvedCredential(
+        provider,
+        value,
+        `protected file (${candidate})`,
+        true,
+      );
+      if (credential) return credential;
     }
   }
   const keychain = keyFromKeychain(provider);
-  if (keychain) return { ...keychain, persistent: true };
+  if (keychain) {
+    const credential = resolvedCredential(provider, keychain.value, keychain.source, true);
+    if (credential) return credential;
+  }
   // The provider CLI's own sign-in comes last: a key the user deliberately
   // stored here, or exported into the environment, stays in charge, and the
   // session only fills the gap for someone who never pasted one.
   const session = readCliSessionCredential(provider);
   return session
-    ? { value: session.value, source: session.label, persistent: true }
+    ? resolvedCredential(provider, session.value, session.label, true)
     : undefined;
 }
 
@@ -102,6 +212,8 @@ export function resolveProviderCredential(providerOrId, options = {}) {
 // naming only the key one would hide the OAuth flow from every surface that
 // prints this sentence (doctor, discovery errors, the enable gate).
 export function credentialSetupHint(provider) {
+  if (provider.authMode === "anonymous") return "No key needed; free models are rate limited by the provider.";
+  if (provider.authMode === "per-model") return "No key needed here; each model names its own endpoint.";
   if (provider.keyless) return "No key needed; it runs on this machine.";
   const keyCommand = targetCli(`provider-key ${provider.id} set`);
   const session = cliSessionDescriptor(provider);
@@ -110,9 +222,18 @@ export function credentialSetupHint(provider) {
     : `Run ${keyCommand}`;
 }
 
+export function credentialLabel(provider) {
+  if (provider.authMode === "anonymous") return "No API key";
+  if (provider.authMode === "per-model") return "Per-model endpoints";
+  return provider.credential?.label || "API key";
+}
+
 export function credentialStatus(providerOrId, options = {}) {
   const provider =
-    typeof providerOrId === "string" ? apiProvider(providerOrId) : providerOrId;
+    typeof providerOrId === "string" ? PROVIDERS.get(providerOrId) : providerOrId;
+  if (!provider || provider.kind !== "openai-compatible") {
+    throw new Error(`Unknown API-key provider: ${typeof providerOrId === "string" ? providerOrId : "unknown"}`);
+  }
   const credential = resolveProviderCredential(provider, options);
   return credential
     ? { configured: true, source: credential.source, persistent: credential.persistent }
@@ -123,7 +244,10 @@ export function writeProviderCredential(providerOrId, value) {
   const provider =
     typeof providerOrId === "string" ? apiProvider(providerOrId) : providerOrId;
   const key = String(value || "").trim();
-  if (!key) throw new Error("No API key was entered; nothing changed.");
+  if (!key) throw new Error(`No ${credentialLabel(provider)} was entered; nothing changed.`);
+  if (provider.authProfile === "github-copilot") {
+    assertGitHubCopilotCredential(key);
+  }
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   chmodSync(STATE_DIR, 0o700);
   const target = primaryCredentialPath(provider);
@@ -137,6 +261,7 @@ export function writeProviderCredential(providerOrId, value) {
     if (existsSync(temporary)) unlinkSync(temporary);
     throw error;
   }
+  resetKeychainCache();
   return target;
 }
 
@@ -149,6 +274,10 @@ export function removeProviderCredential(providerOrId) {
     unlinkSync(candidate);
     removed += 1;
   }
+  // Deleting the files makes the Keychain the next thing consulted, and
+  // `removeApiCredential` reports what still resolves afterwards. That answer
+  // has to come from a fresh look.
+  resetKeychainCache();
   return removed;
 }
 

@@ -12,18 +12,21 @@ migrate_known=false
 smoke_test=false
 with_tray=false
 no_tray=false
+no_provider=false
+no_discovery=false
 previous_revision=
+force=false
 target=codex
 
 usage() {
   cat <<'EOF'
 Usage: install.sh [options]
 
-Install external model routes for Codex.
+Install external model routes for Codex or DeepSeek Harness.
 
 Options:
   --install-dir PATH  Stable checkout used by the background service
-  --target APP        Install for "codex" (the default and only target)
+  --target APP        Install for "codex" (default) or "dsh" (DeepSeek Harness)
   --prepare-only      Install dependencies without changing either app
   --api-key           Alias for --kimi-api-key
   --kimi-api-key      Prompt securely for a Kimi Platform API key
@@ -37,6 +40,11 @@ Options:
   --smoke-test       Make one small billed request per enabled provider
   --with-tray        Also build and launch the desktop companion app
   --no-tray          Never offer the desktop companion app
+  --no-provider      Install idle: no provider is selected or configured
+  --no-discovery     With --no-provider: never read credentials, the Keychain,
+                     or other CLIs' sessions; Codex traffic gets a local error
+  --force            Discard edits to tracked files in the managed checkout
+                     before updating it. Untracked files are never touched.
   -h, --help          Show this help
 
 When run from a checkout, this script installs that checkout. When piped from
@@ -49,10 +57,49 @@ die() {
   exit 1
 }
 
+# Mirrors DIRTY_PREVIEW_LIMIT in src/update.mjs and $DirtyPreviewLimit in
+# install.ps1. test/installer-scripts.test.mjs compares all three, so they
+# cannot drift apart.
+dirty_preview_limit=10
+
+# Mirrors localModifications() in src/update.mjs. Only tracked edits are at
+# stake: a fast-forward pull never replaces an untracked file, and git refuses
+# the rare collision on its own with a precise message. Counting untracked
+# files as "local changes" only ever stranded people -- one stray file in the
+# checkout and every later self-update was refused, with nothing in the error
+# to say which file or how to get past it.
+local_modifications() {
+  status_output=$(git -C "$1" status --porcelain --untracked-files=no) || return 1
+  printf '%s\n' "$status_output" | sed -e 's/^[[:space:]]*//' -e '/^$/d'
+}
+
+# Mirrors localModificationsMessage() in src/update.mjs. Naming the files and
+# both ways forward is the whole point: the old message named neither, so
+# anyone blocked by a single stray edit had nothing to act on.
+local_modifications_message() {
+  changes=$1
+  directory=$2
+  count=$(printf '%s\n' "$changes" | wc -l)
+  count=$((count))
+  if [ "$count" -eq 1 ]; then
+    counted="1 tracked file"
+  else
+    counted="$count tracked files"
+  fi
+  printf 'The checkout has local changes to %s; refusing to replace them during update:\n' "$counted"
+  printf '%s\n' "$changes" | head -n "$dirty_preview_limit" | sed 's/^/  /'
+  if [ "$count" -gt "$dirty_preview_limit" ]; then
+    printf '  ...and %s more\n' "$((count - dirty_preview_limit))"
+  fi
+  printf '\n'
+  printf 'Keep them:    git -C %s stash\n' "$directory"
+  printf 'Discard them: re-run the same command with --force\n'
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --target)
-      [ "$#" -ge 2 ] || die "--target requires codex"
+      [ "$#" -ge 2 ] || die "--target requires codex or dsh"
       target=$2
       shift 2
       ;;
@@ -107,12 +154,24 @@ while [ "$#" -gt 0 ]; do
       no_tray=true
       shift
       ;;
+    --no-provider)
+      no_provider=true
+      shift
+      ;;
+    --no-discovery)
+      no_discovery=true
+      shift
+      ;;
     --migrate-known)
       migrate_known=true
       shift
       ;;
     --smoke-test)
       smoke_test=true
+      shift
+      ;;
+    --force)
+      force=true
       shift
       ;;
     -h|--help)
@@ -126,11 +185,23 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$target" in
-  codex) ;;
-  *) die "--target must be codex" ;;
+  codex|dsh) ;;
+  *) die "--target must be codex or dsh" ;;
 esac
+# Legacy migration replaces an older router's managed Codex config block, and
+# the native catalog is the ChatGPT-plan model list Codex adopts. Neither has a
+# counterpart in the harness, whose integration is one settings section.
 if [ "$target" != codex ] && [ "$migrate_known" = true ]; then
   die "--migrate-known applies only to the Codex target"
+fi
+# An idle install is exactly "no providers", so naming providers or pasting
+# keys alongside it is a contradiction; and --no-discovery alone would select
+# providers that can never authenticate.
+if [ "$no_provider" = true ] && { [ -n "$providers" ] || [ -n "$configure_provider_keys" ] || [ "$guided" = true ]; }; then
+  die "--no-provider cannot be combined with --guided, --providers, or key flags"
+fi
+if [ "$no_discovery" = true ] && [ "$no_provider" != true ]; then
+  die "--no-discovery requires --no-provider"
 fi
 MODEL_ROUTER_TARGET=$target
 export MODEL_ROUTER_TARGET
@@ -161,8 +232,20 @@ if [ -z "$repo_dir" ]; then
         ;;
     esac
 
-    [ -z "$(git -C "$install_dir" status --porcelain)" ] ||
-      die "$install_dir has local changes; review them before updating"
+    # Mirrors requireReplaceableCheckout() in src/update.mjs, including its
+    # refusal to reach for `git clean`: --force restores files git already
+    # tracks and leaves untracked files exactly where they are, because an
+    # update has no business deleting work git was never asked to track.
+    changes=$(local_modifications "$install_dir") ||
+      die "unable to read the Git status of $install_dir"
+    if [ -n "$changes" ]; then
+      if [ "$force" != true ]; then
+        local_modifications_message "$changes" "$install_dir" >&2
+        exit 1
+      fi
+      git -C "$install_dir" reset --hard HEAD ||
+        die "unable to discard the local changes in $install_dir"
+    fi
     current_branch=$(git -C "$install_dir" branch --show-current)
     [ "$current_branch" = "main" ] ||
       die "$install_dir must be on its main branch before updating"
@@ -195,7 +278,9 @@ for provider_id in $configure_provider_keys; do
 done
 
 if [ "$guided" = auto ]; then
-  if [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  if [ "$no_provider" = true ]; then
+    guided=false
+  elif [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
     guided=true
   else
     guided=false
@@ -209,6 +294,8 @@ if [ "$migrate_known" = true ]; then set -- "$@" --migrate-known; fi
 if [ "$smoke_test" = true ]; then set -- "$@" --smoke-test; fi
 if [ "$with_tray" = true ]; then set -- "$@" --with-tray; fi
 if [ "$no_tray" = true ]; then set -- "$@" --no-tray; fi
+if [ "$no_provider" = true ]; then set -- "$@" --no-provider; fi
+if [ "$no_discovery" = true ]; then set -- "$@" --no-discovery; fi
 setup_status=0
 "$repo_dir/bin/setup" "$@" || setup_status=$?
 # Exit 2 means setup left configuration unfinished (a declined prompt, a

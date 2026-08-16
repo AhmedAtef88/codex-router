@@ -2,7 +2,7 @@
 
 ## Architecture
 
-- `config/providers.json` is the provider and model registry.
+- `config/` is the split provider and model registry tree.
 - `src/model-registry.mjs` validates and indexes that registry.
 - `src/catalog.mjs` merges listed registry models with native Codex models.
 - `src/litellm-config.mjs` generates every provider translation route.
@@ -20,7 +20,7 @@
 
 ## Add an API-key provider
 
-1. Add a provider object to `config/providers.json` with a unique lowercase ID,
+1. Add a provider fragment under `config/<vendor>/` with a unique lowercase ID,
    API base URL, protocol when it is not OpenAI-compatible, environment variable, protected key filename, and optional
    Keychain service.
 2. Add one model object per upstream model. Public slugs should be namespaced as
@@ -45,12 +45,34 @@ OAuth schemes usually need a dedicated adapter because refresh and identity
 rules are provider-specific. Never infer that an API key can replace an OAuth
 credential or vice versa.
 
+GitHub Copilot is the existing dynamic-auth exception inside the shared API
+forwarder. Its registry provider declares `authProfile: "github-copilot"`;
+`src/github-copilot-session.mjs` validates the stored fine-grained PAT against
+the account endpoint, caches the validated account routing briefly, allowlists
+the returned inference host, and builds provider identity headers. Do not reuse
+that profile for another vendor.
+
 ## Registry rules
 
 The registry is intentionally declarative. `src/model-registry.mjs` rejects
 unknown provider kinds, duplicate provider IDs, duplicate public slugs,
 duplicate gateway model IDs, missing credential metadata, and incomplete picker
 metadata.
+
+Remote anonymous providers are a separate, tightly constrained mode. A
+provider with `authMode: "anonymous"` must use one of the fixed official
+endpoints allowlisted in `src/model-registry.mjs`, must not declare a
+credential or a base-URL override, and must declare an `anonymousModelPolicy`
+and user-facing `anonymousNote`. Discovery and user-model validation enforce
+that policy so a free route cannot be used to reach paid model IDs. This mode
+is for documented provider-side free exceptions; it is not an alternative
+form of arbitrary keyless hosting (keyless providers remain loopback-only).
+
+Models may declare `serviceTiers` as `{ id, name, description? }` entries only
+when the upstream is verified to honor those request values. The catalog
+exposes them as opt-in choices and always keeps standard service as the
+default. User-curated entries can add the same field directly in
+`user-models.json`; duplicate tier IDs are rejected.
 
 Set `listed: false` for compatibility aliases that must remain routable but
 should not appear in the app picker. Every model, listed or hidden, receives a
@@ -75,6 +97,23 @@ the deterministic `--models` form), and everything defaults conservatively
 when unanswered. The stored entries in `user-models.json` are plain local
 state — edit any value in place and re-run `./bin/install` to apply.
 
+The deterministic `--models` form is additive so adding one model cannot
+discard other curated entries or their hand-tuned metadata. Non-interactive
+pruning is explicit with `--remove id1,id2` and does not require a provider
+network request. The interactive picker remains authoritative: deselecting an
+entry there removes it.
+
+A curated model inherits a request profile from the provider's registry
+models when it has any. The catalog-only resellers ship none, so curation
+also offers `auto-tool-choice` (`--request-profile` in the deterministic
+form) — the one profile meaningful to pick by hand, for a model whose
+upstream rejects `tool_choice: "required"` while still calling tools under
+`"auto"`. It normalizes the tool choice and nothing else, so it composes with
+no vendor's parameter surface and misreads none. Keep it per model: the
+restriction belongs to the upstream behind the reseller, and a provider-wide
+downgrade would let models that honor a forced choice decline both the
+compatibility probe and the subagent payload relay's forced function call.
+
 ## Tests
 
 ```sh
@@ -82,7 +121,12 @@ npm ci
 npm run check
 npm test
 sh -n install.sh
-for file in bin/*; do sh -n "$file"; done
+for file in bin/*; do
+  case "$file" in
+    *.mjs) node --check "$file" ;;
+    *) sh -n "$file" ;;
+  esac
+done
 npm audit --omit=dev
 ```
 

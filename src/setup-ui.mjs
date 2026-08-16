@@ -8,6 +8,7 @@ const ACTION_LABELS = Object.freeze({
   login: "needs CLI sign-in",
   install: "needs CLI install",
   blocked: "CLI blocked by Windows",
+  anonymous: "no API key",
 });
 
 const COLOR_CODES = Object.freeze({
@@ -22,6 +23,9 @@ export function stepHeader(step, total, title) {
 }
 
 export function providerStatusLabel(snapshot) {
+  if (snapshot.action === "add-key" && snapshot.credentialLabel) {
+    return `needs ${snapshot.credentialLabel}`;
+  }
   return ACTION_LABELS[snapshot.action] || "setup required";
 }
 

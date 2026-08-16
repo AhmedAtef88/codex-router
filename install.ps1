@@ -3,13 +3,25 @@ param(
   [switch]$CheckoutInstall,
   [switch]$PrepareOnly,
   [switch]$ForceDeps,
-  [ValidateSet("codex")]
+  [ValidateSet("codex", "dsh")]
   [string]$Target = "codex",
   [switch]$Guided,
   [switch]$Auto,
   [string]$Providers,
   [switch]$MigrateKnown,
+  [switch]$AdoptNativeCatalog,
   [switch]$SmokeTest,
+  # Matches install.sh's --with-tray/--no-tray. Windows previously had no way
+  # to ask for the companion at all, so it was never built and never started.
+  [switch]$WithTray,
+  [switch]$NoTray,
+  # Matches install.sh's --no-provider/--no-discovery: install idle with an
+  # explicit empty selection, optionally with credential discovery disabled.
+  [switch]$NoProvider,
+  [switch]$NoDiscovery,
+  # Discards tracked edits in the managed checkout so the update can proceed.
+  # Deliberately never touches untracked files -- see Reset-ManagedCheckout.
+  [switch]$Force,
   [string]$InstallDir = $(
     if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "codex-router" }
     else { Join-Path $HOME ".local\share\codex-router" }
@@ -18,8 +30,32 @@ param(
 
 $ErrorActionPreference = "Stop"
 $env:MODEL_ROUTER_TARGET = $Target
+# Legacy migration replaces an older router's managed Codex config block, and
+# the native catalog is the ChatGPT-plan model list Codex adopts. Neither has a
+# counterpart in DeepSeek Harness, whose integration is one settings section.
 if ($Target -ne "codex" -and $MigrateKnown) {
   throw "-MigrateKnown applies only to the Codex target."
+}
+if ($Target -ne "codex" -and $AdoptNativeCatalog) {
+  throw "-AdoptNativeCatalog applies only to the Codex target."
+}
+if ($PrepareOnly -and $AdoptNativeCatalog) {
+  throw "-AdoptNativeCatalog cannot be used with -PrepareOnly."
+}
+if ($MigrateKnown -and $AdoptNativeCatalog) {
+  throw "-AdoptNativeCatalog cannot be combined with -MigrateKnown."
+}
+if ($WithTray -and $NoTray) {
+  throw "-WithTray cannot be combined with -NoTray."
+}
+# An idle install is exactly "no providers", so naming providers alongside it
+# is a contradiction; and -NoDiscovery alone would select providers that can
+# never authenticate.
+if ($NoProvider -and ($Guided -or $Providers)) {
+  throw "-NoProvider cannot be combined with -Guided or -Providers."
+}
+if ($NoDiscovery -and -not $NoProvider) {
+  throw "-NoDiscovery requires -NoProvider."
 }
 $PreviousRevision = $null
 $RepositoryUrl = if ($env:CODEX_ROUTER_REPOSITORY_URL) {
@@ -42,6 +78,47 @@ function Test-RouterCheckout([string]$Directory) {
   } catch {
     return $false
   }
+}
+
+# Mirrors DIRTY_PREVIEW_LIMIT in src/update.mjs. test/installer-scripts.test.mjs
+# imports that constant and compares it with this one, so the two cannot drift.
+$DirtyPreviewLimit = 10
+
+# Mirrors localModifications() in src/update.mjs. Only tracked edits are at
+# stake: a fast-forward pull never replaces an untracked file, and git refuses
+# the rare collision on its own with a precise message. Counting untracked files
+# as "local changes" only ever stranded people -- one stray file in the checkout
+# and every later self-update was refused.
+function Get-LocalModification([string]$Directory) {
+  $Output = @(& git -C $Directory status --porcelain --untracked-files=no)
+  if ($LASTEXITCODE -ne 0) { throw "Unable to read the Git status of $Directory." }
+  return @($Output | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+}
+
+# Mirrors localModificationsMessage() in src/update.mjs. Naming the files and
+# both ways forward is the whole point: the old message named neither, so anyone
+# blocked by a single stray edit had nothing to act on.
+function Get-LocalModificationMessage([string[]]$Changes, [string]$Directory) {
+  $Plural = if ($Changes.Count -eq 1) { "" } else { "s" }
+  $Lines = @(
+    "The checkout has local changes to $($Changes.Count) tracked file${Plural}; refusing to replace them during update:"
+  )
+  $Lines += @($Changes | Select-Object -First $DirtyPreviewLimit | ForEach-Object { "  $_" })
+  $Remainder = $Changes.Count - $DirtyPreviewLimit
+  if ($Remainder -gt 0) { $Lines += "  ...and $Remainder more" }
+  $Lines += ""
+  $Lines += "Keep them:    git -C $Directory stash"
+  $Lines += "Discard them: re-run the same command with -Force"
+  return ($Lines -join "`n")
+}
+
+# Mirrors requireReplaceableCheckout() in src/update.mjs, including its refusal
+# to reach for `git clean`: -Force restores files git already tracks and leaves
+# untracked files exactly where they are, because an update has no business
+# deleting work git was never asked to track.
+function Reset-ManagedCheckout([string]$Directory) {
+  & git -C $Directory reset --hard HEAD
+  if ($LASTEXITCODE -ne 0) { throw "Unable to discard the local changes in $Directory." }
 }
 
 $ScriptDirectory = $PSScriptRoot
@@ -68,9 +145,12 @@ if (-not $CheckoutInstall) {
       if ($Origin -notin $AllowedOrigins) {
         throw "$InstallDir has an unrecognized origin and will not be updated: $Origin"
       }
-      $Dirty = (& git -C $InstallDir status --porcelain)
-      if ($LASTEXITCODE -ne 0 -or $Dirty) {
-        throw "$InstallDir has local changes; automatic update will not overwrite them."
+      # PowerShell unrolls a one-element array on return, so re-wrap before
+      # reading .Count.
+      $Dirty = @(Get-LocalModification $InstallDir)
+      if ($Dirty.Count) {
+        if (-not $Force) { throw (Get-LocalModificationMessage $Dirty $InstallDir) }
+        Reset-ManagedCheckout $InstallDir
       }
       # A failed setup rolls the checkout back to a detached HEAD (see the
       # rollback below), where `branch --show-current` prints nothing. A native
@@ -112,11 +192,16 @@ if (-not $CheckoutInstall) {
 
   $SetupScript = "src\setup.mjs"
   $SetupArguments = @((Join-Path $Repository $SetupScript))
-  $UseGuided = $Guided -or (-not $Auto -and [Environment]::UserInteractive)
+  $UseGuided = $Guided -or (-not $Auto -and -not $NoProvider -and [Environment]::UserInteractive)
   if ($UseGuided) { $SetupArguments += "--guided" }
   if ($Providers) { $SetupArguments += @("--providers", $Providers) }
   if ($MigrateKnown) { $SetupArguments += "--migrate-known" }
+  if ($AdoptNativeCatalog) { $SetupArguments += "--adopt-native-catalog" }
   if ($SmokeTest) { $SetupArguments += "--smoke-test" }
+  if ($WithTray) { $SetupArguments += "--with-tray" }
+  if ($NoTray) { $SetupArguments += "--no-tray" }
+  if ($NoProvider) { $SetupArguments += "--no-provider" }
+  if ($NoDiscovery) { $SetupArguments += "--no-discovery" }
   & node @SetupArguments
   $SetupExitCode = $LASTEXITCODE
   # Exit 2 means setup left configuration unfinished (a declined prompt, a
@@ -146,12 +231,22 @@ if ([int]$VersionParts[0] -lt 22 -or
   throw "Node.js 22.19 or newer is required; Node.js 24 LTS is recommended."
 }
 
+# Each target enables its own client configuration; everything around that one
+# step is the shared router plane.
+$ConfigManager = if ($Target -eq "dsh") { "src\dsh-config-manager.mjs" } else { "src\config-manager.mjs" }
+$ConfigEnableCommand = if ($Target -eq "dsh") { "install" } else { "enable" }
+$ConfigDisableCommand = if ($Target -eq "dsh") { "uninstall" } else { "disable" }
+$ConfigEnabled = $false
+$ServiceInstalled = $false
+$AdoptionPending = $false
 Push-Location $ScriptDirectory
 try {
   if ($Target -eq "codex") {
     $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
     New-Item -ItemType Directory -Force -Path $CodexHome | Out-Null
-    & node src/legacy-migration.mjs assert-clear | Out-Null
+    $LegacyArguments = @("src\legacy-migration.mjs", "assert-clear")
+    if ($AdoptNativeCatalog) { $LegacyArguments += "--adopt-native-catalog" }
+    & node @LegacyArguments | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Resolve the detected older router before installing." }
   }
   if (-not $PrepareOnly) {
@@ -186,33 +281,58 @@ try {
   if ((Get-InstallStep "python-deps") -eq "skip") {
     Write-Host "LiteLLM already matches the pinned versions; skipping the Python install."
   } elseif (Get-Command "uv" -ErrorAction SilentlyContinue) {
+    $VenvHomeOk = (& node src/install-plan.mjs venv-home-ok 2>$null | Select-Object -Last 1) -eq "ok"
     if (-not (Test-Path $Python)) {
       & uv venv --python 3.12 .venv
       if ($LASTEXITCODE -ne 0) { throw "uv could not create the Python environment." }
+    } elseif (-not $VenvHomeOk) {
+      # A venv whose interpreter home was cleared (macOS wipes /private/tmp,
+      # and installers that recorded a temporary Python as the venv home end
+      # up with a dangling interpreter) must be recreated, not pip-installed
+      # into: the launcher may still exist while pyvenv.cfg points at a
+      # vanished home.
+      Write-Host "The virtual environment's interpreter home is missing; recreating the venv."
+      & uv venv --clear --python 3.12 .venv
+      if ($LASTEXITCODE -ne 0) { throw "uv could not create the Python environment." }
     }
-    # litellm 1.95.0 needs fastapi<0.140 (get_flat_dependant was removed);
-    # re-test before lifting either pin. src/install-plan.mjs holds the same
-    # pins and its test fails when only one copy moves.
-    & uv pip install --python $Python "litellm[proxy]==1.95.0" "fastapi==0.139.2"
+    # requirements/python.txt is the hash-verified transitive closure of the
+    # pins in src/install-plan.mjs. Hash checking makes every wheel and sdist
+    # in that tree verify against the lock before it is executed; without it
+    # only the two top-level packages were pinned and the rest was whatever
+    # PyPI resolved that day. Regenerate with bin/lock-python, never by hand.
+    & uv pip install --python $Python --require-hashes -r requirements/python.txt
     if ($LASTEXITCODE -ne 0) { throw "LiteLLM installation failed." }
     & node src/install-plan.mjs record python-deps
     if ($LASTEXITCODE -ne 0) { throw "Recording the Python dependency state failed." }
   } else {
+    $VenvHomeOk = (& node src/install-plan.mjs venv-home-ok 2>$null | Select-Object -Last 1) -eq "ok"
+    $RecreateVenv = -not $VenvHomeOk
     if (Get-Command "py" -ErrorAction SilentlyContinue) {
       & py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
       if ($LASTEXITCODE -ne 0) { throw "Python 3.10 or newer is required." }
-      if (-not (Test-Path $Python)) { & py -3 -m venv .venv }
+      if (-not (Test-Path $Python)) {
+        & py -3 -m venv .venv
+      } elseif ($RecreateVenv) {
+        Write-Host "The virtual environment's interpreter home is missing; recreating the venv."
+        & py -3 -m venv --clear .venv
+      }
     } elseif (Get-Command "python" -ErrorAction SilentlyContinue) {
       & python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
       if ($LASTEXITCODE -ne 0) { throw "Python 3.10 or newer is required." }
-      if (-not (Test-Path $Python)) { & python -m venv .venv }
+      if (-not (Test-Path $Python)) {
+        & python -m venv .venv
+      } elseif ($RecreateVenv) {
+        Write-Host "The virtual environment's interpreter home is missing; recreating the venv."
+        & python -m venv --clear .venv
+      }
     } else {
       throw "Python 3.10+ or uv is required. Install uv from https://docs.astral.sh/uv/."
     }
     if (-not (Test-Path $Python)) { throw "The Python virtual environment was not created." }
     & $Python -m pip install --upgrade pip
     if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed." }
-    & $Python -m pip install "litellm[proxy]==1.95.0" "fastapi==0.139.2"
+    # Same hash-verified lock as the uv branch above; both stay hash-checked.
+    & $Python -m pip install --require-hashes -r requirements/python.txt
     if ($LASTEXITCODE -ne 0) { throw "LiteLLM installation failed." }
     & node src/install-plan.mjs record python-deps
     if ($LASTEXITCODE -ne 0) { throw "Recording the Python dependency state failed." }
@@ -220,46 +340,79 @@ try {
 
   & node src/secret.mjs ensure
   if ($LASTEXITCODE -ne 0) { throw "Local router-key setup failed." }
+  if ($AdoptNativeCatalog) {
+    & node src/native-catalog-source.mjs prepare-from-config | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Existing native model-catalog adoption failed." }
+    $AdoptionPending = $true
+  }
+  # The state root is read by both arms below, so it is computed once rather
+  # than inside the Codex branch: the harness arm needs it to find an existing
+  # native catalog, and the republish step needs it to find the harness's own.
+  $StateRoot = if ($env:MODEL_ROUTER_STATE_DIR) { $env:MODEL_ROUTER_STATE_DIR }
+    elseif ($env:CODEX_ROUTER_STATE_DIR) { $env:CODEX_ROUTER_STATE_DIR }
+    elseif ($env:KIMI_CODEX_STATE_DIR) { $env:KIMI_CODEX_STATE_DIR }
+    elseif ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME "codex-router" }
+    else { Join-Path $HOME ".codex\codex-router" }
+  # `-s` in the POSIX scripts: present *and* non-empty. A zero-byte state file
+  # is a half-written one, and treating it as real publishes an empty catalog.
+  function Test-NonEmptyFile([string] $Path) {
+    return (Test-Path $Path -PathType Leaf) -and ((Get-Item $Path).Length -gt 0)
+  }
+  $NativeCatalogPath = Join-Path $StateRoot "native-models.json"
   if ($Target -eq "codex") {
-    $StateRoot = if ($env:MODEL_ROUTER_STATE_DIR) { $env:MODEL_ROUTER_STATE_DIR }
-      elseif ($env:CODEX_ROUTER_STATE_DIR) { $env:CODEX_ROUTER_STATE_DIR }
-      elseif ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME "codex-router" }
-      else { Join-Path $HOME ".codex\codex-router" }
-    if (Test-Path (Join-Path $StateRoot "native-models.json")) {
+    if (Test-NonEmptyFile $NativeCatalogPath) {
       & node src/catalog.mjs
     } else {
       & node src/catalog.mjs --refresh-native
     }
     if ($LASTEXITCODE -ne 0) { throw "Codex model-catalog generation failed." }
+  } elseif (Test-NonEmptyFile $NativeCatalogPath) {
+    # A harness-only machine has no Codex to ask for a native catalog, so one is
+    # regenerated only when an earlier Codex install already left one behind.
+    & node src/catalog.mjs
+    if ($LASTEXITCODE -ne 0) { throw "Codex model-catalog generation failed." }
   }
   & node src/litellm-config.mjs
   if ($LASTEXITCODE -ne 0) { throw "Gateway configuration generation failed." }
+  # The router plane is shared, so an install for one client changes the routable
+  # set for the other. Republish whichever integration is already installed here
+  # rather than leaving it advertising a stale model list.
+  if ($Target -ne "dsh" -and (Test-NonEmptyFile (Join-Path $StateRoot "dsh-models.json"))) {
+    & node src/dsh-config-manager.mjs install | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "DeepSeek Harness republish failed." }
+  }
 
   if ($PrepareOnly) {
     Write-Host "Dependencies and generated files are prepared; application configuration was not changed."
     exit 0
   }
 
-  $ConfigManager = "src\config-manager.mjs"
-  $ConfigEnabled = $false
-  $ServiceInstalled = $false
-  try {
-    $ConfigEnabled = $true
-    & node $ConfigManager enable
-    if ($LASTEXITCODE -ne 0) { throw "$Target configuration update failed." }
-    $ServiceInstalled = $true
-    & node src/service.mjs install
-    if ($LASTEXITCODE -ne 0) { throw "Background-service installation failed." }
-    & node src/wait-health.mjs
-    if ($LASTEXITCODE -ne 0) { throw "The router did not become healthy." }
-    & node src/install-manifest.mjs record | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Install-manifest recording failed." }
-  } catch {
-    if ($ServiceInstalled) { & node src/service.mjs uninstall 2>$null | Out-Null }
-    if ($ConfigEnabled) { & node $ConfigManager disable 2>$null | Out-Null }
-    throw
+  $ConfigEnabled = $true
+  $ConfigArguments = @($ConfigManager, $ConfigEnableCommand)
+  if ($AdoptNativeCatalog) { $ConfigArguments += "--adopt-native-catalog" }
+  & node @ConfigArguments
+  if ($LASTEXITCODE -ne 0) { throw "$Target configuration update failed." }
+  $AdoptionPending = $false
+  $ServiceInstalled = $true
+  & node src/service.mjs install
+  if ($LASTEXITCODE -ne 0) { throw "Background-service installation failed." }
+  & node src/wait-health.mjs
+  if ($LASTEXITCODE -ne 0) { throw "The router did not become healthy." }
+  & node src/install-manifest.mjs record | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "Install-manifest recording failed." }
+  if ($Target -eq "dsh") {
+    Write-Host "Published the selected external model routes to DeepSeek Harness. It reloads them on the next request."
+  } else {
+    Write-Host "Installed the selected external model routes. Fully quit and reopen Codex."
   }
-  Write-Host "Installed the selected external model routes. Fully quit and reopen Codex."
+} catch {
+  if ($ServiceInstalled) { & node src/service.mjs uninstall 2>$null | Out-Null }
+  if ($ConfigEnabled) {
+    & node $ConfigManager $ConfigDisableCommand 2>$null | Out-Null
+  } elseif ($AdoptionPending) {
+    & node src/native-catalog-source.mjs clear-pending 2>$null | Out-Null
+  }
+  throw
 } finally {
   Pop-Location
 }

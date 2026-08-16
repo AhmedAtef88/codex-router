@@ -120,13 +120,14 @@ approval_policy = "never"
     assert.match(configured, /# BEGIN codex-router-multi-agent-v2-managed/);
     assert.match(
       configured,
-      /multi_agent_v2 = \{ enabled = true, max_concurrent_threads_per_session = 6, expose_spawn_agent_model_overrides = true \}/,
+      /multi_agent_v2 = \{ enabled = true, max_concurrent_threads_per_session = 6, expose_spawn_agent_model_overrides = true, usage_hint_enabled = true, root_agent_usage_hint_text = "When a child agent finishes \(FINAL_ANSWER, task_complete, or an idle\/errored wait snapshot\), call interrupt_agent on that child so Codex can mark it done\. Do not leave finished children in the working state\." \}/,
     );
     assert.doesNotMatch(configured, /codex-router-agent-concurrency-managed/);
     assert.doesNotMatch(configured, /^max_concurrent_threads_per_session\s*=/m);
     assert.doesNotMatch(configured, /\[agents\]/);
     assert.match(configured, /\[model_providers\.codex-router\]/);
     assert.match(configured, /wire_api = "responses"/);
+    assert.match(configured, /supports_standalone_web_search = true/);
     assert.ok(
       configured.includes(
         `openai_base_url = "http://127.0.0.1:46192/_codex-router/${CALLER_KEY}/v1"`,
@@ -318,7 +319,7 @@ test("config manager enables multi_agent_v2 and skips the legacy agents scalar w
     assert.match(enabled, /# BEGIN codex-router-multi-agent-v2-managed/);
     assert.match(
       enabled,
-      /multi_agent_v2 = \{ enabled = true, max_concurrent_threads_per_session = 6, expose_spawn_agent_model_overrides = true \}/,
+      /multi_agent_v2 = \{ enabled = true, max_concurrent_threads_per_session = 6, expose_spawn_agent_model_overrides = true, usage_hint_enabled = true, root_agent_usage_hint_text = "When a child agent finishes \(FINAL_ANSWER, task_complete, or an idle\/errored wait snapshot\), call interrupt_agent on that child so Codex can mark it done\. Do not leave finished children in the working state\." \}/,
     );
     assert.doesNotMatch(enabled, /codex-router-agent-concurrency-managed/);
     assert.doesNotMatch(enabled, /^max_concurrent_threads_per_session\s*=/m);
@@ -334,6 +335,22 @@ test("config manager enables multi_agent_v2 and skips the legacy agents scalar w
     const restored = readFileSync(configPath, "utf8");
     assert.doesNotMatch(restored, /codex-router-multi-agent-v2-managed|multi_agent_v2/);
     assert.equal(restored.trimStart(), `model = "gpt-5.5"\n`);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("the managed multi_agent_v2 line tells the parent to interrupt finished children", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-v2-hint-"));
+  const configPath = path.join(codexHome, "config.toml");
+  writeFileSync(configPath, `model = "gpt-5.5"\n`, { mode: 0o600 });
+
+  try {
+    run("enable", codexHome);
+    const enabled = readFileSync(configPath, "utf8");
+    assert.match(enabled, /usage_hint_enabled = true/);
+    assert.match(enabled, /root_agent_usage_hint_text = "When a child agent finishes/);
+    assert.match(enabled, /call interrupt_agent on that child/);
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }
@@ -520,7 +537,12 @@ test("config manager adopts the exact legacy router-owned provider table", () =>
     assert.equal((migrated.match(/\[model_providers\.codex-router\]/g) || []).length, 1);
     assert.match(migrated, /# BEGIN codex-router-provider-managed/);
     assert.match(migrated, /name = "Codex Router \(external models\)"/);
-    assert.doesNotMatch(migrated, /extra providers|requires_openai_auth/);
+    assert.doesNotMatch(migrated, /extra providers/);
+    const loginFreeProvider = migrated.match(
+      /\[model_providers\.codex-router\][\s\S]*?# END codex-router-provider-managed/,
+    )?.[0];
+    assert.ok(loginFreeProvider);
+    assert.doesNotMatch(loginFreeProvider, /requires_openai_auth/);
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }
@@ -571,7 +593,7 @@ test("config manager upgrades the earlier Kimi-only managed block", () => {
 
 # BEGIN kimi-codex-router-managed
 openai_base_url = "http://127.0.0.1:46192/v1"
-model_catalog_json = "${path.join(codexHome, "kimi-router", "merged-models.json")}"
+model_catalog_json = ${JSON.stringify(path.join(codexHome, "kimi-router", "merged-models.json"))}
 # END kimi-codex-router-managed
 
 [profiles.personal]
@@ -607,7 +629,7 @@ model_reasoning_effort = "high"
 
 # BEGIN kimi-codex-router-managed
 openai_base_url = "http://127.0.0.1:46192/v1"
-model_catalog_json = "${prototypeCatalog}"
+model_catalog_json = ${JSON.stringify(prototypeCatalog)}
 
 [projects."/important/project"]
 trust_level = "trusted"
@@ -695,6 +717,26 @@ model = "gpt-5.6-terra"
   }
 });
 
+test("config manager recognizes the pre-BrlAPI-safe default and rewrites it", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-legacy-port-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(stateDir, "caller-secret"), `${CALLER_KEY}\n`, { mode: 0o600 });
+  writeFileSync(
+    configPath,
+    `# BEGIN codex-router-managed\nopenai_base_url = "http://127.0.0.1:4102/_codex-router/${CALLER_KEY}/v1"\nmodel_catalog_json = ${JSON.stringify(path.join(stateDir, "merged-models.json"))}\n`,
+    { mode: 0o600 },
+  );
+  try {
+    assert.equal(run("enable", codexHome, stateDir).mode, "router");
+    assert.match(readFileSync(configPath, "utf8"), /127\.0\.0\.1:46192/);
+    assert.doesNotMatch(readFileSync(configPath, "utf8"), /127\.0\.0\.1:4102/);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
 test("model_catalog_json round-trips through TOML escaping", () => {
   const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-config-catalog-"));
   const configPath = path.join(codexHome, "config.toml");
@@ -727,6 +769,567 @@ test("model_catalog_json accepts apostrophes and backslashes in the path", () =>
     assert.ok(line, "model_catalog_json is emitted");
     const raw = line.slice(line.indexOf("=") + 1).trim();
     assert.equal(JSON.parse(raw), path.join(stateDir, "merged-models.json"));
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("config manager adopts and restores a prepared user-owned native catalog", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-adopt-catalog-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  const foreignCatalog = path.join(codexHome, "user catalog's", "native-models.json");
+  mkdirSync(path.dirname(foreignCatalog), { recursive: true });
+  writeFileSync(
+    foreignCatalog,
+    JSON.stringify({ models: [{ slug: "gpt-user-native" }] }),
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    configPath,
+    `model = "gpt-user-native"\nmodel_catalog_json = ${JSON.stringify(foreignCatalog)}\n`,
+    { mode: 0o600 },
+  );
+
+  try {
+    execFileSync(
+      process.execPath,
+      [path.join(root, "src", "native-catalog-source.mjs"), "prepare-from-config"],
+      {
+        cwd: root,
+        env: {
+          ...process.env,
+          CODEX_HOME: codexHome,
+          CODEX_ROUTER_STATE_DIR: stateDir,
+        },
+      },
+    );
+    const enabled = run("enable", codexHome, stateDir, ["--adopt-native-catalog"]);
+    assert.equal(enabled.mode, "router");
+    assert.equal(
+      JSON.parse(
+        readFileSync(path.join(stateDir, "native-catalog-source.json"), "utf8"),
+      ).status,
+      "active",
+    );
+
+    const disabled = run("disable", codexHome, stateDir);
+    assert.equal(disabled.mode, "native");
+    assert.equal(
+      readFileSync(configPath, "utf8").includes(
+        `model_catalog_json = ${JSON.stringify(foreignCatalog)}`,
+      ),
+      true,
+    );
+    assert.equal(
+      existsSync(path.join(stateDir, "native-catalog-source.json")),
+      false,
+    );
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("signed routing preserves the active provider identity and exactly restores its table", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-signed-provider-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  const original = `model = "gpt-5.6-sol"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "CC Switch"
+base_url = "https://example.invalid/v1"
+wire_api = "responses"
+
+[model_providers.custom.query_params]
+api_key = "PROVIDER_QUERY_SECRET"
+
+[profiles.work]
+model = "gpt-5.6-terra"
+
+[model_providers.custom.auth]
+token = "PROVIDER_AUTH_SECRET"
+
+[model_providers.other]
+base_url = "https://other.invalid/v1"
+
+[model_providers.custom.http_headers]
+Authorization = "Bearer PROVIDER_HEADER_SECRET"
+`;
+  writeFileSync(configPath, original, { mode: 0o600 });
+
+  try {
+    const enabled = run("signed-enable", codexHome, stateDir);
+    assert.equal(enabled.signed_routing, true);
+    assert.equal(enabled.signed_routing_managed, true);
+    const configured = readFileSync(configPath, "utf8");
+    assert.match(configured, /^model_provider = "custom"$/m);
+    assert.match(configured, /# BEGIN codex-router-signed-provider-managed/);
+    assert.match(configured, /\[model_providers\.custom\]/);
+    assert.doesNotMatch(configured, /\[model_providers\.codex-router-signed\]/);
+    assert.match(configured, new RegExp(`base_url = "http://127\\.0\\.0\\.1:46192/_codex-router/${CALLER_KEY}/v1"`));
+    assert.match(configured, /requires_openai_auth = true/);
+    assert.match(configured, /supports_websockets = false/);
+    assert.match(configured, /supports_standalone_web_search = true/);
+    assert.doesNotMatch(configured, /PROVIDER_(?:QUERY|AUTH|HEADER)_SECRET/);
+    assert.doesNotMatch(
+      configured,
+      /\[model_providers\.custom\.(?:query_params|auth|http_headers)\]/,
+    );
+    assert.match(configured, /\[model_providers\.other\]/);
+    assert.match(configured, /\[profiles\.work\]/);
+    assert.equal(
+      privateFileIsProtected(path.join(stateDir, "signed-provider-mode.json")),
+      true,
+    );
+
+    const disabled = run("signed-disable", codexHome, stateDir);
+    assert.equal(disabled.model_provider, "custom");
+    assert.equal(disabled.signed_provider_state_present, false);
+    const restored = readFileSync(configPath, "utf8");
+    assert.match(restored, /\[model_providers\.custom\]/);
+    assert.match(restored, /name = "CC Switch"/);
+    assert.match(restored, /base_url = "https:\/\/example\.invalid\/v1"/);
+    assert.match(restored, /api_key = "PROVIDER_QUERY_SECRET"/);
+    assert.match(restored, /token = "PROVIDER_AUTH_SECRET"/);
+    assert.match(restored, /Authorization = "Bearer PROVIDER_HEADER_SECRET"/);
+    assert.ok(
+      restored.indexOf("[model_providers.custom.query_params]") <
+        restored.indexOf("[profiles.work]"),
+    );
+    assert.ok(
+      restored.indexOf("[model_providers.other]") <
+        restored.indexOf("[model_providers.custom.http_headers]"),
+    );
+    assert.doesNotMatch(restored, /codex-router-signed-provider-managed/);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("signed routing snapshots a quoted provider id containing a closing bracket", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-signed-quoted-id-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  writeFileSync(
+    configPath,
+    `model_provider = "custom]id"
+
+[model_providers."custom]id"]
+name = "Foreign provider"
+base_url = "https://foreign.invalid/v1"
+
+[model_providers."custom]id".query_params]
+api_key = "QUOTED_QUERY_SECRET"
+
+[model_providers."custom]id".auth]
+token = "QUOTED_AUTH_SECRET"
+
+[model_providers."custom]id".http_headers]
+Authorization = "Bearer QUOTED_HEADER_SECRET"
+`,
+    { mode: 0o600 },
+  );
+
+  try {
+    const enabled = run("signed-enable", codexHome, stateDir);
+    assert.equal(enabled.signed_routing, true);
+    const active = readFileSync(configPath, "utf8");
+    assert.equal((active.match(/\[model_providers\."custom\]id"\]/g) || []).length, 1);
+    assert.doesNotMatch(active, /https:\/\/foreign\.invalid/);
+    assert.doesNotMatch(active, /QUOTED_(?:QUERY|AUTH|HEADER)_SECRET/);
+    assert.doesNotMatch(
+      active,
+      /\[model_providers\."custom\]id"\.(?:query_params|auth|http_headers)\]/,
+    );
+
+    run("signed-disable", codexHome, stateDir);
+    const restored = readFileSync(configPath, "utf8");
+    assert.match(restored, /base_url = "https:\/\/foreign\.invalid\/v1"/);
+    assert.match(restored, /api_key = "QUOTED_QUERY_SECRET"/);
+    assert.match(restored, /token = "QUOTED_AUTH_SECRET"/);
+    assert.match(restored, /Authorization = "Bearer QUOTED_HEADER_SECRET"/);
+    assert.doesNotMatch(restored, /codex-router-signed-provider-managed/);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("signed routing ignores table-looking lines inside multiline TOML strings", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-signed-multiline-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  writeFileSync(
+    configPath,
+    `model_provider = "custom"
+
+[model_providers.custom]
+description = """
+[looks.like.a.table]
+This is provider documentation, not a TOML table.
+"""
+base_url = "https://foreign.invalid/v1"
+
+[model_providers.custom.query_params]
+api_key = "MULTILINE_QUERY_SECRET"
+`,
+    { mode: 0o600 },
+  );
+
+  try {
+    run("signed-enable", codexHome, stateDir);
+    const active = readFileSync(configPath, "utf8");
+    assert.doesNotMatch(active, /\[looks\.like\.a\.table\]/);
+    assert.doesNotMatch(active, /https:\/\/foreign\.invalid/);
+    assert.doesNotMatch(active, /MULTILINE_QUERY_SECRET/);
+
+    run("signed-disable", codexHome, stateDir);
+    const restored = readFileSync(configPath, "utf8");
+    assert.match(restored, /description = """\n\[looks\.like\.a\.table\]/);
+    assert.match(restored, /api_key = "MULTILINE_QUERY_SECRET"/);
+    assert.doesNotMatch(restored, /codex-router-signed-provider-managed/);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("signed routing fails closed before writing ambiguous TOML boundaries", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-signed-ambiguous-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  const original = `model_provider = "custom"
+
+[model_providers.custom]
+description = """
+[looks.like.a.table]
+`;
+  writeFileSync(configPath, original, { mode: 0o600 });
+
+  try {
+    assert.throws(
+      () => run("signed-enable", codexHome, stateDir),
+      /ambiguous TOML|unterminated multiline/i,
+    );
+    assert.equal(readFileSync(configPath, "utf8"), original);
+    assert.equal(existsSync(path.join(stateDir, "signed-provider-mode.json")), false);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("ordinary enable keeps signed routing active without reviving nested provider secrets", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-signed-update-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  writeFileSync(
+    configPath,
+    `model_provider = "custom"
+
+[model_providers.custom]
+name = "CC Switch"
+base_url = "https://example.invalid/v1"
+
+[model_providers.custom.query_params]
+api_key = "UPDATE_QUERY_SECRET"
+
+[model_providers.custom.http_headers]
+Authorization = "Bearer UPDATE_HEADER_SECRET"
+`,
+    { mode: 0o600 },
+  );
+  try {
+    run("signed-enable", codexHome, stateDir);
+    const updated = run("enable", codexHome, stateDir);
+    assert.equal(updated.signed_routing, true);
+    assert.equal(updated.signed_routing_managed, true);
+    const active = readFileSync(configPath, "utf8");
+    assert.doesNotMatch(active, /UPDATE_(?:QUERY|HEADER)_SECRET/);
+    assert.equal(
+      (active.match(/# BEGIN codex-router-signed-provider-managed/g) || []).length,
+      1,
+    );
+    assert.equal(
+      JSON.parse(readFileSync(path.join(stateDir, "signed-provider-mode.json"), "utf8"))
+        .version,
+      3,
+    );
+
+    run("signed-disable", codexHome, stateDir);
+    const restored = readFileSync(configPath, "utf8");
+    assert.match(restored, /api_key = "UPDATE_QUERY_SECRET"/);
+    assert.match(restored, /Authorization = "Bearer UPDATE_HEADER_SECRET"/);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("ordinary update upgrades v2 signed state and captures subtables it previously left active", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-signed-v2-update-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  const statePath = path.join(stateDir, "signed-provider-mode.json");
+  writeFileSync(
+    configPath,
+    `model_provider = "custom"
+
+[model_providers.custom]
+name = "CC Switch"
+base_url = "https://example.invalid/v1"
+
+[model_providers.custom.query_params]
+api_key = "LEGACY_V2_QUERY_SECRET"
+`,
+    { mode: 0o600 },
+  );
+  try {
+    run("signed-enable", codexHome, stateDir);
+    const v3 = JSON.parse(readFileSync(statePath, "utf8"));
+    const legacyActive = `${readFileSync(configPath, "utf8")
+      .replace(/^# codex-router-signed-provider-tree-slot.*(?:\n|$)/gm, "")
+      .trimEnd()}\n\n${v3.previousProviderSections[1]}\n`;
+    writeFileSync(configPath, legacyActive, { mode: 0o600 });
+    writeFileSync(
+      statePath,
+      `${JSON.stringify({
+        version: 2,
+        mode: "provider-table",
+        managedProvider: "custom",
+        managedBaseUrl: v3.managedBaseUrl,
+        previousProviderTablePresent: true,
+        previousProviderTable: v3.previousProviderSections[0],
+      }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+
+    const updated = run("enable", codexHome, stateDir);
+    assert.equal(updated.signed_routing, true);
+    assert.doesNotMatch(readFileSync(configPath, "utf8"), /LEGACY_V2_QUERY_SECRET/);
+    const upgraded = JSON.parse(readFileSync(statePath, "utf8"));
+    assert.equal(upgraded.version, 3);
+    assert.ok(
+      upgraded.previousProviderSections.some((section) =>
+        section.includes("LEGACY_V2_QUERY_SECRET")),
+    );
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test(
+  "refresh-catalog restores signed routing instead of leaving the selected provider direct",
+  { skip: process.platform === "win32" },
+  () => {
+    const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-signed-refresh-"));
+    const stateDir = path.join(codexHome, "router-state");
+    const configPath = path.join(codexHome, "config.toml");
+    const codexStub = path.join(codexHome, "codex-stub");
+    writeFileSync(
+      configPath,
+      `model_provider = "custom"
+
+[model_providers.custom]
+name = "CC Switch"
+base_url = "https://example.invalid/v1"
+
+[model_providers.custom.query_params]
+api_key = "REFRESH_QUERY_SECRET"
+`,
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      codexStub,
+      `#!/bin/sh
+case "$1" in
+  --version) echo 'codex-cli 99.0.0' ;;
+  login) exit 0 ;;
+  debug) echo '{"models":[{"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","visibility":"list","priority":10}]}' ;;
+  *) exit 1 ;;
+esac
+`,
+      { mode: 0o755 },
+    );
+    try {
+      run("signed-enable", codexHome, stateDir);
+      writeFileSync(
+        path.join(stateDir, "enabled-providers.json"),
+        `${JSON.stringify({ version: 1, providers: ["deepseek"] })}\n`,
+        { mode: 0o600 },
+      );
+      writeFileSync(path.join(stateDir, "deepseek-api-key.secret"), "test-key\n", {
+        mode: 0o600,
+      });
+      execFileSync(path.join(root, "bin", "refresh-catalog"), [], {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODEX_BIN: codexStub,
+          CODEX_HOME: codexHome,
+          CODEX_ROUTER_PORT: "46192",
+          CODEX_ROUTER_STATE_DIR: stateDir,
+          MODEL_ROUTER_STATE_DIR: stateDir,
+          MODEL_ROUTER_TARGET: "codex",
+        },
+      });
+      const status = run("status", codexHome, stateDir);
+      assert.equal(status.signed_routing, true);
+      assert.equal(status.model_provider, "custom");
+      const active = readFileSync(configPath, "utf8");
+      assert.doesNotMatch(active, /REFRESH_QUERY_SECRET/);
+      assert.match(active, /codex-router-signed-provider-managed/);
+      const catalog = JSON.parse(
+        readFileSync(path.join(stateDir, "merged-models.json"), "utf8"),
+      );
+      assert.ok(catalog.models.some((model) => model.slug === "gpt-5.6-sol"));
+      assert.ok(
+        catalog.models.some((model) => model.slug === "deepseek/deepseek-v4-flash"),
+      );
+    } finally {
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  },
+);
+
+test("signed routing restores an originally unset provider", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-signed-unset-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  writeFileSync(configPath, 'model = "gpt-5.6-sol"\n', { mode: 0o600 });
+  try {
+    run("signed-enable", codexHome, stateDir);
+    assert.doesNotMatch(readFileSync(configPath, "utf8"), /^model_provider\s*=/m);
+    run("signed-disable", codexHome, stateDir);
+    assert.doesNotMatch(readFileSync(configPath, "utf8"), /^model_provider\s*=/m);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("signed routing refuses to overwrite provider-table ownership drift", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-signed-drift-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  writeFileSync(
+    configPath,
+    `model_provider = "custom"
+
+[model_providers.custom]
+name = "CC Switch"
+wire_api = "responses"
+`,
+    { mode: 0o600 },
+  );
+  try {
+    run("signed-enable", codexHome, stateDir);
+    const drifted = readFileSync(configPath, "utf8").replace(
+      /^base_url = ".*"$/m,
+      'base_url = "https://changed.invalid/v1"',
+    );
+    writeFileSync(configPath, drifted, { mode: 0o600 });
+    assert.throws(
+      () => run("signed-disable", codexHome, stateDir),
+      /lost ownership|Refusing to replace/i,
+    );
+    assert.match(readFileSync(configPath, "utf8"), /changed\.invalid/);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("config manager keeps user tables parked inside the managed provider block", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-config-"));
+  const configPath = path.join(codexHome, "config.toml");
+  writeFileSync(configPath, 'model = "gpt-5.6-sol"\nmodel_provider = "openai"\n', {
+    mode: 0o644,
+  });
+
+  try {
+    run("enable", codexHome);
+
+    // The desktop app rewrites config.toml wholesale and can park user tables
+    // between the managed provider table and the end marker.
+    const parked = readFileSync(configPath, "utf8").replace(
+      "# END codex-router-provider-managed",
+      `[desktop]
+localeOverride = "zh-CN"
+followUpQueueMode = "queue"
+
+[desktop.appearanceLightChromeTheme]
+accent = "#4e96d1"
+
+# END codex-router-provider-managed`,
+    );
+    assert.notEqual(parked, readFileSync(configPath, "utf8"));
+    writeFileSync(configPath, parked, { mode: 0o600 });
+
+    const reenabled = run("enable", codexHome);
+    assert.equal(reenabled.mode, "router");
+    const refreshed = readFileSync(configPath, "utf8");
+    assert.match(refreshed, /\[desktop\]/);
+    assert.match(refreshed, /localeOverride = "zh-CN"/);
+    assert.match(refreshed, /\[desktop\.appearanceLightChromeTheme\]/);
+    assert.match(refreshed, /accent = "#4e96d1"/);
+    // The hoisted table must sit outside the managed block.
+    const providerBlock = refreshed.match(
+      /# BEGIN codex-router-provider-managed\n[\s\S]*?\n# END codex-router-provider-managed/,
+    );
+    assert.ok(providerBlock);
+    assert.doesNotMatch(providerBlock[0], /\[desktop\]/);
+
+    const disabled = run("disable", codexHome);
+    assert.equal(disabled.mode, "native");
+    const restored = readFileSync(configPath, "utf8");
+    assert.doesNotMatch(restored, /codex-router-provider-managed/);
+    assert.match(restored, /\[desktop\]/);
+    assert.match(restored, /localeOverride = "zh-CN"/);
+    assert.match(restored, /accent = "#4e96d1"/);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
+test("a header-looking line inside a parked multiline string does not split the hoist", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-config-"));
+  const configPath = path.join(codexHome, "config.toml");
+  writeFileSync(configPath, 'model = "gpt-5.6-sol"\nmodel_provider = "openai"\n', {
+    mode: 0o644,
+  });
+
+  try {
+    run("enable", codexHome);
+
+    // A parked table can hold a multiline string whose content looks like a
+    // TOML header. A `[`-prefix line scan would split the string there and
+    // corrupt the hoisted table; the real scanner must carry it out whole.
+    const parked = readFileSync(configPath, "utf8").replace(
+      "# END codex-router-provider-managed",
+      `[desktop]
+notes = """
+[not_a_table]
+still the same string
+"""
+accent = "#4e96d1"
+
+# END codex-router-provider-managed`,
+    );
+    writeFileSync(configPath, parked, { mode: 0o600 });
+
+    const reenabled = run("enable", codexHome);
+    assert.equal(reenabled.mode, "router");
+    const refreshed = readFileSync(configPath, "utf8");
+    // The whole table survived as one piece: header, multiline string with its
+    // header-looking content, and the key that followed the string.
+    assert.match(
+      refreshed,
+      /\[desktop\]\nnotes = """\n\[not_a_table\]\nstill the same string\n"""\naccent = "#4e96d1"/,
+    );
+    // The string content was not promoted to a real table anywhere.
+    assert.equal(
+      refreshed.indexOf("[not_a_table]"),
+      refreshed.lastIndexOf("[not_a_table]"),
+      "the header-looking line appears once, inside the string",
+    );
   } finally {
     rmSync(codexHome, { recursive: true, force: true });
   }

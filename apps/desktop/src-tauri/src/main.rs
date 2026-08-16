@@ -19,6 +19,9 @@ use tauri::{
     AppHandle, Manager, PhysicalPosition, Position, State, WebviewWindow, WindowEvent,
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 const PANEL_WIDTH: f64 = 382.0;
 const PANEL_HEIGHT: f64 = 610.0;
 const ISLAND_WIDTH: f64 = 326.0;
@@ -100,6 +103,24 @@ fn main() {
             account_usage,
             provider_usage,
             provider_setup,
+            local_models,
+            local_model_speed,
+            update_local_ollama,
+            vision_bridge_status,
+            vision_bridge_models,
+            vision_bridge_probe,
+            set_vision_bridge,
+            set_vision_engine,
+            set_vision_effort,
+            pull_vision_model,
+            vision_pull_status,
+            benchmark_vision_model,
+            use_local_vision_model,
+            install_local_model,
+            uninstall_local_model,
+            cancel_local_model,
+            set_local_model_enabled,
+            set_lmstudio_model_enabled,
             install_provider_cli,
             connect_oauth,
             save_api_key,
@@ -107,10 +128,18 @@ fn main() {
             set_provider_enabled,
             set_subagent_mode,
             set_subagent_model,
+            set_subagent_provider,
             set_subagent_selection,
             set_picker_model,
+            set_picker_provider,
             set_picker_models,
+            set_tool_result_aging,
             set_login_free,
+            set_signed_routing,
+            presence_status,
+            set_presence_mode,
+            maintenance,
+            doctor_fix,
             set_island_enabled,
             set_island_expanded,
             show_panel,
@@ -161,19 +190,25 @@ fn main() {
 }
 
 fn install_tray(app: &mut tauri::App) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "Open Model Router", true, None::<&str>)?;
-    let toggle = MenuItem::with_id(
+    let open = MenuItem::with_id(
         app,
-        "toggle-island",
-        "Toggle activity pill",
+        "open",
+        tray_text("Open Model Router"),
         true,
         None::<&str>,
     )?;
-    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let toggle = MenuItem::with_id(
+        app,
+        "toggle-island",
+        tray_text("Toggle activity pill"),
+        true,
+        None::<&str>,
+    )?;
+    let quit = MenuItem::with_id(app, "quit", tray_text("Quit"), true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &toggle, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("model-router")
-        .tooltip("Codex Model Router")
+        .tooltip(tray_text("Codex Model Router"))
         .menu(&menu)
         .show_menu_on_left_click(cfg!(target_os = "linux"))
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -215,6 +250,28 @@ fn install_tray(app: &mut tauri::App) -> tauri::Result<()> {
     }
     builder.build(app)?;
     Ok(())
+}
+
+/// The native macOS companion has its own SwiftUI localization layer. Keep the
+/// Tauri tray menu in sync for Linux and Windows, where the menu itself is
+/// rendered by the Rust tray backend.
+fn tray_text(english: &str) -> String {
+    let language = ["LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"]
+        .iter()
+        .filter_map(|name| env::var(name).ok())
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if language.starts_with("zh") || language.contains("zh_") {
+        return match english {
+            "Open Model Router" => "打开模型路由".into(),
+            "Toggle activity pill" => "切换活动胶囊".into(),
+            "Quit" => "退出".into(),
+            "Codex Model Router" => "Codex 模型路由".into(),
+            _ => english.into(),
+        };
+    }
+    english.into()
 }
 
 #[tauri::command]
@@ -274,6 +331,256 @@ async fn provider_setup(state: State<'_, RouterState>) -> Result<Value, String> 
 }
 
 #[tauri::command]
+async fn local_models(state: State<'_, RouterState>) -> Result<Value, String> {
+    run_json_command(
+        state.inner().clone(),
+        vec!["local-models".into(), "list".into(), "--json".into()],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn local_model_speed(state: State<'_, RouterState>, model: String) -> Result<Value, String> {
+    validate_local_model_ref(&model)?;
+    run_json_command(
+        state.inner().clone(),
+        vec!["local-models".into(), "benchmark".into(), model],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn update_local_ollama(state: State<'_, RouterState>) -> Result<Value, String> {
+    run_json_command(
+        state.inner().clone(),
+        vec![
+            "local-models".into(),
+            "runtime".into(),
+            "update".into(),
+            "--yes".into(),
+        ],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn vision_bridge_status(state: State<'_, RouterState>) -> Result<Value, String> {
+    run_json_command(
+        state.inner().clone(),
+        vec!["vision-bridge".into(), "status".into()],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn vision_bridge_models(state: State<'_, RouterState>) -> Result<Value, String> {
+    run_json_command(
+        state.inner().clone(),
+        vec!["vision-bridge".into(), "models".into()],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn vision_bridge_probe(state: State<'_, RouterState>) -> Result<Value, String> {
+    run_json_command(
+        state.inner().clone(),
+        vec!["vision-bridge".into(), "probe".into()],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn set_vision_bridge(state: State<'_, RouterState>, enabled: bool) -> Result<Value, String> {
+    run_json_command(
+        state.inner().clone(),
+        vec![
+            "vision-bridge".into(),
+            (if enabled { "on" } else { "off" }).into(),
+        ],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn set_vision_engine(
+    state: State<'_, RouterState>,
+    engine: String,
+    effort: Option<String>,
+) -> Result<Value, String> {
+    validate_vision_value(&engine, "vision engine")?;
+    if let Some(value) = effort.as_deref() {
+        validate_vision_value(value, "vision effort")?;
+    }
+    let mut args = vec!["vision-bridge".into(), "engine".into(), engine];
+    if let Some(value) = effort {
+        args.push(value);
+    }
+    run_json_command(state.inner().clone(), args, None).await
+}
+
+#[tauri::command]
+async fn set_vision_effort(state: State<'_, RouterState>, effort: String) -> Result<Value, String> {
+    validate_vision_value(&effort, "vision effort")?;
+    run_json_command(
+        state.inner().clone(),
+        vec!["vision-bridge".into(), "effort".into(), effort],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn pull_vision_model(state: State<'_, RouterState>, model: String) -> Result<Value, String> {
+    validate_local_model_ref(&model)?;
+    run_json_command(
+        state.inner().clone(),
+        vec!["vision-bridge".into(), "pull".into(), model],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn vision_pull_status(state: State<'_, RouterState>) -> Result<Value, String> {
+    run_json_command(
+        state.inner().clone(),
+        vec!["vision-bridge".into(), "pull-status".into()],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn benchmark_vision_model(
+    state: State<'_, RouterState>,
+    model: String,
+) -> Result<Value, String> {
+    validate_local_model_ref(&model)?;
+    run_json_command(
+        state.inner().clone(),
+        vec!["vision-bridge".into(), "benchmark".into(), model],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn use_local_vision_model(
+    state: State<'_, RouterState>,
+    model: String,
+) -> Result<Value, String> {
+    validate_local_model_ref(&model)?;
+    run_json_command(
+        state.inner().clone(),
+        vec!["vision-bridge".into(), "local".into(), model],
+        None,
+    )
+    .await
+}
+
+// `--yes` is consent to install and start Ollama itself when it is missing, so
+// a single install action covers both the runtime and the model. `force` is a
+// separate decision -- the operator accepting a model this machine is rated too
+// small for -- and the two have to be expressible together.
+#[tauri::command]
+async fn install_local_model(
+    state: State<'_, RouterState>,
+    model: String,
+    force: Option<bool>,
+) -> Result<Value, String> {
+    validate_local_model_ref(&model)?;
+    let mut args: Vec<String> = vec![
+        "local-models".into(),
+        "install".into(),
+        model,
+        "--yes".into(),
+    ];
+    if force.unwrap_or(false) {
+        args.push("--force".into());
+    }
+    run_json_command(state.inner().clone(), args, None).await
+}
+
+#[tauri::command]
+async fn uninstall_local_model(
+    state: State<'_, RouterState>,
+    model: String,
+) -> Result<Value, String> {
+    validate_local_model_ref(&model)?;
+    run_json_command(
+        state.inner().clone(),
+        vec![
+            "local-models".into(),
+            "uninstall".into(),
+            model,
+            "--yes".into(),
+            "--async".into(),
+        ],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn cancel_local_model(state: State<'_, RouterState>, model: String) -> Result<Value, String> {
+    validate_local_model_ref(&model)?;
+    run_json_command(
+        state.inner().clone(),
+        vec!["local-models".into(), "cancel".into(), model],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn set_local_model_enabled(
+    state: State<'_, RouterState>,
+    model: String,
+    enabled: bool,
+) -> Result<Value, String> {
+    validate_local_model_ref(&model)?;
+    run_json_command(
+        state.inner().clone(),
+        vec![
+            "local-models".into(),
+            "set".into(),
+            model,
+            (if enabled { "on" } else { "off" }).into(),
+        ],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn set_lmstudio_model_enabled(
+    state: State<'_, RouterState>,
+    model: String,
+    enabled: bool,
+) -> Result<Value, String> {
+    validate_lmstudio_model_id(&model)?;
+    run_json_command(
+        state.inner().clone(),
+        vec![
+            "local-models".into(),
+            "lmstudio-set".into(),
+            model,
+            (if enabled { "on" } else { "off" }).into(),
+        ],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
 async fn install_provider_cli(
     state: State<'_, RouterState>,
     provider: String,
@@ -309,10 +616,10 @@ async fn save_api_key(
 ) -> Result<Value, String> {
     validate_provider_kind(&provider, ProviderKind::Api)?;
     if api_key.trim().is_empty() {
-        return Err("Enter an API key first.".into());
+        return Err("Enter a credential first.".into());
     }
     if api_key.len() > 16 * 1024 {
-        return Err("The API key is too large.".into());
+        return Err("The credential is too large.".into());
     }
 
     let router = state.inner().clone();
@@ -326,7 +633,7 @@ async fn save_api_key(
         run_control_json(&router, &["providers", "--json"], None)
     })
     .await
-    .map_err(|_| "The API key operation did not finish.".to_string())?
+    .map_err(|_| "The credential operation did not finish.".to_string())?
 }
 
 // The control plane already drops the provider from the Codex selection when a
@@ -345,7 +652,7 @@ async fn remove_api_key(state: State<'_, RouterState>, provider: String) -> Resu
         Ok(removal)
     })
     .await
-    .map_err(|_| "The API key removal did not finish.".to_string())?
+    .map_err(|_| "The credential removal did not finish.".to_string())?
 }
 
 #[tauri::command]
@@ -394,6 +701,25 @@ async fn set_subagent_model(
 }
 
 #[tauri::command]
+async fn set_subagent_provider(
+    state: State<'_, RouterState>,
+    provider: String,
+    enabled: bool,
+) -> Result<Value, String> {
+    run_json_command(
+        state.inner().clone(),
+        vec![
+            "subagents".into(),
+            "provider".into(),
+            provider,
+            (if enabled { "on" } else { "off" }).into(),
+        ],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
 async fn set_subagent_selection(
     state: State<'_, RouterState>,
     select_all: bool,
@@ -434,6 +760,25 @@ async fn set_picker_model(
 }
 
 #[tauri::command]
+async fn set_picker_provider(
+    state: State<'_, RouterState>,
+    provider: String,
+    visible: bool,
+) -> Result<Value, String> {
+    run_json_command(
+        state.inner().clone(),
+        vec![
+            "picker".into(),
+            "provider".into(),
+            provider,
+            (if visible { "show" } else { "hide" }).into(),
+        ],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
 async fn set_picker_models(state: State<'_, RouterState>, show_all: bool) -> Result<Value, String> {
     run_json_command(
         state.inner().clone(),
@@ -442,6 +787,72 @@ async fn set_picker_models(state: State<'_, RouterState>, show_all: bool) -> Res
             "all".into(),
             (if show_all { "show" } else { "hide" }).into(),
         ],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn set_tool_result_aging(
+    state: State<'_, RouterState>,
+    enabled: bool,
+) -> Result<Value, String> {
+    run_json_command(
+        state.inner().clone(),
+        vec![
+            "tool-result-aging".into(),
+            (if enabled { "on" } else { "off" }).into(),
+        ],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn set_signed_routing(state: State<'_, RouterState>, enabled: bool) -> Result<Value, String> {
+    run_command_then_snapshot(
+        state.inner().clone(),
+        vec![
+            "signed-routing".into(),
+            (if enabled { "on" } else { "off" }).into(),
+        ],
+    )
+    .await
+}
+
+#[tauri::command]
+async fn presence_status(state: State<'_, RouterState>) -> Result<Value, String> {
+    run_json_command(
+        state.inner().clone(),
+        vec!["presence".into(), "status".into()],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn set_presence_mode(state: State<'_, RouterState>, mode: String) -> Result<Value, String> {
+    if !matches!(mode.as_str(), "always" | "follow-codex") {
+        return Err("Choose Always or With Codex for tray visibility.".into());
+    }
+    run_json_command(
+        state.inner().clone(),
+        vec!["presence".into(), "set".into(), mode],
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn maintenance(state: State<'_, RouterState>) -> Result<Value, String> {
+    run_json_command(state.inner().clone(), vec!["maintenance".into()], None).await
+}
+
+#[tauri::command]
+async fn doctor_fix(state: State<'_, RouterState>) -> Result<Value, String> {
+    run_json_command(
+        state.inner().clone(),
+        vec!["doctor".into(), "--fix".into(), "--json".into()],
         None,
     )
     .await
@@ -510,6 +921,16 @@ async fn run_json_command(
     tauri::async_runtime::spawn_blocking(move || {
         let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
         run_control_json(&state, &borrowed, stdin.as_deref().map(str::as_bytes))
+    })
+    .await
+    .map_err(|_| "The Model Router command did not finish.".to_string())?
+}
+
+async fn run_command_then_snapshot(state: RouterState, args: Vec<String>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+        run_control(&state, &borrowed, None)?;
+        run_control_json(&state, &["--json"], None)
     })
     .await
     .map_err(|_| "The Model Router command did not finish.".to_string())?
@@ -585,6 +1006,14 @@ fn run_control(
             Stdio::null()
         });
 
+    // Spawned from a GUI process with no console, a console-subsystem child
+    // (node.exe) gets a fresh console window unless CREATE_NO_WINDOW is set.
+    // Every control call would otherwise flash a terminal on screen.
+    #[cfg(windows)]
+    {
+        command.creation_flags(0x08000000);
+    }
+
     let mut child = command
         .spawn()
         .map_err(|_| "Could not start the Model Router control process.".to_string())?;
@@ -613,7 +1042,7 @@ fn read_router_health() -> Value {
     let port = env::var("MODEL_ROUTER_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(4102);
+        .unwrap_or(4202);
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let mut stream = match TcpStream::connect_timeout(&address, Duration::from_millis(500)) {
         Ok(stream) => stream,
@@ -839,6 +1268,25 @@ fn resolve_source_root(app: &AppHandle) -> Option<PathBuf> {
         .into_iter()
         .find(|candidate| candidate.join("src/control.mjs").is_file())
         .and_then(|candidate| candidate.canonicalize().ok().or(Some(candidate)))
+        .map(windows_readable_path)
+}
+
+// `canonicalize` returns Windows extended-length paths (`\\?\C:\...`). Node
+// cannot execute one of those as a script entry point: it strips the prefix,
+// resolves the drive letter alone, and fails at startup with ESDIR/EISDIR on a
+// directory — which is exactly the error the tray's refresh produced on every
+// spawn. The desktop app never needs the extended form (its paths are far
+// short of MAX_PATH), so drop the prefix before handing the path to Node.
+fn windows_readable_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(text) = path.to_str() {
+            if let Some(stripped) = text.strip_prefix(r"\\?\") {
+                return PathBuf::from(stripped);
+            }
+        }
+    }
+    path
 }
 
 fn standard_source_roots() -> Vec<PathBuf> {
@@ -930,16 +1378,19 @@ enum ProviderKind {
     Api,
 }
 
+// Which provider ids exist is decided by the router's registry, which gains
+// entries with every release; a list copied here silently stops the tray from
+// toggling anything added since it was written — which by now is most of them.
+// This guard therefore only has to keep an arbitrary string out of a
+// subprocess argument, because the control plane rejects an id it does not know.
 fn validate_provider(provider: &str) -> Result<(), String> {
-    const PROVIDERS: &[&str] = &[
-        "anthropic-api",
-        "kimi-oauth",
-        "kimi-api",
-        "deepseek",
-        "grok-api",
-        "grok-oauth",
-    ];
-    if PROVIDERS.contains(&provider) {
+    let valid = !provider.is_empty()
+        && provider.len() <= 64
+        && provider.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+        && !provider.starts_with('-');
+    if valid {
         Ok(())
     } else {
         Err("Unknown provider.".into())
@@ -953,6 +1404,70 @@ fn validate_provider_kind(provider: &str, kind: ProviderKind) -> Result<(), Stri
         Ok(())
     } else {
         Err("That provider does not support this connection method.".into())
+    }
+}
+
+// Ollama tags may be namespaced (including hf.co paths) and install also
+// accepts an official ollama.com model page. This is only an argument-shape
+// guard; the router's stricter normalizer remains authoritative.
+fn validate_local_model_ref(model: &str) -> Result<(), String> {
+    let trimmed = model.trim();
+    let valid_characters = trimmed.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(
+                character,
+                '.' | '_' | '/' | ':' | '-' | '?' | '=' | '&' | '%'
+            )
+    });
+    let is_tag = !trimmed.contains("://")
+        && !trimmed.starts_with('-')
+        && !trimmed.contains("//")
+        && !trimmed.split('/').any(|part| matches!(part, "." | ".."))
+        && valid_characters;
+    let is_ollama_url = ["https://ollama.com/", "https://www.ollama.com/"]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+        && valid_characters;
+    if !trimmed.is_empty() && trimmed.len() <= 512 && (is_tag || is_ollama_url) {
+        Ok(())
+    } else {
+        Err("Enter a valid Ollama model tag or model-page URL.".into())
+    }
+}
+
+/// Same character discipline as the Node-side `requireTag` (an id reaches a
+/// command line either way), with an error that names LM Studio instead of
+/// telling an LM Studio user their id is not a valid Ollama tag.
+fn validate_lmstudio_model_id(model: &str) -> Result<(), String> {
+    let trimmed = model.trim();
+    let valid = !trimmed.is_empty()
+        && trimmed.len() <= 128
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '-'))
+        && !trimmed.starts_with('-');
+    if valid {
+        Ok(())
+    } else {
+        Err("Enter a valid LM Studio model id.".into())
+    }
+}
+
+fn validate_vision_value(value: &str, label: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    let valid = !trimmed.is_empty()
+        && trimmed.len() <= 256
+        && trimmed.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '/' | ':' | '-')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("Invalid {label}."))
     }
 }
 
@@ -986,11 +1501,37 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_known_provider_ids() {
+    fn accepts_only_registry_shaped_provider_ids() {
         assert!(validate_provider("kimi-oauth").is_ok());
+        assert!(validate_provider("clinepass").is_ok());
+        // Providers the registry gained after this file was written must keep
+        // working without a code change here.
+        assert!(validate_provider("local").is_ok());
+        assert!(validate_provider("openrouter").is_ok());
+        assert!(validate_provider("chutes").is_ok());
         assert!(validate_provider("../../secret").is_err());
+        assert!(validate_provider("").is_err());
+        assert!(validate_provider("--flag").is_err());
+        assert!(validate_provider("Grok API").is_err());
         assert!(validate_provider_kind("deepseek", ProviderKind::Api).is_ok());
         assert!(validate_provider_kind("deepseek", ProviderKind::Oauth).is_err());
+        assert!(validate_provider_kind("github-copilot", ProviderKind::Api).is_ok());
+        assert!(validate_provider_kind("github-copilot", ProviderKind::Oauth).is_err());
+        assert!(validate_provider_kind("clinepass", ProviderKind::Api).is_ok());
+        assert!(validate_provider_kind("clinepass", ProviderKind::Oauth).is_err());
+        assert!(validate_provider_kind("chutes", ProviderKind::Api).is_ok());
+        assert!(validate_provider_kind("chutes", ProviderKind::Oauth).is_err());
+    }
+
+    #[test]
+    fn accepts_only_ollama_shaped_model_references() {
+        assert!(validate_local_model_ref("gemma4:12b").is_ok());
+        assert!(validate_local_model_ref("hf.co/user/model:Q4_K_M").is_ok());
+        assert!(validate_local_model_ref("https://ollama.com/library/gemma4:12b").is_ok());
+        assert!(validate_local_model_ref("https://example.com/model").is_err());
+        assert!(validate_local_model_ref("../../secret").is_err());
+        assert!(validate_local_model_ref("--yes").is_err());
+        assert!(validate_local_model_ref("").is_err());
     }
 
     #[test]
@@ -1006,6 +1547,29 @@ mod tests {
     fn rejects_non_success_health_response() {
         let response = b"HTTP/1.1 503 Nope\r\n\r\n{}";
         assert!(parse_health_response(response).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_root_path_is_executable_by_node() {
+        // `canonicalize` returns `\\?\C:\...` on Windows, which node cannot run
+        // as a script entry (it fails with ESDIR/EISDIR on the drive letter).
+        // The stripped form must be what the desktop app hands to node.
+        let extended = windows_readable_path(PathBuf::from(r"\\?\C:\Users\me\codex-router"));
+        assert_eq!(extended, PathBuf::from(r"C:\Users\me\codex-router"));
+        let plain = windows_readable_path(PathBuf::from(r"C:\Users\me\codex-router"));
+        assert_eq!(plain, PathBuf::from(r"C:\Users\me\codex-router"));
+        let posix = windows_readable_path(PathBuf::from("/home/me/codex-router"));
+        assert_eq!(posix, PathBuf::from("/home/me/codex-router"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn source_root_path_is_left_alone_off_windows() {
+        // The extended-length prefix only exists on Windows; everywhere else
+        // the helper must hand the path through untouched.
+        let posix = windows_readable_path(PathBuf::from("/home/me/codex-router"));
+        assert_eq!(posix, PathBuf::from("/home/me/codex-router"));
     }
 
     #[cfg(target_os = "linux")]

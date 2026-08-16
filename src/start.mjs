@@ -14,8 +14,14 @@ import {
   TARGET,
   loopback,
 } from "./paths.mjs";
-import { probeDelayMs } from "./health-backoff.mjs";
+import { waitForHealth as pollHealth } from "./health-probe.mjs";
 import { writeLiteLlmConfig } from "./litellm-config.mjs";
+import { readLocalModelSelection } from "./local-models.mjs";
+import { ensureOllamaHeadless } from "./ollama-runtime.mjs";
+import { venvRuntimeProblem } from "./venv-runtime.mjs";
+import { dependencyRepairHint } from "./dependency-repair.mjs";
+
+const dependencyFix = dependencyRepairHint();
 
 const litellm =
   process.env.MODEL_ROUTER_LITELLM_BIN ||
@@ -29,7 +35,38 @@ const litellm =
     process.platform === "win32" ? "litellm.exe" : "litellm",
   );
 if (!existsSync(litellm)) {
-  throw new Error(`LiteLLM is not installed at ${litellm}; run ./bin/install.`);
+  throw new Error(`LiteLLM is not installed at ${litellm}. ${dependencyFix}.`);
+}
+
+// A launcher file that exists on disk is not proof the venv works: an
+// interpreter home pointing at a cleared temporary directory (macOS wipes
+// /private/tmp, and an installer that recorded a temporary Python as the venv
+// home leaves `.venv/bin/python` dangling) makes every spawn fail with ENOENT
+// while the launcher itself is still present. Probe the interpreter
+// explicitly so a broken venv fails here with a readable message and a fix
+// path instead of feeding launchd's restart loop an unreadable crash.
+// The probe applies only to the bundled venv: a custom launcher
+// (MODEL_ROUTER_LITELLM_BIN or a codex-target alias) may deliberately ship
+// without the bundled `.venv`, and CI exercises startup with
+// MODEL_ROUTER_LITELLM_BIN=process.execPath on a fresh checkout that has no
+// venv at all.
+const usesBundledVenv = !process.env.MODEL_ROUTER_LITELLM_BIN &&
+  !(TARGET === "codex" &&
+    (process.env.CODEX_ROUTER_LITELLM_BIN || process.env.KIMI_LITELLM_BIN));
+if (usesBundledVenv) {
+  const venvPython = path.join(
+    SOURCE_ROOT,
+    ".venv",
+    process.platform === "win32" ? "Scripts" : "bin",
+    process.platform === "win32" ? "python.exe" : "python",
+  );
+  const venvProblem = venvRuntimeProblem(venvPython);
+  if (venvProblem) {
+    throw new Error(
+      `The LiteLLM virtual environment is broken at ${venvPython} (${venvProblem}). ` +
+        `${dependencyFix}.`,
+    );
+  }
 }
 if (!existsSync(INTERNAL_SECRET_PATH)) {
   throw new Error(`Internal service key is missing; run ./bin/install.`);
@@ -43,6 +80,18 @@ const callerKey = assertCallerSecret(
   readFileSync(CALLER_SECRET_PATH, "utf8").trim(),
 );
 writeLiteLlmConfig();
+
+// A checked local model means the operator intends to route through Ollama,
+// so keep its daemon available for the gateway. This never installs software
+// or pulls a model during service startup; a missing runtime remains a doctor
+// warning, while a present runtime is started as a detached, headless server.
+if (readLocalModelSelection().enabled.length) {
+  try {
+    await ensureOllamaHeadless({ install: false });
+  } catch (error) {
+    console.error(`Local Ollama is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
 
 const commonEnv = {
   MODEL_ROUTER_TARGET: TARGET,
@@ -111,35 +160,18 @@ function waitForExit(child, label) {
   });
 }
 
-async function waitForHealth(label, url, headers = {}, timeoutMs = 30_000, expectedService, child) {
-  const deadline = Date.now() + timeoutMs;
-  let attempt = 0;
-  while (Date.now() < deadline) {
-    if (child && (child.exitCode !== null || child.signalCode !== null)) {
-      throw new Error(`${label} exited before becoming healthy.`);
-    }
-    if (shuttingDown) throw new Error("Service startup was interrupted.");
-    try {
-      const response = await fetch(url, {
-        headers,
-        signal: AbortSignal.timeout(1_000),
-      });
-      if (response.ok) {
-        if (!expectedService) return;
-        const payload = await response.json().catch(() => ({}));
-        if (payload.service === expectedService) return;
-      }
-    } catch {
-      // The service is still starting.
-    }
-    // Back off rather than hammering: the gateway is allowed a 300 second cold
-    // start, and at a flat interval every one of those probes is a gateway
-    // access-log line for a service that is plainly not up yet.
-    const wait = Math.min(probeDelayMs(attempt), Math.max(0, deadline - Date.now()));
-    attempt += 1;
-    await new Promise((resolve) => setTimeout(resolve, wait));
-  }
-  throw new Error(`Timed out waiting for ${label} to become healthy.`);
+// The probe loop lives in src/health-probe.mjs so it can be tested directly;
+// importing this file starts the whole service pipeline.
+function waitForHealth(label, url, headers = {}, timeoutMs = 30_000, expectedService, child) {
+  return pollHealth({
+    label,
+    url,
+    headers,
+    timeoutMs,
+    expectedService,
+    child,
+    isShuttingDown: () => shuttingDown,
+  });
 }
 
 function stopChildren() {
@@ -159,20 +191,38 @@ const FRONTEND = { script: "router.mjs", service: "codex-router", label: "Codex 
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, stopChildren);
 
 async function main() {
+  // These forwarders use separate ports and do not depend on one another.
+  // Start all of them before waiting so a cold service does not pay their
+  // startup times one after another.
   const kimiForwarder = run(process.execPath, [path.join(SOURCE_ROOT, "src", "oauth-forwarder.mjs")]);
-  await waitForHealth("OAuth forwarder", loopback(PORTS.oauth, "/health"), {
-    Authorization: `Bearer ${internalKey}`,
-  }, 30_000, undefined, kimiForwarder);
-
   const api = run(process.execPath, [path.join(SOURCE_ROOT, "src", "api-forwarder.mjs")]);
-  await waitForHealth("API forwarder", loopback(PORTS.api, "/health"), {
-    Authorization: `Bearer ${internalKey}`,
-  }, 30_000, undefined, api);
-
   const grokForwarder = run(process.execPath, [path.join(SOURCE_ROOT, "src", "grok-oauth-forwarder.mjs")]);
-  await waitForHealth("Grok OAuth forwarder", loopback(PORTS.grokOauth, "/health"), {
-    Authorization: `Bearer ${internalKey}`,
-  }, 30_000, undefined, grokForwarder);
+  await Promise.all([
+    waitForHealth(
+      "OAuth forwarder",
+      loopback(PORTS.oauth, "/health"),
+      { Authorization: `Bearer ${internalKey}` },
+      30_000,
+      undefined,
+      kimiForwarder,
+    ),
+    waitForHealth(
+      "API forwarder",
+      loopback(PORTS.api, "/health"),
+      { Authorization: `Bearer ${internalKey}` },
+      30_000,
+      undefined,
+      api,
+    ),
+    waitForHealth(
+      "Grok OAuth forwarder",
+      loopback(PORTS.grokOauth, "/health"),
+      { Authorization: `Bearer ${internalKey}` },
+      30_000,
+      undefined,
+      grokForwarder,
+    ),
+  ]);
 
   const gateway = run(litellm, [
     "--config",

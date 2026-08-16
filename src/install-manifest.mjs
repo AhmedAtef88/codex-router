@@ -1,23 +1,19 @@
 import { execFileSync } from "node:child_process";
 import {
-  chmodSync,
   existsSync,
-  mkdirSync,
   readFileSync,
-  renameSync,
-  writeFileSync,
 } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { protectPrivateFile } from "./file-security.mjs";
+import { writePrivateJson } from "./file-security.mjs";
 import {
   INSTALL_MANIFEST_PATH,
   SOURCE_ROOT,
-  STATE_DIR,
   TARGET,
 } from "./paths.mjs";
 import { providerSelectionStatus } from "./provider-selection.mjs";
+import { packSkillNames } from "./skills-install.mjs";
 
 function gitValue(args) {
   try {
@@ -51,20 +47,21 @@ export function readInstallManifest() {
 }
 
 function atomicWrite(value) {
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-  chmodSync(STATE_DIR, 0o700);
-  const temporary = `${INSTALL_MANIFEST_PATH}.tmp.${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  protectPrivateFile(temporary);
-  renameSync(temporary, INSTALL_MANIFEST_PATH);
-  protectPrivateFile(INSTALL_MANIFEST_PATH);
+  writePrivateJson(INSTALL_MANIFEST_PATH, value, { directoryMode: 0o700 });
 }
 
 export function recordInstall() {
   const previous = readInstallManifest();
+  // The skills field is derived from the checkout's skills/ directory, not
+  // from post-install filesystem state: bin/install records the manifest
+  // before the skills step runs, so managedSkillNames() would report the
+  // previous run's state. The checkout source is deterministic at this point
+  // and correct for provenance, because the skills installed moments later
+  // come from that same checkout.
+  const skills = {
+    names: packSkillNames(),
+    count: packSkillNames().length,
+  };
   const current = {
     commit: gitValue(["rev-parse", "HEAD"]),
     branch: gitValue(["branch", "--show-current"]),
@@ -73,7 +70,9 @@ export function recordInstall() {
     sourceRoot: SOURCE_ROOT,
     target: TARGET,
     platform: process.platform,
+    packageManager: process.env.CODEX_ROUTER_PACKAGE_MANAGER || null,
     providers: providerSelectionStatus().providers,
+    skills,
   };
   const previousEntry = previous?.current;
   const history = [

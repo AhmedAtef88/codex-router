@@ -1,13 +1,25 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   buildQuotaCards,
   chartGeometry,
+  commandRefused,
   compactTokens,
   dailySeries,
+  metricRemainingPercent,
+  observedModelSpeed,
   quotaWindow,
+  readOnlyCapabilities,
+  toolResultAgingChecked,
+  visibleLocalDownload,
 } from "../apps/desktop/ui/model.mjs";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+import { availableLanguages, getLanguage, setLanguage, t, translationKeys } from "../apps/desktop/ui/i18n.mjs";
 
 test("desktop usage series fills missing local calendar days", () => {
   const series = dailySeries(
@@ -37,6 +49,21 @@ test("quota windows use one weekly label and a distinct five-hour label", () => 
   assert.deepEqual(quotaWindow({ windowDurationMins: 300 }), {
     key: "five-hour",
     label: "5-hour limit",
+  });
+});
+
+test("monthly quota windows keep their own label instead of being dropped", () => {
+  assert.deepEqual(quotaWindow({ label: "Monthly limit" }), {
+    key: "monthly",
+    label: "Monthly limit",
+  });
+  assert.deepEqual(quotaWindow({ label: "Monthly subscription" }), {
+    key: "monthly",
+    label: "Monthly limit",
+  });
+  assert.deepEqual(quotaWindow({ windowDurationMins: 43_200 }), {
+    key: "monthly",
+    label: "Monthly limit",
   });
 });
 
@@ -77,6 +104,19 @@ test("quota cards omit unconfigured providers and de-duplicate synonymous window
       { providerId: "kimi-oauth", label: "5-hour limit" },
     ],
   );
+  assert.deepEqual(
+    cards.map(({ usedPercent, remainingPercent }) => ({ usedPercent, remainingPercent })),
+    [
+      { usedPercent: 48, remainingPercent: 52 },
+      { usedPercent: 3, remainingPercent: 97 },
+    ],
+  );
+});
+
+test("quota remaining percentage prefers provider data and derives from usage", () => {
+  assert.equal(metricRemainingPercent({ usedPercent: 35 }), 65);
+  assert.equal(metricRemainingPercent({ used: 25, limit: 100 }), 75);
+  assert.equal(metricRemainingPercent({ usedPercent: 35, remainingPercent: 72 }), 72);
 });
 
 test("chart geometry stays finite for an empty week", () => {
@@ -91,4 +131,167 @@ test("token counts remain compact without hiding small values", () => {
   assert.equal(compactTokens(1_250), "1.3k");
   assert.equal(compactTokens(28_800), "29k");
   assert.equal(compactTokens(2_500_000), "2.5m");
+});
+
+test("completed local downloads disappear when the model is no longer installed", () => {
+  const done = { tag: "gemma4:12b", status: "done", percent: 100 };
+  assert.equal(visibleLocalDownload({ models: [], download: done }), null);
+  assert.deepEqual(
+    visibleLocalDownload({ models: [{ tag: "gemma4:12b" }], download: done }),
+    done,
+  );
+  const removedWithWarning = {
+    tag: "gemma4:12b",
+    kind: "uninstall",
+    status: "done",
+    detail: "Model removed · catalog refresh needed",
+    catalogError: "The Codex catalog could not be refreshed.",
+  };
+  assert.deepEqual(
+    visibleLocalDownload({ models: [], download: removedWithWarning }),
+    removedWithWarning,
+  );
+  const active = { tag: "gemma4:12b", status: "downloading", percent: 42 };
+  assert.deepEqual(visibleLocalDownload({ models: [], download: active }), active);
+});
+
+test("active model speed prefers its provider and matches qualified slugs", () => {
+  const usage = {
+    providers: [
+      {
+        id: "deepseek",
+        models: [
+          {
+            slug: "deepseek/deepseek-v4-flash",
+            displayName: "deepseek-v4-flash",
+            observedTokensPerSecond: 18.7,
+            speedSampleCount: 4,
+          },
+        ],
+      },
+    ],
+  };
+  assert.deepEqual(observedModelSpeed(usage, "deepseek", "deepseek/deepseek-v4-flash"), {
+    speed: 18.7,
+    samples: 4,
+  });
+  usage.providers[0].models[0].observedTokensPerSecond = null;
+  assert.equal(observedModelSpeed(usage, "deepseek", "deepseek/deepseek-v4-flash"), null);
+  assert.equal(observedModelSpeed(usage, "deepseek", "missing/model"), null);
+});
+
+// src/tool-result-aging-state.mjs defaults the feature off when no state file
+// exists, so an absent snapshot has to render off. Rendering on told every
+// fresh install that ageing was happening when nothing was.
+test("the tool-result-aging switch renders off when the snapshot is absent", () => {
+  assert.equal(toolResultAgingChecked(undefined), false);
+  assert.equal(toolResultAgingChecked(null), false);
+  assert.equal(toolResultAgingChecked({}), false);
+});
+
+test("the tool-result-aging switch follows the snapshot when it is present", () => {
+  assert.equal(toolResultAgingChecked({ enabled: true }), true);
+  assert.equal(toolResultAgingChecked({ enabled: false }), false);
+  assert.equal(toolResultAgingChecked({ enabled: true, environmentOverride: false }), true);
+});
+
+// A control the surface will refuse must be dead before it is clicked, and the
+// UI decides that from the surface's own lists rather than a copy of them.
+test("a read-only surface refuses only what it did not advertise", () => {
+  const capabilities = {
+    readOnly: true,
+    allowedCommands: ["control_snapshot"],
+    localCommands: ["hide_panel"],
+  };
+  assert.equal(commandRefused(capabilities, "set_tool_result_aging"), true);
+  assert.equal(commandRefused(capabilities, "control_snapshot"), false);
+  assert.equal(commandRefused(capabilities, "hide_panel"), false);
+  // A shell that advertises no limit carries the full table and refuses
+  // nothing, which is how the tray and the Electron window stay unaffected.
+  assert.equal(commandRefused(null, "set_tool_result_aging"), false);
+  assert.equal(readOnlyCapabilities({ os: "darwin" }), null);
+  assert.equal(readOnlyCapabilities({ capabilities: { readOnly: false } }), null);
+});
+
+test("the macOS tray tool-result-aging switch mirrors the same off default", () => {
+  const source = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
+    "utf8",
+  );
+  assert.match(source, /toolResultAging\?\.enabled \?\? false/);
+  assert.doesNotMatch(source, /toolResultAging\?\.enabled \?\? true/);
+});
+
+// The disabled set is derived from data-command, so a control that drives a
+// command without carrying one would stay live on a surface that refuses it.
+test("every mutating control in the desktop UI names the command it drives", () => {
+  const markup = [
+    readFileSync(path.join(root, "apps", "desktop", "ui", "index.html"), "utf8"),
+    readFileSync(path.join(root, "apps", "desktop", "ui", "app.js"), "utf8"),
+  ].join("\n");
+  for (const command of [
+    "set_tool_result_aging",
+    "set_login_free",
+    "set_signed_routing",
+    "set_presence_mode",
+    "set_vision_bridge",
+    "set_subagent_mode",
+    "set_subagent_model",
+    "set_picker_model",
+    "set_provider_enabled",
+    "save_api_key",
+    "remove_api_key",
+    "install_local_model",
+    "set_local_model_enabled",
+  ]) {
+    assert.ok(
+      markup.includes(`data-command="${command}"`),
+      `no control declares data-command="${command}"`,
+    );
+  }
+});
+
+test("desktop UI exposes translations with matching keys for every language", () => {
+  assert.deepEqual(
+    availableLanguages().map(({ id }) => id),
+    ["en", "zh-CN", "ar", "hi", "ja", "ko"],
+  );
+  const keys = translationKeys();
+  const englishKeys = [...keys.en].sort();
+  for (const language of Object.keys(keys)) {
+    assert.deepEqual([...keys[language]].sort(), englishKeys, `translation keys diverge for ${language}`);
+  }
+  // Stated separately from the parity check above, which would also pass if a
+  // new string were left out of all six.
+  for (const language of Object.keys(keys)) {
+    for (const key of ["general.readOnlySurface", "general.readOnlyControl"]) {
+      assert.ok([...keys[language]].includes(key), `${key} is missing from ${language}`);
+    }
+  }
+  const samples = [
+    ["zh-CN", "用量"],
+    ["ar", "الاستخدام"],
+    ["hi", "उपयोग"],
+    ["ja", "使用量"],
+    ["ko", "사용량"],
+  ];
+  try {
+    for (const [language, navUsage] of samples) {
+      setLanguage(language);
+      assert.equal(getLanguage(), language);
+      assert.equal(t("nav.usage"), navUsage);
+    }
+    setLanguage("zh-CN");
+    assert.equal(t("usage.resetsToday", { time: "10:30" }), "今天 10:30 重置");
+  } finally {
+    setLanguage("en");
+  }
+  assert.equal(t("nav.usage"), "Usage");
+});
+
+test("desktop UI marks Arabic as the only right-to-left language", () => {
+  for (const { id, dir } of availableLanguages()) {
+    if (id === "ar") assert.equal(dir, "rtl");
+    else assert.notEqual(dir, "rtl", `unexpected right-to-left direction for ${id}`);
+  }
 });

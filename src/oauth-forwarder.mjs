@@ -1,6 +1,8 @@
 import http from "node:http";
 
 import {
+  applyKeepAliveTimeouts,
+  formatErrorChain,
   HOP_BY_HOP_HEADERS,
   httpErrorStatus,
   pipeResponse,
@@ -14,6 +16,9 @@ import {
   readKimiOAuthToken,
 } from "./kimi-oauth-session.mjs";
 import { PORTS, TARGET } from "./paths.mjs";
+import { installStableFetchTransport } from "./fetch-transport.mjs";
+
+installStableFetchTransport();
 
 const API_BASE = (
   process.env.KIMI_CODE_BASE_URL || "https://api.kimi.com/coding/v1"
@@ -122,7 +127,9 @@ function upstreamHeaders(requestHeaders, body) {
   }
   Object.assign(headers, kimiIdentityHeaders());
   headers["Accept-Encoding"] = "identity";
-  if (body.length) headers["Content-Length"] = String(body.length);
+  // Content-Length is fetch's to compute. An explicit copy is at best
+  // redundant, and the HTTP/1.1 dispatcher rejects the request outright
+  // (UND_ERR_INVALID_ARG) when a caller-supplied value accompanies a body.
   return headers;
 }
 
@@ -225,7 +232,11 @@ const server = http.createServer((request, response) => {
   handleRequest(request, response).catch((error) => {
     const status = httpErrorStatus(error);
     const authenticationFailure = status === 401;
-    console.error("[kimi-oauth] request failed");
+    // Names and codes only: a refresh failure can wrap upstream response text
+    // in its message, and bodies never belong in the log (#171).
+    console.error(
+      `[kimi-oauth] request failed: ${formatErrorChain(error, { messages: false })}`,
+    );
     if (!response.headersSent) {
       writeJson(response, status, {
         error: {
@@ -241,6 +252,7 @@ const server = http.createServer((request, response) => {
   });
 });
 
+applyKeepAliveTimeouts(server);
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.error("[kimi-oauth] listening");
 });

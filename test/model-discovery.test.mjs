@@ -7,6 +7,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const { PROVIDERS } = await import("../src/model-registry.mjs");
+const { modelIds } = await import("../src/model-discovery.mjs");
 
 test("model discovery compares fixtures without needing or exposing a key", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-discovery-"));
@@ -53,4 +55,94 @@ test("Command Code discovery parses the Provider API model list", () => {
   } finally {
     rmSync(testRoot, { recursive: true, force: true });
   }
+});
+
+test("Copilot discovery exposes only account-enabled Responses models with tools", () => {
+  const payload = {
+    data: [
+      {
+        id: "gpt-responses",
+        // Copilot CLI integrations currently receive picker=false even for
+        // account-enabled models; policy is the account entitlement signal.
+        model_picker_enabled: false,
+        policy: { state: "enabled" },
+        supported_endpoints: ["/responses", "/chat/completions"],
+        capabilities: { supports: { tool_calls: true, streaming: true } },
+      },
+      {
+        id: "chat-only",
+        model_picker_enabled: true,
+        policy: { state: "enabled" },
+        supported_endpoints: ["/chat/completions"],
+        capabilities: { supports: { tool_calls: true, streaming: true } },
+      },
+      {
+        id: "no-tools",
+        model_picker_enabled: true,
+        policy: { state: "enabled" },
+        supported_endpoints: ["/responses"],
+        capabilities: { supports: { tool_calls: false, streaming: true } },
+      },
+      {
+        id: "policy-disabled",
+        model_picker_enabled: true,
+        policy: { state: "disabled" },
+        supported_endpoints: ["/responses"],
+        capabilities: { supports: { tool_calls: true, streaming: true } },
+      },
+      {
+        id: "utility",
+        policy: { state: "unconfigured" },
+        supported_endpoints: ["/responses"],
+        capabilities: { supports: { tool_calls: true, streaming: true } },
+      },
+      {
+        id: "accounts/router/internal",
+        object: "model",
+        model_picker_enabled: true,
+        policy: { state: "enabled" },
+        supported_endpoints: ["/responses"],
+        capabilities: { type: "chat", supports: { tool_calls: true, streaming: true } },
+      },
+      {
+        id: "embedding-record",
+        object: "embedding",
+        model_picker_enabled: true,
+        policy: { state: "enabled" },
+        supported_endpoints: ["/responses"],
+        capabilities: { supports: { tool_calls: true, streaming: true } },
+      },
+      {
+        id: "non-chat",
+        object: "model",
+        model_picker_enabled: true,
+        policy: { state: "enabled" },
+        supported_endpoints: ["/responses"],
+        capabilities: { type: "embedding", supports: { tool_calls: true, streaming: true } },
+      },
+    ],
+  };
+  assert.deepEqual(modelIds(payload, PROVIDERS.get("github-copilot")), ["gpt-responses"]);
+});
+
+test("anonymous discovery keeps only each provider's documented free models", () => {
+  const opencode = PROVIDERS.get("opencode-free");
+  assert.deepEqual(
+    modelIds({ data: [
+      { id: "glm-5.1" },
+      { id: "big-pickle" },
+      { id: "mimo-v2.5-free" },
+      { id: "accounts/internal" },
+    ] }, opencode),
+    ["big-pickle", "mimo-v2.5-free"],
+  );
+  const kilo = PROVIDERS.get("kilo-free");
+  assert.deepEqual(
+    modelIds({ data: [
+      { id: "z-ai/glm-5:free" },
+      { id: "minimax/minimax-m2.1:free" },
+      { id: "z-ai/glm-5" },
+    ] }, kilo),
+    ["minimax/minimax-m2.1:free", "z-ai/glm-5:free"],
+  );
 });

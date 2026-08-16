@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -28,6 +28,13 @@ function probe(target, providers, usageEvents = [], options = {}) {
     writeFileSync(
       path.join(stateDir, "native-models.json"),
       `${JSON.stringify({ models: options.nativeModels })}\n`,
+      { mode: 0o600 },
+    );
+  }
+  if (options.subagentSettings) {
+    writeFileSync(
+      path.join(stateDir, "multi-agent-settings.json"),
+      `${JSON.stringify({ version: 2, ...options.subagentSettings })}\n`,
       { mode: 0o600 },
     );
   }
@@ -63,6 +70,7 @@ function probe(target, providers, usageEvents = [], options = {}) {
         CODEX_HOME: stateDir,
         MODEL_ROUTER_TARGET: target,
         MODEL_ROUTER_STATE_DIR: stateDir,
+        CODEX_ROUTER_TOOL_RESULT_AGING: "1",
       },
     });
     return JSON.parse(output);
@@ -157,6 +165,47 @@ test("codex probe includes native GPT models and the configured default", () => 
   assert.equal(slice.loginFreeManaged, false);
   assert.equal(slice.modelSettings.picker.hidden.length, 0);
   assert.ok(["all", "selected", "proven"].includes(slice.modelSettings.subagents.mode));
+  // Compaction is opt-in, so an unconfigured probe reports it off.
+  assert.equal(slice.modelSettings.toolResultAging.enabled, false);
+  // The panel's periodic refresh reads this snapshot, not `local-models
+  // list`, so the LM Studio section has to ride here or it paints once and
+  // vanishes on the next poll.
+  assert.equal(slice.modelSettings.localModels.lmstudio.provider, "lmstudio");
+  assert.equal(typeof slice.modelSettings.localModels.lmstudio.reachable, "boolean");
+  assert.ok(Array.isArray(slice.modelSettings.localModels.lmstudio.models));
+});
+
+test("codex probe reports the effective v2 state of selected native GPT models", () => {
+  const slice = probe("codex", [], [], {
+    nativeModels: [
+      {
+        slug: "gpt-5.6-terra",
+        display_name: "GPT-5.6-Terra",
+        visibility: "list",
+        multi_agent_version: "v1",
+      },
+      {
+        slug: "gpt-5.6-luna",
+        display_name: "GPT-5.6-Luna",
+        visibility: "list",
+        multi_agent_version: "v1",
+      },
+    ],
+    subagentSettings: {
+      mode: "selected",
+      enabled: ["gpt-5.6-terra"],
+      disabled: [],
+    },
+  });
+
+  assert.equal(
+    slice.models.find((model) => model.slug === "gpt-5.6-terra")?.multiAgentVersion,
+    "v2",
+  );
+  assert.equal(
+    slice.models.find((model) => model.slug === "gpt-5.6-luna")?.multiAgentVersion,
+    "v2",
+  );
 });
 
 test("codex probe exposes managed login-free mode without credential details", () => {
@@ -193,6 +242,34 @@ test("control exposes subagent and picker settings without credentials", () => {
       ),
     );
     assert.deepEqual(picker.hidden, []);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("control toggles tool-result aging without a router restart", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-tool-result-aging-"));
+  const env = {
+    ...process.env,
+    MODEL_ROUTER_TARGET: "codex",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+  };
+  delete env.CODEX_ROUTER_TOOL_RESULT_AGING;
+  const runControl = (action) =>
+    JSON.parse(
+      execFileSync(
+        process.execPath,
+        [path.join(root, "src", "control.mjs"), "tool-result-aging", action],
+        { cwd: root, encoding: "utf8", env },
+      ),
+    );
+  try {
+    // Starts off, because compaction is opted into.
+    assert.equal(runControl("status").enabled, false);
+    assert.equal(runControl("on").enabled, true);
+    assert.equal(runControl("status").enabled, true);
+    assert.equal(runControl("off").enabled, false);
+    assert.equal(runControl("status").enabled, false);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -377,7 +454,10 @@ test("login-free aliasing applies even when a ChatGPT credential is still stored
           env: {
             ...process.env,
             CODEX_HOME: stateDir,
-            CODEX_BIN: "/usr/bin/true",
+            // A real Codex install must not leak into this test on Windows,
+            // where /usr/bin/true does not exist. Node is runnable everywhere
+            // and produces no Codex catalog, so the seeded fixture is reused.
+            CODEX_BIN: process.execPath,
             MODEL_ROUTER_TARGET: "codex",
             MODEL_ROUTER_STATE_DIR: stateDir,
           },
@@ -480,11 +560,161 @@ test("model-set switches the login-free model and rejects unavailable models", (
   }
 });
 
-test("aggregate overview covers every target", () => {
+test("signed routing rolls back catalog and config after a forced post-publication failure", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-signed-rollback-"));
+  const configPath = path.join(stateDir, "config.toml");
+  const originalCatalog = {
+    models: [
+      {
+        slug: "gpt-5.6-sol",
+        display_name: "GPT-5.6-Sol",
+        visibility: "list",
+        priority: 10,
+      },
+    ],
+  };
+  const staleMergedCatalog = {
+    models: [
+      ...originalCatalog.models,
+      {
+        slug: "deepseek/deepseek-v4-flash",
+        display_name: "DeepSeek V4 Flash",
+        visibility: "list",
+        priority: 6,
+      },
+    ],
+  };
+  writeFileSync(
+    configPath,
+    `model_provider = "custom"
+
+[model_providers.custom]
+name = "CC Switch"
+base_url = "https://direct.invalid/v1"
+
+[model_providers.custom.query_params]
+api_key = "ROLLBACK_QUERY_SECRET"
+`,
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    path.join(stateDir, "enabled-providers.json"),
+    `${JSON.stringify({ version: 1, providers: ["deepseek"] })}\n`,
+    { mode: 0o600 },
+  );
+  writeFileSync(path.join(stateDir, "deepseek-api-key.secret"), "test-provider-key\n", {
+    mode: 0o600,
+  });
+  writeFileSync(
+    path.join(stateDir, "caller-secret"),
+    "test-control-caller-capability-with-sufficient-length\n",
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    path.join(stateDir, "native-models.json"),
+    `${JSON.stringify(originalCatalog)}\n`,
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    path.join(stateDir, "merged-models.json"),
+    `${JSON.stringify(staleMergedCatalog, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+  const environment = {
+    ...process.env,
+    CODEX_HOME: stateDir,
+    CODEX_BIN: process.execPath,
+    MODEL_ROUTER_TARGET: "codex",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_TEST_FAIL_AFTER_CATALOG_WRITE: "1",
+  };
+  try {
+    assert.throws(
+      () =>
+        execFileSync(
+          process.execPath,
+          [path.join(root, "src", "control.mjs"), "signed-routing", "on"],
+          { cwd: root, encoding: "utf8", env: environment, stdio: "pipe" },
+        ),
+      /catalog|publication/i,
+    );
+    const restoredConfig = readFileSync(configPath, "utf8");
+    assert.match(restoredConfig, /^model_provider = "custom"$/m);
+    assert.match(restoredConfig, /base_url = "https:\/\/direct\.invalid\/v1"/);
+    assert.match(restoredConfig, /api_key = "ROLLBACK_QUERY_SECRET"/);
+    assert.doesNotMatch(restoredConfig, /codex-router-signed-provider-managed/);
+    const safeCatalog = JSON.parse(
+      readFileSync(path.join(stateDir, "merged-models.json"), "utf8"),
+    );
+    assert.equal(
+      safeCatalog.models.some((model) => model.slug === "deepseek/deepseek-v4-flash"),
+      false,
+    );
+    assert.equal(
+      existsSync(path.join(stateDir, "signed-provider-mode.json")),
+      false,
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// The state directory is pinned per case on purpose: this assertion used to
+// read the developer's own installation, so publishing to DeepSeek Harness on
+// the machine running the tests changed the expected target list.
+function overviewTargets(stateDir) {
   const output = execFileSync(process.execPath, [path.join(root, "src", "control.mjs"), "--json"], {
     cwd: root,
     encoding: "utf8",
+    env: { ...process.env, MODEL_ROUTER_STATE_DIR: stateDir },
   });
-  const overview = JSON.parse(output);
-  assert.deepEqual(Object.keys(overview.targets).sort(), ["codex"]);
+  return Object.keys(JSON.parse(output).targets).sort();
+}
+
+test("aggregate overview covers every target", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-targets-"));
+  try {
+    assert.deepEqual(overviewTargets(stateDir), ["codex"]);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("the harness target appears only once its route has been published", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-targets-dsh-"));
+  try {
+    writeFileSync(
+      path.join(stateDir, "dsh-models.json"),
+      `${JSON.stringify({ version: 1, route: "codex-router", models: [] })}\n`,
+      { mode: 0o600 },
+    );
+    assert.deepEqual(overviewTargets(stateDir), ["codex", "dsh"]);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("the tray usage advertises rebuild alongside the supervised actions", () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-tray-usage-"));
+  try {
+    assert.throws(
+      () =>
+        execFileSync(
+          process.execPath,
+          [path.join(root, "src", "control.mjs"), "tray", "bogus"],
+          {
+            cwd: root,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            env: { ...process.env, MODEL_ROUTER_STATE_DIR: stateDir },
+          },
+        ),
+      (error) => {
+        assert.match(String(error.stderr), /Usage: control tray enable\|disable\|status\|restart\|rebuild/);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 });

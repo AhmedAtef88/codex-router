@@ -1,18 +1,22 @@
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { protectPrivateFile } from "./file-security.mjs";
+import { isManagedCallerBaseUrl } from "./caller-auth.mjs";
 import {
   ANNOUNCED_MODELS_PATH,
   CONFIG_PATH,
   MERGED_CATALOG_PATH,
+  MODELS_CACHE_PATH,
   NATIVE_ALIAS_PATH,
   NATIVE_CATALOG_PATH,
 } from "./paths.mjs";
@@ -21,23 +25,161 @@ import { readUserModels } from "./user-models.mjs";
 import { syncRoutedCodexAgents } from "./codex-agent-catalog.mjs";
 import { MODEL_BY_SLUG } from "./model-registry.mjs";
 import {
-  applyMultiAgentSettings,
+  applyMultiAgentCapabilities,
   readMultiAgentSettings,
+  subagentEligibleModels,
 } from "./multi-agent-state.mjs";
 import { readHiddenModels } from "./model-picker-state.mjs";
 import { buildNativeAliasAssignments } from "./native-alias.mjs";
-import { selectedConfiguredListedModels } from "./provider-selection.mjs";
+import { selectedConfiguredListedModels, configuredProviderIds } from "./provider-selection.mjs";
 import { assertStateOwnership } from "./state-owner.mjs";
+import { scanTomlDocument, tomlStringValue } from "./toml-structure.mjs";
 import { applyVisionBridge, resolveVisionEngine } from "./vision-bridge.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
+import { nativeVisionEngines } from "./vision-engines.mjs";
+import {
+  readNativeCatalogFile,
+  readNativeCatalogSource,
+} from "./native-catalog-source.mjs";
+import { discoveryDisabled } from "./discovery-mode.mjs";
 
 const refresh = process.argv.includes("--refresh-native");
-const bundled = process.argv.includes("--bundled-native");
 
-function atomicJson(target, value) {
+function validNativeCatalog(parsed) {
+  return parsed && Array.isArray(parsed.models) && parsed.models.length > 0;
+}
+
+// The account cache stores the raw instruction template while the bundled
+// catalog ships `base_instructions` with the template variables already
+// substituted: for every shared slug that carries variables, the bundled
+// `base_instructions` equals the account template with `{{ personality }}`
+// replaced by `instructions_variables.personality_default`. Mirror that
+// substitution — and strip any placeholder without a default — so a literal
+// `{{ ... }}` token can never reach a model's system prompt.
+const INSTRUCTION_PLACEHOLDER = /\{\{\s*([\w.-]+)\s*\}\}/g;
+
+export function deriveBaseInstructions(modelMessages) {
+  const template = modelMessages?.instructions_template;
+  if (typeof template !== "string") return undefined;
+  const variables = modelMessages?.instructions_variables;
+  const substituted = template.replace(INSTRUCTION_PLACEHOLDER, (_token, name) => {
+    const fallback = variables?.[`${name}_default`];
+    return typeof fallback === "string" ? fallback : "";
+  });
+  // A default could itself contain a placeholder; the guarantee is that none
+  // survive, not that substitution is recursive.
+  return substituted.replace(INSTRUCTION_PLACEHOLDER, "");
+}
+
+// Codex has two native catalogs: the account-aware catalog (`debug models`)
+// and the static catalog shipped in the binary (`--bundled`). Neither is a
+// safe source by itself. The account catalog can add models or change their
+// visibility without a client update, while the bundled catalog can contain a
+// newer schema or models absent from a stale account cache. Preserve the
+// account entry for every slug it lists (first occurrence wins on a
+// duplicate), then append bundled-only entries.
+export function mergeNativeCatalogs(accountCatalog, bundledCatalog) {
+  const account = validNativeCatalog(accountCatalog) ? accountCatalog.models : [];
+  const fallback = validNativeCatalog(bundledCatalog) ? bundledCatalog.models : [];
+  const fallbackBySlug = new Map(
+    fallback.map((model) => [String(model?.slug || ""), model]),
+  );
+  const normalizedAccount = [];
+  const seen = new Set();
+  for (const model of account) {
+    const slug = String(model?.slug || "");
+    if (seen.has(slug)) continue;
+    seen.add(slug);
+    const base = fallbackBySlug.get(slug);
+    const merged = mergeNativeModel(model, base);
+    // The remote cache may omit `base_instructions` because Codex can derive
+    // it internally. A custom model_catalog_json is parsed more strictly and
+    // requires the field, so derive it the same way for account-only models
+    // such as Codex Spark.
+    if (typeof merged.base_instructions !== "string") {
+      const derived = deriveBaseInstructions(merged.model_messages);
+      if (typeof derived === "string") merged.base_instructions = derived;
+    }
+    normalizedAccount.push(merged);
+  }
+  return {
+    models: [
+      ...normalizedAccount,
+      ...fallback.filter((model) => !seen.has(String(model?.slug || ""))),
+    ],
+  };
+}
+
+function isEmptyNativeMetadata(value) {
+  if (value === undefined || value === null) return true;
+  if (typeof value === "string") return value.trim() === "";
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === "object") return Object.keys(value).length === 0;
+  return false;
+}
+
+// Only fields where an empty account value can never be a deliberate account
+// narrowing may be backfilled from the bundled catalog. Each entry earns its
+// place: the speed/service tiers are the observed bug (a stale account schema
+// wiped the Fast tier), `input_modalities: []` would describe a model nothing
+// can call, and the tool/instruction fields are binary-schema data the account
+// cache merely mirrors. Deliberately absent: `visibility` (the account's own
+// signal, always non-empty in practice but not worth betting on) and
+// `supported_reasoning_levels` (an account that lost an effort ladder is
+// expressing exactly that — resurrecting bundled's ladder would offer efforts
+// the account cannot spend).
+const BUNDLED_BACKFILL_FIELDS = Object.freeze([
+  "additional_speed_tiers",
+  "service_tiers",
+  "input_modalities",
+  "experimental_supported_tools",
+  "include_apps_usage_instructions",
+  "model_messages",
+]);
+
+// The account catalog may use an older schema and publish empty fields for
+// capabilities already present in the current binary. Preserve the non-empty
+// bundled value for the allowlisted schema fields in that case; a non-empty
+// account value always remains authoritative.
+export function mergeNativeModel(accountModel, bundledModel) {
+  if (!bundledModel) return { ...accountModel };
+
+  const merged = { ...bundledModel, ...accountModel };
+  for (const field of BUNDLED_BACKFILL_FIELDS) {
+    const value = bundledModel[field];
+    if (
+      !isEmptyNativeMetadata(value) &&
+      isEmptyNativeMetadata(accountModel[field])
+    ) {
+      merged[field] = value;
+    }
+  }
+  return merged;
+}
+
+// One read serves both the catalog contents and the fingerprint; reading the
+// file twice would hash a possibly different snapshot than the one merged.
+function readModelsCache() {
+  const missing = { catalog: undefined, fingerprint: undefined };
+  if (!existsSync(MODELS_CACHE_PATH)) return missing;
+  try {
+    const parsed = JSON.parse(readFileSync(MODELS_CACHE_PATH, "utf8"));
+    if (!validNativeCatalog(parsed)) return missing;
+    return {
+      catalog: parsed,
+      fingerprint: createHash("sha256")
+        .update(JSON.stringify(parsed.models))
+        .digest("hex"),
+    };
+  } catch {
+    return missing;
+  }
+}
+
+function atomicContents(target, contents) {
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
   const temporary = `${target}.tmp.${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+  writeFileSync(temporary, contents, {
     encoding: "utf8",
     mode: 0o600,
   });
@@ -46,27 +188,69 @@ function atomicJson(target, value) {
   protectPrivateFile(target);
 }
 
-function captureNative() {
-  const args = ["debug", "models"];
-  if (bundled) args.push("--bundled");
-  let output;
-  try {
-    output = runCodex(args, {
-      encoding: "utf8",
-      timeout: 30_000,
-      maxBuffer: 32 * 1024 * 1024,
-    });
-  } catch (error) {
-    if (bundled) throw error;
-    output = runCodex(["debug", "models", "--bundled"], {
-      encoding: "utf8",
-      timeout: 30_000,
-      maxBuffer: 32 * 1024 * 1024,
-    });
+function atomicJson(target, value) {
+  atomicContents(target, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function fileSnapshot(target) {
+  return existsSync(target)
+    ? { present: true, contents: readFileSync(target, "utf8") }
+    : { present: false };
+}
+
+function restoreFileSnapshot(target, snapshot) {
+  if (snapshot.present) {
+    atomicContents(target, snapshot.contents);
+  } else if (existsSync(target)) {
+    unlinkSync(target);
   }
-  const parsed = JSON.parse(output);
-  if (!parsed || !Array.isArray(parsed.models) || parsed.models.length === 0) {
-    throw new Error("Codex returned an empty or invalid model catalog.");
+}
+
+function captureNative(cache) {
+  // A discovery-disabled install promised that nothing account-derived is
+  // read: `debug models` without --bundled reflects the signed-in account's
+  // catalog, and `models_cache.json` is that same catalog written to disk, so
+  // both stay untouched and the bundled static list is the whole capture.
+  // This is the gate SECURITY.md's "the one Codex spawn that remains is
+  // `codex debug models --bundled`" claim rests on.
+  const idle = discoveryDisabled();
+  const resolved = cache ?? (idle ? {} : readModelsCache());
+  // This is the account-aware catalog Codex itself cached after signing in.
+  // Reading it directly also avoids asking `codex debug models` while the
+  // router catalog is active, which would merely return our own merged output.
+  let account = resolved.catalog;
+  let fallback;
+  let accountError;
+  let fallbackError;
+  if (!account && !idle) {
+    try {
+      account = JSON.parse(runCodex(["debug", "models"], {
+        encoding: "utf8",
+        timeout: 30_000,
+        maxBuffer: 32 * 1024 * 1024,
+      }));
+    } catch (error) {
+      accountError = error;
+    }
+  }
+  // The bundled source supplies schema fields that the remote cache is allowed
+  // to omit, so use both when available. If it fails, account-only entries are
+  // still normalized above and remain preferable to an empty picker.
+  try {
+    fallback = JSON.parse(runCodex(["debug", "models", "--bundled"], {
+      encoding: "utf8",
+      timeout: 30_000,
+      maxBuffer: 32 * 1024 * 1024,
+    }));
+  } catch (error) {
+    fallbackError = error;
+  }
+  const parsed = mergeNativeCatalogs(account, fallback);
+  if (!validNativeCatalog(parsed)) {
+    const detail = accountError?.message || fallbackError?.message;
+    throw new Error(
+      `Codex returned no valid native model catalog${detail ? ` (${detail})` : ""}.`,
+    );
   }
   if (parsed.models.some((model) => MODEL_BY_SLUG.has(String(model.slug)))) {
     throw new Error(
@@ -74,8 +258,10 @@ function captureNative() {
     );
   }
   const capturedWith = codexVersion();
+  const sourceFingerprint = cache.fingerprint;
   atomicJson(NATIVE_CATALOG_PATH, {
     ...(capturedWith ? { captured_with: capturedWith } : {}),
+    ...(sourceFingerprint ? { native_source_fingerprint: sourceFingerprint } : {}),
     models: parsed.models,
   });
   return parsed;
@@ -86,19 +272,46 @@ function captureNative() {
 // carry different capability values for the same slug. An unknown current
 // version keeps the cache — with no binary to re-ask, stale is the best we
 // have.
-export function nativeCatalogIsReusable(parsed, currentVersion) {
+export function nativeCatalogIsReusable(
+  parsed,
+  currentVersion,
+  currentSourceFingerprint = undefined,
+) {
   if (!parsed || !Array.isArray(parsed.models) || parsed.models.length === 0) {
     return false;
   }
-  return !currentVersion || parsed.captured_with === currentVersion;
+  if (currentVersion && parsed.captured_with !== currentVersion) return false;
+  if (
+    currentSourceFingerprint &&
+    parsed.native_source_fingerprint !== currentSourceFingerprint
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function nativeCatalog() {
-  if (!existsSync(NATIVE_CATALOG_PATH) || refresh) return captureNative();
+  const source = readNativeCatalogSource();
+  if (source) {
+    const catalog = readNativeCatalogFile(source.path);
+    if (!catalog) {
+      throw new Error(
+        `Configured native model catalog is unavailable or invalid: ${source.path}`,
+      );
+    }
+    return catalog;
+  }
+  // `models_cache.json` is the signed-in account's catalog written to disk,
+  // so a discovery-disabled install leaves it unread like every other
+  // account-derived artifact.
+  const cache = discoveryDisabled() ? {} : readModelsCache();
+  if (!existsSync(NATIVE_CATALOG_PATH) || refresh) return captureNative(cache);
   const parsed = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));
-  if (nativeCatalogIsReusable(parsed, codexVersion())) return parsed;
+  if (nativeCatalogIsReusable(parsed, codexVersion(), cache.fingerprint)) {
+    return parsed;
+  }
   try {
-    return captureNative();
+    return captureNative(cache);
   } catch (error) {
     // Version-mismatched is still better than empty: serve the stale capture
     // when the re-capture fails, but say so instead of hiding it.
@@ -193,10 +406,50 @@ function loginFreeConfigured() {
   if (override === "1") return true;
   if (override === "0") return false;
   if (!existsSync(CONFIG_PATH)) return false;
-  const config = readFileSync(CONFIG_PATH, "utf8");
-  const firstTable = config.search(/^\s*\[/m);
-  const root = firstTable === -1 ? config : config.slice(0, firstTable);
-  return root.match(/^\s*model_provider\s*=\s*["\']([^"\']+)["\']/m)?.[1] === "codex-router";
+  try {
+    const document = scanTomlDocument(readFileSync(CONFIG_PATH, "utf8"));
+    return tomlStringValue(document, [], "model_provider") === "codex-router";
+  } catch {
+    return false;
+  }
+}
+
+// A merged catalog is useful only when the selected Codex transport reaches
+// this router. The built-in OpenAI provider uses the managed root base URL;
+// the dedicated signed provider carries the same URL explicitly. Any other
+// custom provider (for example a configuration switcher) owns the endpoint and
+// would make external picker entries misleading.
+export function routedCatalogConfigured(contents, override = process.env.MODEL_ROUTER_SIGNED_ROUTING) {
+  if (override === "1") return true;
+  if (override === "0") return false;
+  try {
+    const document = scanTomlDocument(contents);
+    const provider = tomlStringValue(document, [], "model_provider");
+    if (!provider || provider === "openai") {
+      const baseUrl = tomlStringValue(document, [], "openai_base_url");
+      // Before first install there is no managed URL yet, but the catalog
+      // still has to be buildable. Once an URL is present, only the caller-
+      // capability endpoint proves that OpenAI traffic reaches this router.
+      return baseUrl === undefined || isManagedCallerBaseUrl(baseUrl);
+    }
+
+    const providerPath = ["model_providers", provider];
+    const directTables = document.headers.filter(
+      ({ path: tablePath }) =>
+        tablePath.length === providerPath.length &&
+        tablePath.every((part, index) => part === providerPath[index]),
+    );
+    if (directTables.length !== 1) return false;
+    const baseUrl = tomlStringValue(document, providerPath, "base_url");
+    return Boolean(baseUrl && isManagedCallerBaseUrl(baseUrl));
+  } catch {
+    return false;
+  }
+}
+
+function routedCatalogActive() {
+  const contents = existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "";
+  return routedCatalogConfigured(contents);
 }
 
 function identityName(model) {
@@ -259,7 +512,19 @@ export function routedModel(template, model) {
     input_modalities: model.inputModalities,
     comp_hash: model.compHash,
     additional_speed_tiers: [],
-    service_tiers: [],
+    service_tiers: Array.isArray(model.serviceTiers)
+      ? model.serviceTiers.map((tier) => ({
+          id: tier.id.trim(),
+          name: tier.name.trim(),
+          ...(typeof tier.description === "string" && tier.description.trim()
+            ? { description: tier.description.trim() }
+            : {}),
+        }))
+      : [],
+    // Never inherit a native template's paid tier as the routed default.
+    // Declared tiers are opt-in choices; standard provider service stays the
+    // default until a separate, validated default is intentionally supported.
+    default_service_tier: null,
     // Codex surfaces this once per slug (up to its own show cap) as the
     // "Introducing {model}" announcement; absent copy must stay null so the
     // client never renders an empty card.
@@ -286,10 +551,11 @@ export function routedModel(template, model) {
     // Capability toggles come from the registry entry, never from the native
     // template: an absent flag keeps the conservative default so a routed
     // model only advertises what its slug's gateway path actually verified.
-    // "hosted" is the only search mode the request path can serve today (the
-    // provider backend runs the search server-side, as the Grok OAuth
-    // forwarder does); the registry loader rejects anything else.
-    supports_search_tool: model.searchTool?.mode === "hosted",
+    // Both search paths are explicit registry capabilities. Hosted search is
+    // executed by the provider backend; standalone search is executed by
+    // Codex and its result is replayed through the routed conversation. An
+    // absent declaration remains the conservative default.
+    supports_search_tool: ["hosted", "standalone"].includes(model.searchTool?.mode),
     supports_image_detail_original: model.supportsImageDetailOriginal === true,
     use_responses_lite: false,
     // Codex only knows one ApplyPatchToolType variant. The native template
@@ -302,6 +568,20 @@ export function routedModel(template, model) {
     // opt in after their tool and encrypted-payload relay paths are verified.
     multi_agent_version: model.multiAgentVersion || "v1",
   };
+  // ClinePass strips these unsupported request controls, so Codex must not offer them.
+  if (model.requestProfile === "clinepass") {
+    delete next.default_reasoning_level;
+    delete next.supported_reasoning_levels;
+  }
+  // A few OpenAI-compatible upstreams reject tool scheduling the native
+  // template advertises. Registry entries opt out explicitly so the picker
+  // never offers a custom or parallel tool the provider backend will 400.
+  if (typeof model.supportsParallelToolCalls === "boolean") {
+    next.supports_parallel_tool_calls = model.supportsParallelToolCalls;
+  }
+  if (Array.isArray(model.experimentalSupportedTools)) {
+    next.experimental_supported_tools = [...model.experimentalSupportedTools];
+  }
   if (typeof next.base_instructions === "string") {
     next.base_instructions = rewriteIdentity(next.base_instructions, model);
   }
@@ -309,11 +589,6 @@ export function routedModel(template, model) {
     next.model_messages = rewriteModelMessages(next.model_messages, model);
   }
   return next;
-}
-
-export function applyAllMultiAgent(models, enabled) {
-  if (!enabled) return models;
-  return models.map((model) => ({ ...model, multiAgentVersion: "v2" }));
 }
 
 export const AUTO_ANNOUNCE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
@@ -409,9 +684,14 @@ function sortCatalogModels(models) {
 // still ships gpt-5.6-luna as "v1" even though it runs correctly on the v2
 // backend (openai/codex#35097, #36294). spawn_agent filters candidate child
 // models on that static value, so a v1 entry can never be delegated to by a v2
-// parent. applyMultiAgentSettings only reaches routed models, which is why
-// "all" mode never promoted the native slugs; apply the same opt-in here so the
-// subagent modes mean what the Settings tab says they mean.
+// parent.
+//
+// These upstream-verified slugs run fine on the v2 backend, so they are
+// promoted unconditionally — no mode switch, no Settings dance. The subagent
+// opt-in below only reaches the *remaining* native models, which stay
+// conservative because their v2 relay paths have not been verified.
+const NATIVE_V2_BACKEND_SLUGS = new Set(["gpt-5.6-luna"]);
+
 export function promoteNativeMultiAgent(models, settings, hidden = new Set()) {
   const enabled = new Set(settings.enabled || []);
   const disabled = new Set(settings.disabled || []);
@@ -419,6 +699,9 @@ export function promoteNativeMultiAgent(models, settings, hidden = new Set()) {
     const slug = String(model.slug);
     if (model.visibility !== "list") return model;
     if (hidden.has(slug) || disabled.has(slug)) return model;
+    if (NATIVE_V2_BACKEND_SLUGS.has(slug)) {
+      return { ...model, multi_agent_version: "v2" };
+    }
     if (settings.mode === "all" || (settings.mode === "selected" && enabled.has(slug))) {
       return { ...model, multi_agent_version: "v2" };
     }
@@ -449,8 +732,19 @@ export function buildMergedCatalog(native, routedModelsList, { includeNative = t
 // models are republished under those slugs with their own names and reasoning
 // levels. Each aliased model keeps a hidden entry under its canonical slug so
 // routing, doctor checks, and existing configs keep resolving it.
+//
+// Only providers with a live credential may take a whitelist slot: the slot is
+// what a signed-out desktop picker offers, and a model whose provider cannot
+// authenticate would occupy it with requests that fail on the first turn. The
+// merged-catalog path filters through `selectedConfiguredListedModels()`; this
+// function keeps the same rule for the login-free path instead of trusting its
+// caller to pre-filter, so no future call site can publish dead slots again.
 export function buildLoginFreeCatalog(native, routedModelsList) {
-  const assignments = buildNativeAliasAssignments(native.models, routedModelsList);
+  const configured = new Set(configuredProviderIds());
+  const usableModels = routedModelsList.filter(
+    (model) => !model.provider || configured.has(model.provider),
+  );
+  const assignments = buildNativeAliasAssignments(native.models, usableModels);
   const aliasedSlugs = new Set(assignments.map(({ model }) => model.slug));
   const aliases = Object.fromEntries(
     assignments.map(({ nativeModel, model }) => [nativeModel.slug, model.slug]),
@@ -461,7 +755,7 @@ export function buildLoginFreeCatalog(native, routedModelsList) {
       slug: nativeModel.slug,
       priority: nativeModel.priority,
     })),
-    ...buildMergedCatalog(native, routedModelsList, { includeNative: false }).map(
+    ...buildMergedCatalog(native, usableModels, { includeNative: false }).map(
       (model) =>
         aliasedSlugs.has(model.slug) ? { ...model, visibility: "hide" } : model,
     ),
@@ -477,10 +771,15 @@ function main() {
   const userSlugs = new Set(readUserModels().map((model) => String(model.slug)));
   const hiddenModels = readHiddenModels();
   const selectedModels = selectedConfiguredListedModels();
-  const allMultiAgentModels = applyMultiAgentSettings(
+  const multiAgentSettings = readMultiAgentSettings();
+  // Demotions first, then this machine's own recorded proofs. Settings still
+  // never manufacture a v2 claim — a promotion here traces to a live probe
+  // or an observed spawn in `multi-agent-proofs.json` — and a slug the
+  // operator hid or switched off stays v1 whatever evidence it carries.
+  const allMultiAgentModels = applyMultiAgentCapabilities(
     selectedModels,
-    readMultiAgentSettings(),
-    hiddenModels,
+    multiAgentSettings,
+    { hidden: hiddenModels },
   );
   // Clamp before announcements and agent sync so every surface Codex reads —
   // picker levels, defaults, and announcement copy — stays inside the effort
@@ -491,21 +790,10 @@ function main() {
     userSlugs,
     Date.now(),
   );
-  // Advertised last, and only while an engine actually resolves: Codex gates
-  // the paste on `input_modalities`, so a bridge that has gone away must take
-  // the advertisement with it rather than leaving a paste that 400s. This runs
-  // after the announcement pass so a bridged model never announces "image
-  // input" as though it grew the capability itself.
-  const visionEngine = resolveVisionEngine(selectedModels, readVisionBridgeSettings());
-  const catalogModels = applyVisionBridge(routedModels, visionEngine);
   const captured = nativeCatalog();
   const native = {
     ...captured,
-    models: promoteNativeMultiAgent(
-      captured.models,
-      readMultiAgentSettings(),
-      hiddenModels,
-    ),
+    models: promoteNativeMultiAgent(captured.models, multiAgentSettings, hiddenModels),
   };
   // Dropping every native model is destructive, so only do it when Codex
   // actually answered that the session is signed out. If the probe could not
@@ -521,30 +809,91 @@ function main() {
   }
   const openaiAuthenticated = auth.authenticated;
   const loginFree = loginFreeConfigured();
+  const routedCatalog = routedCatalogActive();
+  // Advertised last, and only while an engine actually resolves: Codex gates
+  // the paste on `input_modalities`, so a bridge that has gone away must take
+  // the advertisement with it rather than leaving a paste that 400s. This runs
+  // after the announcement pass so a bridged model never announces "image
+  // input" as though it grew the capability itself.
+  //
+  // Native models join the candidate list only once the auth probe says the
+  // session can actually spend them. A login-free install routes every turn
+  // away from the native backend, so nominating a native engine there would
+  // promise image input the router cannot deliver.
+  // The one shared rule (`src/vision-engines.mjs`). This is the only caller
+  // that can name the gate from the probe itself: it is the process that runs
+  // the probe, and it is building the merged catalog every other caller reads
+  // the verdict back out of.
+  const nativeEngines = nativeVisionEngines({
+    models: captured.models,
+    hidden: hiddenModels,
+    authorized: openaiAuthenticated && !loginFree,
+  });
+  const visionEngine = resolveVisionEngine(
+    () => [...selectedModels, ...nativeEngines],
+    readVisionBridgeSettings(),
+  );
+  const catalogModels = applyVisionBridge(routedModels, visionEngine);
   const { models: merged, aliases } = loginFree
     ? buildLoginFreeCatalog(native, catalogModels)
     : {
-        models: buildMergedCatalog(native, catalogModels, {
+        models: buildMergedCatalog(native, routedCatalog ? catalogModels : [], {
           includeNative: openaiAuthenticated,
         }),
         aliases: {},
       };
-  atomicJson(MERGED_CATALOG_PATH, {
-    models: merged.map((model) =>
-      hiddenModels.has(String(model.slug))
-        ? { ...model, visibility: "hide" }
-        : model,
-    ),
-  });
-  atomicJson(NATIVE_ALIAS_PATH, { version: 1, aliases });
-  writeAnnouncedAt(announcedAt);
-  const routedAgents = syncRoutedCodexAgents(routedModels);
+  const snapshots = new Map(
+    [MERGED_CATALOG_PATH, NATIVE_ALIAS_PATH, ANNOUNCED_MODELS_PATH]
+      .map((target) => [target, fileSnapshot(target)]),
+  );
+  let routedAgents;
+  try {
+    atomicJson(NATIVE_ALIAS_PATH, { version: 1, aliases });
+    writeAnnouncedAt(announcedAt);
+    atomicJson(MERGED_CATALOG_PATH, {
+      models: merged.map((model) =>
+        hiddenModels.has(String(model.slug))
+          ? { ...model, visibility: "hide" }
+          : model,
+      ),
+    });
+    if (process.env.MODEL_ROUTER_TEST_FAIL_AFTER_CATALOG_WRITE === "1") {
+      throw new Error("Forced failure after model catalog publication.");
+    }
+    // Codex offers every file in the agents directory by name, so a model
+    // switched off as a subagent needs its definition gone as well. Without
+    // this, switching it off changes multi_agent_version and nothing else, and
+    // the model still answers when it is spawned by name.
+    routedAgents = syncRoutedCodexAgents(
+      routedCatalog || loginFree
+        ? subagentEligibleModels(routedModels, multiAgentSettings)
+        : [],
+    );
+  } catch (error) {
+    const restoreErrors = [];
+    for (const [target, snapshot] of [...snapshots].reverse()) {
+      try {
+        restoreFileSnapshot(target, snapshot);
+      } catch (restoreError) {
+        restoreErrors.push(restoreError);
+      }
+    }
+    if (restoreErrors.length) {
+      throw new AggregateError(
+        [error, ...restoreErrors],
+        "Model catalog update failed and its previous files could not be restored.",
+      );
+    }
+    if (error && typeof error === "object") error.catalogRollbackSafe = true;
+    throw error;
+  }
   process.stdout.write(
     `${JSON.stringify({
       path: MERGED_CATALOG_PATH,
       models: merged.length,
       routed_models: routedModels.length,
-      routed_agents: routedAgents.length,
+      routed_agents: routedAgents.written.length,
+      removed_agents: routedAgents.removed.length,
       vision_bridge_engine: visionEngine?.slug || null,
       vision_bridged_models: catalogModels.filter(
         (model) => model.visionBridgeEngine !== undefined,
@@ -554,6 +903,7 @@ function main() {
         : 0,
       aliased_models: Object.keys(aliases).length,
       login_free: loginFree,
+      routed_catalog_active: routedCatalog || loginFree,
       openai_authenticated: openaiAuthenticated,
       openai_auth_reason: auth.reason,
       selected_model: selectedModel() || null,
@@ -570,6 +920,14 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     if (error?.code === "foreign_state_owner") {
       console.error(error.message);
       process.exit(1);
+    }
+    // Exit 75 tells an orchestrating mode switch that the requested catalog
+    // was not published and every prior catalog file was restored. A generic
+    // failure cannot make that guarantee and must leave the router transport
+    // active until a native-only catalog can be proven.
+    if (error?.catalogRollbackSafe) {
+      console.error(error.message);
+      process.exit(75);
     }
     throw error;
   }

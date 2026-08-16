@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import http from "node:http";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { openPort } from "./port-pool.mjs";
 
 import {
   hostedSearchEnabledFor,
@@ -19,17 +19,6 @@ const INTERNAL_KEY = "test-grok-internal-service-key-with-sufficient-length";
 
 function sse(events) {
   return `${events.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}`).join("\n\n")}\n\n`;
-}
-
-async function openPort() {
-  const server = net.createServer();
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  const { port } = server.address();
-  await new Promise((resolve) => server.close(resolve));
-  return port;
 }
 
 async function mockBackend(handler) {
@@ -195,6 +184,19 @@ test("translates Chat Completions to Grok Responses and back (text + tools)", as
       await effortResponse.json();
       assert.equal(captured.reasoning?.effort, expected);
     }
+
+    const xhighResponse = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        model: "grok-4.6",
+        messages: [{ role: "user", content: "ping" }],
+        reasoning_effort: "xhigh",
+      }),
+    });
+    assert.equal(xhighResponse.status, 200);
+    await xhighResponse.json();
+    assert.equal(captured.reasoning?.effort, "xhigh");
 
     // Streaming text.
     const streamResp = await fetch(`${base}/v1/chat/completions`, {
@@ -376,10 +378,16 @@ test("hostedSearchEnabledFor follows the registry searchTool declaration", () =>
       upstreamModel: "grok-4.5",
       searchTool: { mode: "hosted" },
     },
+    {
+      provider: "grok-oauth",
+      upstreamModel: "grok-4.6",
+      searchTool: { mode: "hosted" },
+    },
     { provider: "grok-oauth", upstreamModel: "grok-4.5-mini" },
     { provider: "kimi-oauth", upstreamModel: "kimi-k3", searchTool: { mode: "hosted" } },
   ];
   assert.equal(hostedSearchEnabledFor("grok-4.5", models), true);
+  assert.equal(hostedSearchEnabledFor("grok-4.6", models), true);
   // No declaration means conservative plain function calling.
   assert.equal(hostedSearchEnabledFor("grok-4.5-mini", models), false);
   // Another provider's declaration must not leak into this forwarder.
@@ -388,6 +396,7 @@ test("hostedSearchEnabledFor follows the registry searchTool declaration", () =>
 
 test("hostedSearchEnabledFor covers the checked-in Grok OAuth model", () => {
   assert.equal(hostedSearchEnabledFor("grok-4.5"), true);
+  assert.equal(hostedSearchEnabledFor("grok-4.6"), true);
 });
 
 test("toResponsesRequest preserves the client's image detail level", () => {
