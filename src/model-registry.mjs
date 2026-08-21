@@ -1,8 +1,9 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
+import { instructionOverlayExists } from "./instruction-overlays.mjs";
 import { SOURCE_ROOT } from "./paths.mjs";
-import { readUserModels } from "./user-models.mjs";
+import { officialModelDisplayName, readUserModels } from "./user-models.mjs";
 
 export const REGISTRY_PATH =
   process.env.MODEL_ROUTER_REGISTRY ||
@@ -163,34 +164,6 @@ export function readRegistryDocument(root = REGISTRY_PATH) {
   return { version: 1, providers, models };
 }
 
-// An optional `credential.cliSession` lets a provider reuse the API key its
-// own CLI stores after a browser sign-in. The descriptor names one file inside
-// one directory of the user's home, so a stray separator or `..` would let the
-// registry point the reader at an arbitrary path; reject those at load time.
-function cliSessionProblem(provider) {
-  // A keyless provider has no credential block at all, so there is no CLI
-  // session descriptor to validate.
-  const session = provider.credential?.cliSession;
-  if (session === undefined) return undefined;
-  if (!session || typeof session !== "object" || Array.isArray(session)) {
-    return `provider ${provider.id} has an invalid credential.cliSession`;
-  }
-  for (const field of ["directory", "file", "field", "label", "loginCommand"]) {
-    if (typeof session[field] !== "string" || !session[field].trim()) {
-      return `provider ${provider.id} cliSession requires ${field}`;
-    }
-  }
-  for (const field of ["directory", "file"]) {
-    if (session[field].includes("/") || session[field].includes("\\") || session[field] === "..") {
-      return `provider ${provider.id} cliSession ${field} must be a single path segment`;
-    }
-  }
-  if (session.homeEnv !== undefined && (typeof session.homeEnv !== "string" || !session.homeEnv)) {
-    return `provider ${provider.id} cliSession has an invalid homeEnv`;
-  }
-  return undefined;
-}
-
 function loadRegistry() {
   const parsed = readRegistryDocument();
   if (!Array.isArray(parsed.providers) || !Array.isArray(parsed.models)) {
@@ -311,8 +284,9 @@ function loadRegistry() {
       ) {
         fail(`provider ${provider.id} has an invalid credential label`);
       }
-      const sessionProblem = cliSessionProblem(provider);
-      if (sessionProblem) fail(sessionProblem);
+      if (provider.credential?.cliSession !== undefined) {
+        fail(`provider ${provider.id} does not support CLI sessions; use an API key`);
+      }
       // Some providers authenticate a credential their plan may still not
       // entitle to the API. The note says so everywhere a user connects, so
       // the first sign of it is not a 403 inside Codex.
@@ -358,15 +332,6 @@ function loadRegistry() {
     }
     if (provider.authProfile !== parent.authProfile) {
       fail(`variant provider ${provider.id} must share ${parent.id}'s auth profile`);
-    }
-    // A variant that resolved a different CLI sign-in than its parent would
-    // authenticate one protocol surface and not the other from the same
-    // "connected" state, so the descriptors must match exactly.
-    if (
-      JSON.stringify(provider.credential?.cliSession ?? null) !==
-      JSON.stringify(parent.credential?.cliSession ?? null)
-    ) {
-      fail(`variant provider ${provider.id} must share ${parent.id}'s credential CLI session`);
     }
   }
 
@@ -484,12 +449,16 @@ function endpointProblem(model, provider) {
 // has to be provider-shaped so the existing base-URL and credential chains
 // accept it. Identity is derived here rather than read from the fragment.
 function normalizedModel(model, provider) {
-  if (!provider?.perModelEndpoint) return Object.freeze(model);
+  const officialDisplayName = officialModelDisplayName(model.provider, model.upstreamModel);
+  const presented = officialDisplayName && model.displayName !== officialDisplayName
+    ? { ...model, displayName: officialDisplayName }
+    : model;
+  if (!provider?.perModelEndpoint) return Object.freeze(presented);
   return Object.freeze({
-    ...model,
+    ...presented,
     endpoint: Object.freeze({
-      ...model.endpoint,
-      id: model.slug,
+      ...presented.endpoint,
+      id: presented.slug,
       kind: "openai-compatible",
     }),
   });
@@ -518,8 +487,23 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   }
   const endpoint = endpointProblem(model, provider);
   if (endpoint) return endpoint;
+  if (
+    model.behaviorTemplate !== undefined &&
+    (typeof model.behaviorTemplate !== "string" || !model.behaviorTemplate.trim())
+  ) {
+    return `model ${model.slug} has an invalid behaviorTemplate`;
+  }
+  if (model.instructionOverlay !== undefined && !instructionOverlayExists(model.instructionOverlay)) {
+    return `model ${model.slug} has an invalid instructionOverlay`;
+  }
   if (model.requestProfile !== undefined && typeof model.requestProfile !== "string") {
     return `model ${model.slug} has an invalid requestProfile`;
+  }
+  if (
+    model.requiresTrailingUserTurn !== undefined &&
+    typeof model.requiresTrailingUserTurn !== "boolean"
+  ) {
+    return `model ${model.slug} has an invalid requiresTrailingUserTurn flag`;
   }
   if (
     model.multiAgentVersion !== undefined &&
@@ -567,6 +551,9 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   // never needs it, so only false is accepted.
   if (model.visionBridge !== undefined && model.visionBridge !== false) {
     return `model ${model.slug} may only set visionBridge to false`;
+  }
+  if (model.isFree !== undefined && typeof model.isFree !== "boolean") {
+    return `model ${model.slug} has an invalid isFree flag`;
   }
   // "hosted" means the provider's own backend executes web searches
   // server-side (xAI's Responses proxy today). "standalone" means Codex

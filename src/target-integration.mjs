@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
   CONFIG_PATH,
   DSH_CATALOG_PATH,
+  GEMINI_CATALOG_PATH,
   NATIVE_CATALOG_PATH,
   SOURCE_ROOT,
   TARGET,
@@ -30,8 +31,14 @@ export function targetCli(command) {
   return `./bin/${command}`;
 }
 
+const PICKER_NAMES = Object.freeze({
+  dsh: "DeepSeek Harness",
+  gemini: "Gemini CLI",
+  codex: "Codex",
+});
+
 export function targetPickerName() {
-  return TARGET === "dsh" ? "DeepSeek Harness" : "Codex";
+  return PICKER_NAMES[TARGET] || PICKER_NAMES.codex;
 }
 
 /**
@@ -43,18 +50,25 @@ export function targetPickerName() {
  * reopen" there would be busywork the product does not need.
  */
 export function targetRestartHint() {
-  return TARGET === "dsh"
-    ? "DeepSeek Harness reloads its settings document on the next request."
-    : `Fully quit and reopen ${targetPickerName()} to refresh the model picker.`;
+  if (TARGET === "dsh") {
+    return "DeepSeek Harness reloads its settings document on the next request.";
+  }
+  // Gemini CLI reads its `.env` once, at process start. A session already open
+  // keeps the old values; the next `gemini` invocation picks the new ones up.
+  // Telling somebody to quit a CLI they may not have running would be busywork.
+  if (TARGET === "gemini") {
+    return "Gemini CLI reads its environment at startup; the next `gemini` run picks this up.";
+  }
+  return `Fully quit and reopen ${targetPickerName()} to refresh the model picker.`;
 }
 
 /**
  * Republishes every *installed* client integration, not only the active target.
  *
  * The router plane is shared: enabling a provider, storing a key, or curating a
- * model changes the routable set for Codex and the harness alike. Refreshing
- * only whichever target the current command happens to run under is how one
- * client ends up advertising a model the other just gained or lost.
+ * model changes the routable set for Codex, the harness, and Gemini alike.
+ * Refreshing only whichever target the current command happens to run under
+ * is how one client ends up advertising a model the other just gained or lost.
  */
 /**
  * Which client integrations are currently published.
@@ -73,6 +87,7 @@ export function installedTargets() {
   // behind after the last integration was removed.
   if (codexIntegrationInstalled()) installed.push("codex");
   if (existsSync(DSH_CATALOG_PATH)) installed.push("dsh");
+  if (existsSync(GEMINI_CATALOG_PATH)) installed.push("gemini");
   return installed;
 }
 
@@ -92,7 +107,11 @@ function codexIntegrationInstalled() {
 
 export function refreshTargetPickerIfInstalled() {
   let refreshed = false;
-  if (existsSync(NATIVE_CATALOG_PATH)) {
+  // A managed Codex config is the integration marker. Keep the retained
+  // native capture as a fallback for an uninstall/update transition, but do
+  // not let a missing cache silently make a live Codex install the one client
+  // that misses a shared picker mutation.
+  if (codexIntegrationInstalled() || existsSync(NATIVE_CATALOG_PATH)) {
     run("catalog.mjs");
     refreshed = true;
   }
@@ -101,6 +120,14 @@ export function refreshTargetPickerIfInstalled() {
   // it survives a user who edits or moves the document by hand.
   if (existsSync(DSH_CATALOG_PATH)) {
     run("dsh-config-manager.mjs", ["install"]);
+    refreshed = true;
+  }
+  // Gemini CLI is served its model list live off the router's own catalog, so
+  // there is no list here to keep in step -- but the published default model is
+  // a slug like any other, and a republish is what moves it off one the routable
+  // set just lost.
+  if (existsSync(GEMINI_CATALOG_PATH)) {
+    run("gemini-config-manager.mjs", ["install"]);
     refreshed = true;
   }
   return refreshed;

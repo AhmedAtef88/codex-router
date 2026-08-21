@@ -120,6 +120,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "opencode-go-messages/qwen3.7-plus",
       "opencode-go-messages/qwen3.8-max",
       "opencode-go-responses/gpt-5.6-luna",
+      "opencode-go-responses/muse-spark-1.2-contributor",
       "qwen-plan/deepseek-v4-flash-0731",
       "qwen-plan/deepseek-v4-pro-0813",
       "qwen-plan/deepseek-v4-pro",
@@ -420,6 +421,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
     "deepseek/deepseek-v4-flash",
     "opencode-go/deepseek-v4-flash",
     "xiaomi-mimo/mimo-v2.5",
+    "zai-coding/glm-5.3",
   ]);
   for (const model of MODELS) {
     if (["grok-oauth/grok-4.5", "grok-oauth/grok-4.6"].includes(model.slug) || standaloneSearchSlugs.has(model.slug)) continue;
@@ -496,6 +498,17 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(grok46.defaultEffort, "high");
   assert.deepEqual(grok46.inputModalities, ["text", "image"]);
   for (const slug of [
+    "grok-oauth/grok-4.6",
+    "grok-oauth/grok-4.5",
+    "grok-api/grok-4.5",
+    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-reasoner",
+  ]) {
+    assert.equal(MODEL_BY_SLUG.get(slug).supportsReasoningSummaries, true);
+  }
+  assert.equal(MODEL_BY_SLUG.get("deepseek/deepseek-chat").supportsReasoningSummaries, undefined);
+  for (const slug of [
     "deepseek/deepseek-v4-flash",
     "deepseek/deepseek-v4-pro",
   ]) {
@@ -506,6 +519,18 @@ test("provider registry exposes configured API and OAuth model families", () => 
   }
 });
 
+test("only checked-in Gemini reseller models opt into trailing model-turn trimming", () => {
+  assert.equal(
+    MODEL_BY_SLUG.get("commandcode/gemini-3.5-flash").requiresTrailingUserTurn,
+    true,
+  );
+  assert.equal(
+    MODEL_BY_SLUG.get("commandcode/gemini-3.7-flash").requiresTrailingUserTurn,
+    true,
+  );
+  assert.equal(MODEL_BY_SLUG.get("commandcode/gpt-5.5").requiresTrailingUserTurn, undefined);
+});
+
 test("DeepSeek V4 Flash routes opt in to Codex standalone web search", () => {
   for (const slug of [
     "deepseek/deepseek-v4-flash",
@@ -513,6 +538,13 @@ test("DeepSeek V4 Flash routes opt in to Codex standalone web search", () => {
   ]) {
     assert.deepEqual(MODEL_BY_SLUG.get(slug)?.searchTool, { mode: "standalone" }, slug);
   }
+});
+
+test("GLM-5.3 Coding Plan opts in to GPT-5.6 behavior, concise execution, and standalone search", () => {
+  const model = MODEL_BY_SLUG.get("zai-coding/glm-5.3");
+  assert.equal(model?.behaviorTemplate, "gpt-5.6-sol");
+  assert.equal(model?.instructionOverlay, "efficient-agentic");
+  assert.deepEqual(model?.searchTool, { mode: "standalone" });
 });
 
 test("Meta models opt out of the apply_patch custom tool", () => {
@@ -677,6 +709,32 @@ test("curated upgrade prompts point at listed generational successors", () => {
   );
 });
 
+test("instruction overlays must name a shipped overlay", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const dir = mkdtempSync(path.join(tmpdir(), "registry-overlay-test-"));
+  try {
+    const registry = readRegistryDocument("config");
+    registry.models = [
+      { ...registry.models[0], instructionOverlay: "no-such-overlay" },
+      ...registry.models.slice(1),
+    ];
+    const registryPath = path.join(dir, "providers.json");
+    writeFileSync(registryPath, JSON.stringify(registry));
+    const result = spawnSync(
+      process.execPath,
+      ["-e", "import('./src/model-registry.mjs').catch((e)=>{console.error(e.message);process.exit(1);})"],
+      { encoding: "utf8", env: { ...process.env, MODEL_ROUTER_REGISTRY: registryPath } },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /invalid instructionOverlay/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // The router's vision bridge is what gives a text-only model images, so the
 // registry may only record an opt-out. A `true` would read as a capability the
 // model itself has, which is exactly the claim the bridge must never make.
@@ -701,6 +759,32 @@ test("visionBridge may only be set to false", async () => {
     );
     assert.equal(result.status, 1);
     assert.match(result.stderr, /may only set visionBridge to false/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("requiresTrailingUserTurn must be a boolean", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const dir = mkdtempSync(path.join(tmpdir(), "registry-trailing-turn-test-"));
+  try {
+    const registry = readRegistryDocument("config");
+    registry.models = [
+      { ...registry.models[0], requiresTrailingUserTurn: "yes" },
+      ...registry.models.slice(1),
+    ];
+    const registryPath = path.join(dir, "providers.json");
+    writeFileSync(registryPath, JSON.stringify(registry));
+    const result = spawnSync(
+      process.execPath,
+      ["-e", "import('./src/model-registry.mjs').catch((e)=>{console.error(e.message);process.exit(1);})"],
+      { encoding: "utf8", env: { ...process.env, MODEL_ROUTER_REGISTRY: registryPath } },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /invalid requiresTrailingUserTurn flag/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -763,6 +847,31 @@ test("serviceTiers require unique non-empty ids and names", async () => {
     );
     const valid = load([{ id: "priority", name: "Fast" }]);
     assert.equal(valid.status, 0, valid.stderr);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("isFree is a boolean model tag", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const nodePath = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const dir = mkdtempSync(nodePath.join(tmpdir(), "registry-free-tag-test-"));
+  const load = (isFree) => {
+    const registry = readRegistryDocument("config");
+    registry.models = [{ ...registry.models[0], isFree }, ...registry.models.slice(1)];
+    const registryPath = nodePath.join(dir, "providers.json");
+    writeFileSync(registryPath, JSON.stringify(registry));
+    return spawnSync(
+      process.execPath,
+      ["-e", "import('./src/model-registry.mjs').catch((e)=>{console.error(e.message);process.exit(1);})"],
+      { encoding: "utf8", env: { ...process.env, MODEL_ROUTER_REGISTRY: registryPath } },
+    );
+  };
+  try {
+    assert.match(load("yes").stderr, /invalid isFree flag/);
+    assert.equal(load(true).status, 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1006,6 +1115,13 @@ test("local models route with Ollama's native protocol and a bounded context", (
   const rendered = renderLiteLlmConfig();
   const openAiRoutes = rendered.match(/model: "openai\/local-[^"]+"/g);
   assert.equal(openAiRoutes, null, "a local model must not use the OpenAI-compatible surface");
+  for (const block of rendered.matchAll(/model: "ollama_chat\/[^"]+"([\s\S]*?)(?=\n\s*- model_name:|\nlitellm_settings:)/g)) {
+    assert.match(
+      block[1],
+      /num_retries: 0/,
+      "a deterministic local rejection must not be repeated inside LiteLLM",
+    );
+  }
   // Every non-local model keeps the forwarder path untouched.
   assert.match(rendered, /model: "openai\/deepseek-v4-pro"/);
 });

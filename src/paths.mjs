@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { trayBundleDir } from "./tray-install.mjs";
 
-const supportedTargets = new Set(["codex", "dsh"]);
+const supportedTargets = new Set(["codex", "dsh", "gemini"]);
 
 export const TARGET = process.env.MODEL_ROUTER_TARGET || "codex";
 if (!supportedTargets.has(TARGET)) {
@@ -25,8 +25,12 @@ if (!supportedTargets.has(TARGET)) {
 // process. They stay on `codex` whichever integration is being installed.
 export const ROUTER_PLANE_TARGET = "codex";
 
-export const TARGET_DISPLAY_NAME =
-  TARGET === "dsh" ? "DeepSeek Harness Router" : "Codex Router";
+const TARGET_DISPLAY_NAMES = Object.freeze({
+  dsh: "DeepSeek Harness Router",
+  gemini: "Gemini CLI Router",
+  codex: "Codex Router",
+});
+export const TARGET_DISPLAY_NAME = TARGET_DISPLAY_NAMES[TARGET] || TARGET_DISPLAY_NAMES.codex;
 const configuredSourceRoot = process.env.CODEX_ROUTER_SOURCE_ROOT;
 if (configuredSourceRoot && !path.isAbsolute(configuredSourceRoot)) {
   throw new Error("CODEX_ROUTER_SOURCE_ROOT must be an absolute path.");
@@ -58,6 +62,22 @@ export const DSH_SETTINGS_PATH =
 export const DSH_CREDENTIALS_PATH =
   process.env.MODEL_ROUTER_DSH_CREDENTIALS || path.join(DSH_HOME, ".credentials.yaml");
 
+// Gemini CLI resolves its own home as `GEMINI_CLI_HOME` or the user's home, and
+// then `.gemini` inside it (`homedir()` in @google/gemini-cli-core's paths
+// util, plus its `GEMINI_DIR` constant). Match that resolution exactly rather
+// than hardcoding the default, or a user who moved theirs gets a document
+// nothing reads.
+export const GEMINI_HOME = path.join(
+  process.env.GEMINI_CLI_HOME || os.homedir(),
+  ".gemini",
+);
+// The only document this integration writes. Gemini CLI loads it at startup for
+// `GOOGLE_GEMINI_BASE_URL`, `GEMINI_API_KEY`, and `GEMINI_MODEL` -- which is the
+// whole integration, so its `settings.json` is never touched. It holds the
+// caller key, so it is written 0600 under a 0700 directory.
+export const GEMINI_ENV_PATH =
+  process.env.MODEL_ROUTER_GEMINI_ENV || path.join(GEMINI_HOME, ".env");
+
 function managedStateDir() {
   return (
     process.env.CODEX_ROUTER_STATE_DIR ||
@@ -82,6 +102,11 @@ export const MERGED_CATALOG_PATH = path.join(STATE_DIR, "merged-models.json");
 // detected against this snapshot rather than by re-deriving what "should" be
 // there and trusting the answer.
 export const DSH_CATALOG_PATH = path.join(STATE_DIR, "dsh-models.json");
+// The same marker for the Gemini integration: what the last publish wrote, so
+// drift is detected against a snapshot rather than by re-deriving what should
+// be there and trusting the answer. Its presence is what says the integration
+// is installed.
+export const GEMINI_CATALOG_PATH = path.join(STATE_DIR, "gemini-models.json");
 export const NATIVE_ALIAS_PATH = path.join(STATE_DIR, "native-aliases.json");
 export const ANNOUNCED_MODELS_PATH = path.join(STATE_DIR, "announced-models.json");
 export const LITELLM_CONFIG_PATH = path.join(STATE_DIR, "litellm.yaml");
@@ -89,13 +114,21 @@ export const INTERNAL_SECRET_PATH = path.join(STATE_DIR, "internal-secret");
 export const CALLER_SECRET_PATH = path.join(STATE_DIR, "caller-secret");
 export const CODEX_PROVIDER_MODE_PATH = path.join(STATE_DIR, "codex-provider-mode.json");
 export const SIGNED_PROVIDER_MODE_PATH = path.join(STATE_DIR, "signed-provider-mode.json");
+// An opt-in routed default for signed-in Codex. The router owns this small
+// state file, while Codex continues to own the actual config document.
+export const CODEX_DEFAULT_MODEL_PATH = path.join(STATE_DIR, "codex-default-model.json");
 export const PROVIDER_SELECTION_PATH = path.join(STATE_DIR, "enabled-providers.json");
 export const DISCOVERY_MODE_PATH = path.join(STATE_DIR, "discovery-mode.json");
+// The last model list each provider published for itself. It is a convenience
+// cache for the curation surfaces, never an authority: what is registered
+// locally is always recomputed from the live registry.
+export const PROVIDER_CATALOG_CACHE_PATH = path.join(STATE_DIR, "provider-catalog-cache.json");
 export const INSTALL_MANIFEST_PATH = path.join(STATE_DIR, "install-manifest.json");
 export const SKILL_OWNERSHIP_PATH = path.join(STATE_DIR, "managed-skills.json");
 export const MIGRATIONS_DIR = path.join(STATE_DIR, "migrations");
 export const SUPPORT_DIR = path.join(STATE_DIR, "support");
 export const LOG_PATH = path.join(STATE_DIR, "router.log");
+export const SERVICE_PROCESS_STATE_PATH = path.join(STATE_DIR, "service-process.json");
 export const BACKUP_PATH = path.join(CODEX_HOME, "config.toml.pre-codex-router");
 export const SERVICE_LABEL = "io.github.codex-router";
 export const LEGACY_SERVICE_LABEL = "io.github.kimi-codex-router";
@@ -150,6 +183,7 @@ export const DEFAULT_PORTS = Object.freeze({
   router: 4202,
   api: 4203,
   grokOauth: 4208,
+  devinCli: 4210,
 });
 
 // Ports used before the BrlAPI-safe defaults shipped. They remain recognized
@@ -181,6 +215,7 @@ export const PORTS = {
     process.env.CODEX_ROUTER_API_PORT || process.env.KIMI_API_FORWARD_PORT || DEFAULT_PORTS.api,
   ),
   grokOauth: port("MODEL_ROUTER_GROK_OAUTH_PORT", DEFAULT_PORTS.grokOauth),
+  devinCli: port("MODEL_ROUTER_DEVIN_CLI_PORT", DEFAULT_PORTS.devinCli),
 };
 
 export function loopback(portNumber, suffix = "") {

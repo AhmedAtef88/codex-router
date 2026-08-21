@@ -20,6 +20,8 @@ import {
   STATE_DIR,
   TARGET,
 } from "./paths.mjs";
+import { serviceProxyEnvironment } from "./proxy-environment.mjs";
+import { assertServiceWriteIsolated } from "./service-write-guard.mjs";
 
 const command = process.argv[2] || "status";
 const effectivePlatform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
@@ -64,6 +66,7 @@ function environmentEntries() {
     CODEX_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     CODEX_ROUTER_PORT: String(PORTS.router),
     CODEX_ROUTER_API_PORT: String(PORTS.api),
+    ...serviceProxyEnvironment(),
     ...(process.env.CODEX_ROUTER_SOURCE_ROOT
       ? { CODEX_ROUTER_SOURCE_ROOT: SOURCE_ROOT }
       : {}),
@@ -153,12 +156,23 @@ function bootout(targetService = service) {
   }
 }
 
+const guardPlistWrite = () => assertServiceWriteIsolated(LAUNCH_AGENT_PATH, {
+  redirected: Boolean(
+    process.env.MODEL_ROUTER_LAUNCH_AGENTS_DIR || process.env.CODEX_ROUTER_LAUNCH_AGENTS_DIR,
+  ),
+  label: "LaunchAgent",
+  override: "MODEL_ROUTER_LAUNCH_AGENTS_DIR",
+});
+
 function writePlist() {
+  guardPlistWrite();
   mkdirSync(path.dirname(LAUNCH_AGENT_PATH), { recursive: true });
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   const temporary = `${LAUNCH_AGENT_PATH}.tmp.${process.pid}`;
-  writeFileSync(temporary, plist(), { encoding: "utf8", mode: 0o644 });
-  chmodSync(temporary, 0o644);
+  // Proxy URLs may carry credentials, so the generated plist is private just
+  // like the state it launches with.
+  writeFileSync(temporary, plist(), { encoding: "utf8", mode: 0o600 });
+  chmodSync(temporary, 0o600);
   renameSync(temporary, LAUNCH_AGENT_PATH);
 }
 
@@ -220,6 +234,9 @@ if (command === "render") {
   } catch {
     // Best effort.
   }
+  // Removal damages the machine exactly as a write does: the observed failure
+  // included a test deleting the real LaunchAgent outright.
+  guardPlistWrite();
   if (existsSync(LAUNCH_AGENT_PATH)) unlinkSync(LAUNCH_AGENT_PATH);
   process.stdout.write(`${JSON.stringify({ installed: false })}\n`);
 } else if (command === "stop") {

@@ -52,7 +52,7 @@ jobs:
           else
             cp "$built/codex-router-desktop" "staged/codex-router-tray-${version}-linux-x64"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tray-${{ runner.os }}
           path: staged/*
@@ -87,7 +87,7 @@ jobs:
       # Before the checksums are taken, so the companion binaries are covered by
       # SHA256SUMS and the provenance attestation like every other asset.
       - name: Collect the companion binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: tray-*
           path: dist

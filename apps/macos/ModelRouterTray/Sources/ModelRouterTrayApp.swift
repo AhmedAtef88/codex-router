@@ -3,6 +3,7 @@ import Combine
 import Foundation
 import ServiceManagement
 import SwiftUI
+import UniformTypeIdentifiers
 
 // Keep the existing material/background treatment, but use stronger text and
 // semantic accents so the compact tray remains readable over it.
@@ -29,6 +30,57 @@ enum LocalModelOperationKind: Equatable {
 struct LocalModelOperation: Equatable {
   let tag: String
   let kind: LocalModelOperationKind
+}
+
+enum RouterToggleKey: Hashable {
+  case provider(String)
+  case signedRouting
+  case loginFree
+  case toolResultAging
+  case subagentMode
+  case subagentModel(String)
+  case pickerModel(String)
+  case localModel(String)
+  case visionBridge
+}
+
+// A refresh remains the source of truth, but a switch should not wait for the
+// control process and publication lock before it moves. The ledger holds only
+// the user's not-yet-reconciled intent. Revisions make a late result from an
+// earlier click harmless when the same switch is changed again in flight.
+struct OptimisticToggleLedger<Key: Hashable> {
+  struct Intent: Equatable {
+    let value: Bool
+    let revision: Int
+  }
+
+  private var revisions: [Key: Int] = [:]
+  private var intents: [Key: Intent] = [:]
+
+  mutating func request(_ value: Bool, for key: Key) -> Intent {
+    let revision = (revisions[key] ?? 0) + 1
+    revisions[key] = revision
+    let intent = Intent(value: value, revision: revision)
+    intents[key] = intent
+    return intent
+  }
+
+  func intent(for key: Key) -> Intent? { intents[key] }
+
+  func value(for key: Key, authoritative: Bool) -> Bool {
+    intents[key]?.value ?? authoritative
+  }
+
+  func isCurrent(_ intent: Intent, for key: Key) -> Bool {
+    intents[key] == intent
+  }
+
+  @discardableResult
+  mutating func reconcile(_ intent: Intent, for key: Key) -> Bool {
+    guard isCurrent(intent, for: key) else { return false }
+    intents.removeValue(forKey: key)
+    return true
+  }
 }
 
 enum RouterActivityState: String, Decodable {
@@ -91,8 +143,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     surfaceVisibility = store.$surfacesVisible
       .combineLatest(store.$islandMode)
       .sink { [weak self] visible, mode in
-        self?.islandController?.setVisible(visible && mode == .notch)
-        self?.desktopPanelController?.setVisible(visible && mode == .desktop)
+        // Publishing from a refresh can happen while SwiftUI is evaluating the
+        // MenuBarExtra tree. Defer AppKit window/layout work until that render
+        // transaction has finished, otherwise relaunches can recurse through
+        // layoutSubtreeIfNeeded.
+        Task { @MainActor [weak self] in
+          self?.islandController?.setVisible(visible && mode == .notch)
+          self?.desktopPanelController?.setVisible(visible && mode == .desktop)
+        }
       }
     store.retireLoginItem()
     store.startHostAppObservation()
@@ -135,6 +193,7 @@ final class RouterStore: ObservableObject {
   @Published private(set) var lastUpdated: Date?
   @Published private(set) var selectedUsageProviderID: String
   @Published private(set) var activityState: RouterActivityState = .idle
+  @Published fileprivate var routerHealth: RouterHealth?
   @Published private(set) var activeRequests: [RouterActiveRequest] = []
   @Published private(set) var activeRequestCount: Int = 0
   @Published private(set) var activeModel: String?
@@ -147,6 +206,7 @@ final class RouterStore: ObservableObject {
   @Published private(set) var providerOperation: String?
   @Published private(set) var visionDownload: VisionDownloadState?
   @Published private(set) var localDownload: VisionDownloadState?
+  @Published private(set) var localMlx: LocalMlxSnapshot?
   @Published private(set) var localModelOperation: LocalModelOperation?
   @Published private(set) var benchmarkingTag: String?
   @Published private(set) var maintenanceMessage: String?
@@ -154,6 +214,13 @@ final class RouterStore: ObservableObject {
   @Published private(set) var harnessMessage: String?
   @Published private(set) var harnessSucceeded = false
   @Published private(set) var islandMode: IslandMode
+  @Published private(set) var menuBarDisplayMode: TrayMenuBarDisplayMode
+  @Published private(set) var menuBarShowModelName: Bool
+  @Published private(set) var menuBarIconStyle: TrayMenuBarIconStyle
+  @Published private(set) var menuBarPresetIcon: String
+  @Published private(set) var menuBarCustomIconPath: String?
+  @Published private(set) var menuBarCustomIconImage: NSImage?
+  @Published private(set) var menuBarCustomIconMissing = false
   // Publishing the language makes every view re-render on change, so the
   // panel switches in place instead of waiting for the next relaunch.
   @Published private(set) var language: TrayLanguage = RouterLanguage.selection
@@ -169,6 +236,7 @@ final class RouterStore: ObservableObject {
   // it so a double-click gets a visible answer even when the tray was already
   // running and nothing about the router changed.
   @Published private(set) var attentionPulse = 0
+  @Published private var optimisticToggles = OptimisticToggleLedger<RouterToggleKey>()
   private var attentionRelease: Task<Void, Never>?
   private var userRevealUntil: Date?
   private static let userRevealWindow: TimeInterval = 20
@@ -180,6 +248,11 @@ final class RouterStore: ObservableObject {
   private let defaults = UserDefaults.standard
   private let islandVisibilityKey = "ModelRouterTray.islandVisible"
   private let islandModeKey = "ModelRouterTray.islandMode"
+  private let menuBarDisplayModeKey = "ModelRouterTray.menuBarDisplayMode"
+  private let menuBarShowModelNameKey = "ModelRouterTray.menuBarShowModelName"
+  private let menuBarIconStyleKey = "ModelRouterTray.menuBarIconStyle"
+  private let menuBarPresetIconKey = "ModelRouterTray.menuBarPresetIcon"
+  private let menuBarCustomIconPathKey = "ModelRouterTray.menuBarCustomIconPath"
   // Named for the retired login item because `update` still reads this default
   // to locate a tray installed outside the standard paths.
   private let loginItemBundlePathKey = "ModelRouterTray.loginItemBundlePath"
@@ -200,6 +273,15 @@ final class RouterStore: ObservableObject {
   private var hostAppRecheck: Task<Void, Never>?
   private var serviceWork: Task<Void, Never>?
   private var serviceIntent: ServiceIntent = .unknown
+  private struct PendingToggleOperation {
+    let label: String
+    let run: @MainActor (Bool) async throws -> Void
+    let success: @MainActor (Bool) async -> String
+  }
+  private var pendingToggleOperations: [RouterToggleKey: PendingToggleOperation] = [:]
+  private var toggleQueue: [RouterToggleKey] = []
+  private var activeToggleKey: RouterToggleKey?
+  private var toggleWorker: Task<Void, Never>?
   // Codex relaunches itself to apply updates, so a momentary disappearance must
   // not bounce the router. Wait the absence out and re-check the process list
   // directly before stopping; workspace notifications are only hints.
@@ -277,6 +359,84 @@ final class RouterStore: ObservableObject {
     return hasLaunchedBefore ? .notch : .off
   }
 
+  // Missing keys keep the look that shipped before custom icons: standard
+  // width, model name on, activity dot. An explicit Settings choice always
+  // wins; garbage raw values fall through the same way island mode does.
+  nonisolated static func resolveMenuBarSettings(
+    storedDisplayMode: String?,
+    storedShowModelName: Bool?,
+    storedIconStyle: String?,
+    storedPresetIcon: String?,
+    storedCustomIconPath: String?
+  ) -> MenuBarSettings {
+    let custom = storedCustomIconPath.flatMap { $0.isEmpty ? nil : $0 }
+    let preset = storedPresetIcon.flatMap { $0.isEmpty ? nil : $0 } ?? "cpu"
+    return MenuBarSettings(
+      displayMode: storedDisplayMode.flatMap(TrayMenuBarDisplayMode.init(rawValue:)) ?? .standard,
+      showModelName: storedShowModelName ?? true,
+      iconStyle: storedIconStyle.flatMap(TrayMenuBarIconStyle.init(rawValue:)) ?? .indicator,
+      presetIcon: preset,
+      customIconPath: custom
+    )
+  }
+
+  nonisolated static let customMenuBarIconMaxBytes = 5 * 1024 * 1024
+
+  nonisolated static func persistCustomMenuBarIcon(
+    from source: URL,
+    into applicationSupportDirectory: URL,
+    fileManager: FileManager = .default,
+    maxBytes: Int = RouterStore.customMenuBarIconMaxBytes
+  ) throws -> URL {
+    let size = (try fileManager.attributesOfItem(atPath: source.path)[.size] as? NSNumber)?.intValue ?? 0
+    if size > maxBytes {
+      throw MenuBarCustomIconError.tooLarge
+    }
+    let dir = applicationSupportDirectory.appendingPathComponent("ModelRouterTray", isDirectory: true)
+    try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+    let ext = source.pathExtension.isEmpty ? "png" : source.pathExtension.lowercased()
+    let dest = dir.appendingPathComponent("menu-bar-icon.\(ext)")
+    let staging = dir.appendingPathComponent("menu-bar-icon.\(UUID().uuidString).tmp")
+    do {
+      try fileManager.copyItem(at: source, to: staging)
+      if fileManager.fileExists(atPath: dest.path) {
+        _ = try fileManager.replaceItemAt(dest, withItemAt: staging)
+      } else {
+        try fileManager.moveItem(at: staging, to: dest)
+      }
+    } catch {
+      try? fileManager.removeItem(at: staging)
+      throw error
+    }
+    if let leftovers = try? fileManager.contentsOfDirectory(
+      at: dir,
+      includingPropertiesForKeys: nil
+    ) {
+      for leftover in leftovers
+      where leftover.lastPathComponent.hasPrefix("menu-bar-icon.")
+        && leftover.lastPathComponent != dest.lastPathComponent
+      {
+        try? fileManager.removeItem(at: leftover)
+      }
+    }
+    return dest
+  }
+
+  nonisolated static func loadCustomMenuBarIcon(path: String?) -> (image: NSImage?, missing: Bool) {
+    guard let path, !path.isEmpty else { return (nil, false) }
+    if let image = NSImage(contentsOfFile: path) {
+      return (image, false)
+    }
+    return (nil, true)
+  }
+
+  nonisolated static func menuBarTooltip(provider: String, state: String, usage: String?) -> String {
+    if let usage {
+      return routerFormat("Codex Router · %@ (%@) · %@", provider, state, usage)
+    }
+    return routerFormat("Codex Router · %@ (%@)", provider, state)
+  }
+
   init() {
     selectedUsageProviderID = "openai"
     // retireLoginItem records the bundle path on every bundled launch and runs
@@ -302,6 +462,22 @@ final class RouterStore: ObservableObject {
     } else {
       presenceMode = .always
     }
+
+    let resolvedMenuBar = Self.resolveMenuBarSettings(
+      storedDisplayMode: defaults.string(forKey: menuBarDisplayModeKey),
+      storedShowModelName: defaults.object(forKey: menuBarShowModelNameKey) == nil
+        ? nil
+        : defaults.bool(forKey: menuBarShowModelNameKey),
+      storedIconStyle: defaults.string(forKey: menuBarIconStyleKey),
+      storedPresetIcon: defaults.string(forKey: menuBarPresetIconKey),
+      storedCustomIconPath: defaults.string(forKey: menuBarCustomIconPathKey)
+    )
+    menuBarDisplayMode = resolvedMenuBar.displayMode
+    menuBarShowModelName = resolvedMenuBar.showModelName
+    menuBarIconStyle = resolvedMenuBar.iconStyle
+    menuBarPresetIcon = resolvedMenuBar.presetIcon
+    menuBarCustomIconPath = resolvedMenuBar.customIconPath
+    reloadCustomMenuBarIcon()
   }
 
   var codexActive: Bool {
@@ -395,6 +571,42 @@ final class RouterStore: ObservableObject {
     // button into a full repair.
     persistPresenceMode(mode)
     reconcileService()
+  }
+
+  func setMenuBarDisplayMode(_ mode: TrayMenuBarDisplayMode) {
+    menuBarDisplayMode = mode
+    defaults.set(mode.rawValue, forKey: menuBarDisplayModeKey)
+  }
+
+  func setMenuBarShowModelName(_ show: Bool) {
+    menuBarShowModelName = show
+    defaults.set(show, forKey: menuBarShowModelNameKey)
+  }
+
+  func setMenuBarIconStyle(_ style: TrayMenuBarIconStyle) {
+    menuBarIconStyle = style
+    defaults.set(style.rawValue, forKey: menuBarIconStyleKey)
+  }
+
+  func setMenuBarPresetIcon(_ icon: String) {
+    menuBarPresetIcon = icon
+    defaults.set(icon, forKey: menuBarPresetIconKey)
+  }
+
+  func setMenuBarCustomIconPath(_ path: String?) {
+    menuBarCustomIconPath = path
+    if let path {
+      defaults.set(path, forKey: menuBarCustomIconPathKey)
+    } else {
+      defaults.removeObject(forKey: menuBarCustomIconPathKey)
+    }
+    reloadCustomMenuBarIcon()
+  }
+
+  private func reloadCustomMenuBarIcon() {
+    let loaded = Self.loadCustomMenuBarIcon(path: menuBarCustomIconPath)
+    menuBarCustomIconImage = loaded.image
+    menuBarCustomIconMissing = loaded.missing
   }
 
   private func refreshHostAppRunning() {
@@ -494,7 +706,9 @@ final class RouterStore: ObservableObject {
     // effectivePresenceMode, not presenceMode: the router pins follow mode to
     // always while a client it cannot watch is talking to it, and a user launch
     // must not undo that.
-    surfacesVisible = pinnedByUser || effectivePresenceMode == .always || hostAppRunning
+    let next = pinnedByUser || effectivePresenceMode == .always || hostAppRunning
+    guard surfacesVisible != next else { return }
+    surfacesVisible = next
   }
 
   // Opening Model Router from Finder, Spotlight, Launchpad, or the Dock has to
@@ -655,6 +869,7 @@ final class RouterStore: ObservableObject {
     "github-copilot": "Copilot",
     "clinepass": "ClinePass",
     "chutes": "Chutes",
+    "orca": "OrcaRouter",
   ]
 
   static func shortName(forRegistryProvider provider: RouterProviderInfo) -> String {
@@ -979,6 +1194,7 @@ final class RouterStore: ObservableObject {
       snapshot = try JSONDecoder().decode(RouterSnapshot.self, from: output)
       updateRouterPinsServiceOn(snapshot.presence?.effectiveMode == "always")
       let reportedLocalModels = snapshot.targets["codex"]?.modelSettings?.localModels
+      let reportedLocalMlx = reportedLocalModels?.mlx
       let installedLocalTags = Set(reportedLocalModels?.models.map(\.tag) ?? [])
       let rawReportedLocalDownload = reportedLocalModels?.download
       // The protected download record intentionally survives completion, but
@@ -1014,6 +1230,17 @@ final class RouterStore: ObservableObject {
       } else {
         localDownload = reportedLocalDownload
       }
+      // Keep the click's optimistic state until the detached worker publishes
+      // a record at least as new. Otherwise a routine refresh can briefly turn
+      // the install card back into an idle button during runtime preflight.
+      if let current = localMlx, current.operation.isRunning {
+        if let reported = reportedLocalMlx,
+          (reported.operation.updatedAt ?? 0) >= (current.operation.startedAt ?? .greatestFiniteMagnitude) {
+          localMlx = reported
+        }
+      } else {
+        localMlx = reportedLocalMlx
+      }
       resolveInitialUsageProvider()
       lastUpdated = .now
       message = nil
@@ -1029,7 +1256,10 @@ final class RouterStore: ObservableObject {
     while !Task.isCancelled {
       await refreshActivity()
       do {
-        try await Task.sleep(nanoseconds: 350_000_000)
+        // Activity is status UI, not a frame clock. A 350ms loop kept waking
+        // SwiftUI and AppKit while the tray was idle; one second is responsive
+        // for a status indicator without turning it into a display link.
+        try await Task.sleep(nanoseconds: 1_000_000_000)
       } catch {
         return
       }
@@ -1169,10 +1399,9 @@ final class RouterStore: ObservableObject {
     focusUsageProvider(providerID)
   }
 
-  // One click covers the whole route into a provider: install the official CLI
-  // when it is missing, then go straight into its browser sign-in. Stopping
-  // after the install left a row that looked finished but still had no
-  // credential, and made connecting a two-click ritual for no reason.
+  // One click covers the whole route into an OAuth provider: install the
+  // official CLI when it is missing, then run its sign-in flow. Stopping after
+  // the install left a row that looked finished but still had no credential.
   // install-cli is a no-op when the CLI is already present, so an unknown
   // state costs a lookup rather than a wrong branch.
   func connectProvider(_ provider: String) async {
@@ -1217,12 +1446,11 @@ final class RouterStore: ObservableObject {
       successMessage: "\(label) saved. Restart Codex to refresh its model picker."
     ) {
       _ = try await runControl(arguments: ["credential", provider], stdin: secret)
-      try await updateProviderSelection(provider, enabled: true)
     }
   }
 
-  // The control plane already drops the provider from the Codex selection when
-  // the key file is deleted; this only makes that selection live.
+  // The credential command removes the key, disables the provider, and publishes
+  // the resulting selection under one model-overlay lock.
   func removeProviderKey(_ provider: String) async {
     let label = providerSetup[provider]?.credentialLabel ?? "API key"
     await performProviderOperation(
@@ -1230,7 +1458,6 @@ final class RouterStore: ObservableObject {
       successMessage: "\(label) removed. Restart Codex to refresh its model picker."
     ) {
       _ = try await runControl(arguments: ["credential", provider, "--remove"])
-      _ = try? await runControl(arguments: ["apply", "--targets", "codex", "--activate"])
     }
   }
 
@@ -1326,22 +1553,125 @@ final class RouterStore: ObservableObject {
     return routerLocalized("No traffic")
   }
 
+  func providerEnabled(_ provider: String, authoritative: Bool) -> Bool {
+    optimisticToggles.value(for: .provider(provider), authoritative: authoritative)
+  }
 
-  func setProvider(_ provider: String, enabled: Bool) async {
-    guard providerOperation == nil else { return }
-    providerOperation = provider
-    defer { providerOperation = nil }
-    do {
-      try await updateProviderSelection(provider, enabled: enabled)
-      await refresh()
-      await refreshProviderUsage()
-      message = enabled
-        ? "Provider added. Restart Codex to refresh its model picker."
-        : "Provider hidden. Restart Codex to refresh its model picker."
-    } catch {
-      message = error.localizedDescription
-      await refresh()
+  func signedRoutingEnabled(authoritative: Bool) -> Bool {
+    optimisticToggles.value(for: .signedRouting, authoritative: authoritative)
+  }
+
+  func loginFreeEnabled(authoritative: Bool) -> Bool {
+    optimisticToggles.value(for: .loginFree, authoritative: authoritative)
+  }
+
+  func toolResultAgingEnabled(authoritative: Bool) -> Bool {
+    optimisticToggles.value(for: .toolResultAging, authoritative: authoritative)
+  }
+
+  func subagentModeAll(authoritative: Bool) -> Bool {
+    optimisticToggles.value(for: .subagentMode, authoritative: authoritative)
+  }
+
+  func subagentModelEnabled(_ slug: String, authoritative: Bool) -> Bool {
+    optimisticToggles.value(for: .subagentModel(slug), authoritative: authoritative)
+  }
+
+  func pickerModelVisible(_ slug: String, authoritative: Bool) -> Bool {
+    optimisticToggles.value(for: .pickerModel(slug), authoritative: authoritative)
+  }
+
+  func localModelEnabled(_ tag: String, authoritative: Bool) -> Bool {
+    optimisticToggles.value(for: .localModel(tag), authoritative: authoritative)
+  }
+
+  func visionBridgeEnabled(authoritative: Bool) -> Bool {
+    optimisticToggles.value(for: .visionBridge, authoritative: authoritative)
+  }
+
+  func providerToggleIsActive(_ provider: String) -> Bool {
+    activeToggleKey == .provider(provider)
+  }
+
+  private func queueOptimisticToggle(
+    _ key: RouterToggleKey,
+    value: Bool,
+    label: String,
+    run: @escaping @MainActor (Bool) async throws -> Void,
+    success: @escaping @MainActor (Bool) async -> String
+  ) {
+    _ = optimisticToggles.request(value, for: key)
+    pendingToggleOperations[key] = PendingToggleOperation(
+      label: label,
+      run: run,
+      success: success
+    )
+    if !toggleQueue.contains(key) { toggleQueue.append(key) }
+    guard toggleWorker == nil else { return }
+    toggleWorker = Task { @MainActor [weak self] in
+      await self?.drainOptimisticToggles()
     }
+  }
+
+  private func drainOptimisticToggles() async {
+    while !toggleQueue.isEmpty {
+      // Non-toggle work keeps its existing exclusive operation contract. A
+      // switch clicked during it still moves now; persistence starts as soon
+      // as that operation releases the store.
+      while providerOperation != nil {
+        try? await Task.sleep(for: .milliseconds(50))
+        if Task.isCancelled { toggleWorker = nil; return }
+      }
+
+      let key = toggleQueue.removeFirst()
+      guard let intent = optimisticToggles.intent(for: key),
+        let operation = pendingToggleOperations.removeValue(forKey: key)
+      else { continue }
+
+      activeToggleKey = key
+      providerOperation = operation.label
+      do {
+        try await operation.run(intent.value)
+        await refresh()
+        // A newer click remains painted over the authoritative result from
+        // this older command and already has one queue entry waiting.
+        if optimisticToggles.isCurrent(intent, for: key) {
+          let successMessage = await operation.success(intent.value)
+          if optimisticToggles.reconcile(intent, for: key) {
+            message = successMessage
+          }
+        }
+      } catch {
+        let errorMessage = error.localizedDescription
+        await refresh()
+        // Roll back only the intent that actually failed. If another click
+        // arrived in flight, keeping its overlay is what makes last intent win.
+        _ = optimisticToggles.reconcile(intent, for: key)
+        message = errorMessage
+      }
+      providerOperation = nil
+      activeToggleKey = nil
+    }
+    toggleWorker = nil
+  }
+
+
+  func setProvider(_ provider: String, enabled: Bool) {
+    queueOptimisticToggle(
+      .provider(provider),
+      value: enabled,
+      label: provider,
+      run: { [weak self] enabled in
+        guard let self else { return }
+        try await self.updateProviderSelection(provider, enabled: enabled)
+      },
+      success: { [weak self] enabled in
+        await self?.refreshProviderUsage()
+        return enabled
+          ? "Provider added. Restart Codex to refresh its model picker."
+          : "Provider hidden. Restart Codex to refresh its model picker."
+      }
+    )
   }
 
   func updateAndVerify() async {
@@ -1490,53 +1820,71 @@ final class RouterStore: ObservableObject {
     }
   }
 
-  func setLoginFree(_ enabled: Bool) async {
-    guard providerOperation == nil else { return }
-    providerOperation = "auth-mode"
-    defer { providerOperation = nil }
-    do {
-      _ = try await runControl(arguments: ["auth-mode", enabled ? "on" : "off"])
-    } catch {
-      let errorMessage = error.localizedDescription
-      await refresh()
-      message = errorMessage
-      return
-    }
-
-    await refresh()
-    do {
-      try await restartCodexApp()
-      message = enabled
-        ? "Codex restarted with external-provider mode."
-        : "Codex restarted with OpenAI login restored."
-    } catch {
-      message = "Mode changed, but Codex could not restart: \(error.localizedDescription)"
-    }
+  func setLoginFree(_ enabled: Bool) {
+    queueOptimisticToggle(
+      .loginFree,
+      value: enabled,
+      label: "auth-mode",
+      run: { [weak self] enabled in
+        guard let self else { return }
+        _ = try await self.runControl(arguments: ["auth-mode", enabled ? "on" : "off"])
+      },
+      success: { [weak self] enabled in
+        guard let self else { return "Mode changed." }
+        do {
+          try await self.restartCodexApp()
+          return enabled
+            ? "Codex restarted with external-provider mode."
+            : "Codex restarted with OpenAI login restored."
+        } catch {
+          return "Mode changed, but Codex could not restart: \(error.localizedDescription)"
+        }
+      }
+    )
   }
 
-  func setSignedRouting(_ enabled: Bool) async {
-    guard providerOperation == nil else { return }
-    providerOperation = "signed-routing"
-    defer { providerOperation = nil }
-    do {
-      _ = try await runControl(arguments: ["signed-routing", enabled ? "on" : "off"])
-      await refresh()
-      message = enabled
+  func setSignedRouting(_ enabled: Bool) {
+    queueOptimisticToggle(
+      .signedRouting,
+      value: enabled,
+      label: "signed-routing",
+      run: { [weak self] enabled in
+        guard let self else { return }
+        _ = try await self.runControl(arguments: ["signed-routing", enabled ? "on" : "off"])
+      },
+      success: { enabled in
+        enabled
         ? "Router with ChatGPT enabled. Fully quit and reopen Codex when ready."
         : "Previous provider restored. Fully quit and reopen Codex when ready."
-    } catch {
-      await refresh()
-      message = error.localizedDescription
-    }
+      }
+    )
   }
 
-  func setSubagentMode(_ mode: String) async {
-    await applyModelSettings(arguments: ["subagents", "mode", mode])
+  func setSubagentMode(_ mode: String) {
+    queueOptimisticToggle(
+      .subagentMode,
+      value: mode == "all",
+      label: "models",
+      run: { [weak self] _ in
+        guard let self else { return }
+        _ = try await self.runControl(arguments: ["subagents", "mode", mode])
+      },
+      success: { _ in "Model settings applied. Restart Codex to refresh its picker." }
+    )
   }
 
-  func setSubagentModel(_ slug: String, enabled: Bool) async {
-    await applyModelSettings(
-      arguments: ["subagents", "set", slug, enabled ? "on" : "off"]
+  func setSubagentModel(_ slug: String, enabled: Bool) {
+    queueOptimisticToggle(
+      .subagentModel(slug),
+      value: enabled,
+      label: "models",
+      run: { [weak self] enabled in
+        guard let self else { return }
+        _ = try await self.runControl(
+          arguments: ["subagents", "set", slug, enabled ? "on" : "off"]
+        )
+      },
+      success: { _ in "Model settings applied. Restart Codex to refresh its picker." }
     )
   }
 
@@ -1554,9 +1902,18 @@ final class RouterStore: ObservableObject {
     )
   }
 
-  func setPickerModel(_ slug: String, visible: Bool) async {
-    await applyModelSettings(
-      arguments: ["picker", "set", slug, visible ? "show" : "hide"]
+  func setPickerModel(_ slug: String, visible: Bool) {
+    queueOptimisticToggle(
+      .pickerModel(slug),
+      value: visible,
+      label: "models",
+      run: { [weak self] visible in
+        guard let self else { return }
+        _ = try await self.runControl(
+          arguments: ["picker", "set", slug, visible ? "show" : "hide"]
+        )
+      },
+      success: { _ in "Model settings applied. Restart Codex to refresh its picker." }
     )
   }
 
@@ -1582,16 +1939,35 @@ final class RouterStore: ObservableObject {
     await applyModelSettings(arguments: ["picker", "all", "hide"])
   }
 
-  func setVisionBridgeEnabled(_ enabled: Bool) async {
-    await applyModelSettings(arguments: ["vision-bridge", enabled ? "on" : "off"])
+  func setVisionBridgeEnabled(_ enabled: Bool) {
+    queueOptimisticToggle(
+      .visionBridge,
+      value: enabled,
+      label: "models",
+      run: { [weak self] enabled in
+        guard let self else { return }
+        _ = try await self.runControl(arguments: ["vision-bridge", enabled ? "on" : "off"])
+      },
+      success: { _ in "Model settings applied. Restart Codex to refresh its picker." }
+    )
   }
 
-  func setToolResultAgingEnabled(_ enabled: Bool) async {
-    await applyModelSettings(
-      arguments: ["tool-result-aging", enabled ? "on" : "off"],
-      successMessage: enabled
+  func setToolResultAgingEnabled(_ enabled: Bool) {
+    queueOptimisticToggle(
+      .toolResultAging,
+      value: enabled,
+      label: "models",
+      run: { [weak self] enabled in
+        guard let self else { return }
+        _ = try await self.runControl(
+          arguments: ["tool-result-aging", enabled ? "on" : "off"]
+        )
+      },
+      success: { enabled in
+        enabled
         ? "Old tool-result compaction is on for the next external-model request."
         : "Exact tool results will be sent on the next external-model request."
+      }
     )
   }
 
@@ -1609,14 +1985,29 @@ final class RouterStore: ObservableObject {
     await applyModelSettings(arguments: ["vision-bridge", "effort", effort])
   }
 
-  func setLocalModelEnabled(_ tag: String, enabled: Bool) async {
-    await applyModelSettings(arguments: ["local-models", "set", tag, enabled ? "on" : "off"])
+  func setLocalModelEnabled(_ tag: String, enabled: Bool) {
+    queueOptimisticToggle(
+      .localModel(tag),
+      value: enabled,
+      label: "models",
+      run: { [weak self] enabled in
+        guard let self else { return }
+        _ = try await self.runControl(
+          arguments: ["local-models", "set", tag, enabled ? "on" : "off"]
+        )
+      },
+      success: { _ in "Model settings applied. Restart Codex to refresh its picker." }
+    )
   }
 
   /// Deletes the model from disk. Irreversible short of downloading it again,
   /// so the tray arms the row before this is reachable.
   func uninstallLocalModel(_ tag: String) async {
-    guard providerOperation == nil, localModelOperation == nil, localDownload?.isRunning != true else { return }
+    guard providerOperation == nil,
+      localModelOperation == nil,
+      localDownload?.isRunning != true,
+      localMlx?.operation.isRunning != true
+    else { return }
     let startedAt = Date()
     localModelOperation = LocalModelOperation(tag: tag, kind: .uninstall)
     do {
@@ -1725,7 +2116,10 @@ final class RouterStore: ObservableObject {
   /// machine is rated too small for. Every catalog entry is offered, so the
   /// only way to attempt an oversized one is to say so explicitly here.
   func downloadLocalModel(_ tag: String, force: Bool = false) async {
-    guard localModelOperation == nil, localDownload?.isRunning != true else { return }
+    guard localModelOperation == nil,
+      localDownload?.isRunning != true,
+      localMlx?.operation.isRunning != true
+    else { return }
     let startedAt = Date().timeIntervalSince1970 * 1_000
     localDownload = VisionDownloadState(
       tag: tag,
@@ -1756,6 +2150,88 @@ final class RouterStore: ObservableObject {
       return
     }
     await pollLocalDownload()
+  }
+
+  /// Installs the curated four-bit MLX build plus its official local runtime,
+  /// then publishes the stable LM Studio slug through the router. The button
+  /// is the operator's consent for both prerequisites and the ~15 GB download;
+  /// no token or credential ever passes through the tray.
+  func installLocalMlx() async {
+    guard localMlx?.operation.isRunning != true,
+      localModelOperation == nil,
+      localDownload?.isRunning != true,
+      localMlx?.host?.supported != false
+    else { return }
+    let now = Date().timeIntervalSince1970 * 1_000
+    let starting = LocalMlxOperation(
+      status: "preparing",
+      detail: "Checking the local runtime and downloader",
+      percent: 0,
+      progressMode: "determinate",
+      startedAt: now,
+      updatedAt: now,
+      workerPid: nil,
+      error: nil
+    )
+    localMlx = localMlx?.replacing(operation: starting)
+      ?? LocalMlxSnapshot(
+        model: nil,
+        host: nil,
+        prerequisites: nil,
+        operation: starting,
+        runtime: nil
+      )
+    do {
+      _ = try await runControl(arguments: ["local-models", "mlx-install", "--yes"])
+    } catch {
+      localMlx = localMlx?.replacing(operation: LocalMlxOperation(
+        status: "error",
+        detail: "The MLX install could not start",
+        percent: 0,
+        progressMode: "determinate",
+        startedAt: now,
+        updatedAt: Date().timeIntervalSince1970 * 1_000,
+        workerPid: nil,
+        error: error.localizedDescription
+      ))
+      message = error.localizedDescription
+      return
+    }
+    await pollLocalMlx()
+  }
+
+  func cancelLocalMlx() async {
+    guard localMlx?.operation.isRunning == true else { return }
+    do {
+      _ = try await runControl(arguments: ["local-models", "mlx-cancel"])
+      await pollLocalMlx()
+    } catch {
+      message = error.localizedDescription
+    }
+  }
+
+  private func pollLocalMlx() async {
+    while !Task.isCancelled {
+      try? await Task.sleep(nanoseconds: 1_000_000_000)
+      guard let data = try? await runControl(arguments: ["local-models", "list", "--json"]),
+        let decoded = try? JSONDecoder().decode(LocalModelsSnapshot.self, from: data),
+        let mlx = decoded.mlx
+      else { continue }
+      localMlx = mlx
+      if mlx.operation.isRunning { continue }
+      await refresh()
+      switch mlx.operation.status {
+      case "done":
+        message = "Qwen3.8 27B MLX is ready for Codex. Fully quit and reopen Codex to refresh its picker."
+      case "cancelled":
+        message = "Qwen3.8 27B MLX installation cancelled."
+      case "error":
+        message = mlx.operation.error ?? mlx.operation.detail ?? "The MLX installation failed."
+      default:
+        break
+      }
+      return
+    }
   }
 
   func updateLocalOllama() async {
@@ -1863,40 +2339,26 @@ final class RouterStore: ObservableObject {
   }
 
   private func updateProviderSelection(_ provider: String, enabled: Bool) async throws {
-    let wasEnabled = snapshot.targets["codex"]?.enabledProviders.contains(provider) == true
     _ = try await runControl(
-      arguments: ["set", provider, enabled ? "on" : "off", "--targets", "codex"]
+      arguments: [
+        "set-apply", provider, enabled ? "on" : "off",
+        "--targets", "codex", "--activate",
+      ]
     )
-    do {
-      _ = try await runControl(arguments: ["apply", "--targets", "codex", "--activate"])
-    } catch {
-      _ = try? await runControl(
-        arguments: ["set", provider, wasEnabled ? "on" : "off", "--targets", "codex"]
-      )
-      _ = try? await runControl(arguments: ["apply", "--targets", "codex", "--activate"])
-      throw error
-    }
   }
 
   private func refreshActivity() async {
-    let configuredPort = ProcessInfo.processInfo.environment["MODEL_ROUTER_PORT"] ?? "4202"
-    guard let url = URL(string: "http://127.0.0.1:\(configuredPort)/health") else {
-      recordActivityHealthFailure()
-      return
-    }
-    var request = URLRequest(url: url)
-    request.cachePolicy = .reloadIgnoringLocalCacheData
-    request.timeoutInterval = 2
     do {
-      let (data, response) = try await URLSession.shared.data(for: request)
-      guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-        throw RouterError("Router health check failed.")
-      }
+      // `control health` uses the protected health leaf and projects away the
+      // forwarders' credential metadata. The public `/health` endpoint is
+      // intentionally too small for the service rows below.
+      let data = try await runControl(arguments: ["health", "--json"])
       let health = try JSONDecoder().decode(RouterHealth.self, from: data)
       let previousActivityState = activityState
       let nextActiveRequests = health.activity.active ?? []
       let nextActiveRequestCount = health.activity.activeCount ?? nextActiveRequests.count
       activityHealthFailureStartedAt = nil
+      routerHealth = health
       if activityState != health.activity.state { activityState = health.activity.state }
       if activeRequests != nextActiveRequests { activeRequests = nextActiveRequests }
       if activeRequestCount != nextActiveRequestCount {
@@ -1938,9 +2400,14 @@ final class RouterStore: ObservableObject {
         }
       }
       if previousActivityState == .generating, health.activity.state != .generating {
-        // Pull the just-finished request into the status speed without waiting
-        // for the normal 30-second account polling interval.
-        Task { await refreshProviderUsage() }
+        // A completed request writes its usage event before the health activity
+        // clears. Pull both the provider aggregate and the snapshot now, so
+        // speed, cache reuse, and tool-result savings update with this turn
+        // instead of waiting for their normal background polling intervals.
+        Task {
+          await refreshProviderUsage()
+          await refresh()
+        }
       }
     } catch {
       recordActivityHealthFailure()
@@ -1948,6 +2415,7 @@ final class RouterStore: ObservableObject {
   }
 
   private func recordActivityHealthFailure() {
+    if routerHealth != nil { routerHealth = nil }
     if !activeRequests.isEmpty { activeRequests = [] }
     if activeRequestCount != 0 { activeRequestCount = 0 }
     if activeModel != nil { activeModel = nil }
@@ -2144,7 +2612,44 @@ final class RouterStore: ObservableObject {
 }
 
 private struct RouterHealth: Decodable {
+  let ok: Bool?
+  let error: String?
+  let degraded: [String]?
+  let gateway: RouterServiceHealth?
+  let oauth: RouterServiceHealth?
+  let api: RouterServiceHealth?
   let activity: RouterActivity
+
+}
+
+private struct RouterServiceHealth: Decodable, Equatable {
+  let reachable: Bool?
+  let enabled: Bool?
+}
+
+private enum TrayServiceHealthState: Equatable {
+  case ready
+  case degraded
+  case offline
+  case standby
+  case unknown
+
+  var tint: Color {
+    switch self {
+    case .ready: return routerMint
+    case .degraded: return routerYellow
+    case .offline: return routerRed
+    case .standby, .unknown: return routerMutedStrong
+    }
+  }
+}
+
+private struct TrayServiceHealthRow: Identifiable {
+  let id: String
+  let label: String
+  let state: TrayServiceHealthState
+  let status: String
+  let detail: String
 }
 
 private struct RouterActivity: Decodable {
@@ -2594,6 +3099,99 @@ struct LocalModelsSnapshot: Decodable {
   let download: VisionDownloadState?
   let runtime: LocalRuntimeSnapshot?
   let catalog: LocalCatalogSnapshot?
+  // Optional so a newer tray remains compatible with a router installed
+  // before the curated MLX workflow existed.
+  let mlx: LocalMlxSnapshot?
+}
+
+struct LocalMlxSnapshot: Decodable, Equatable {
+  let model: LocalMlxModel?
+  let host: LocalMlxHost?
+  let prerequisites: LocalMlxPrerequisites?
+  let operation: LocalMlxOperation
+  let runtime: LocalMlxRuntime?
+
+  func replacing(operation: LocalMlxOperation) -> LocalMlxSnapshot {
+    LocalMlxSnapshot(
+      model: model,
+      host: host,
+      prerequisites: prerequisites,
+      operation: operation,
+      runtime: runtime
+    )
+  }
+}
+
+struct LocalMlxHost: Decodable, Equatable {
+  let supported: Bool
+  let platform: String
+  let arch: String
+  let reason: String?
+}
+
+struct LocalMlxModel: Decodable, Equatable {
+  let id: String
+  let slug: String
+  let source: String
+  let precision: String
+  let contextLength: Int
+}
+
+struct LocalMlxPrerequisites: Decodable, Equatable {
+  let lms: LocalMlxPrerequisite
+  let uvx: LocalMlxPrerequisite
+}
+
+struct LocalMlxPrerequisite: Decodable, Equatable {
+  let available: Bool
+  let automaticWithYes: Bool?
+  let source: String?
+  let installHint: String?
+}
+
+struct LocalMlxOperation: Decodable, Equatable {
+  let status: String
+  let detail: String?
+  let percent: Int?
+  let progressMode: String?
+  let startedAt: Double?
+  let updatedAt: Double?
+  let workerPid: Int?
+  let error: String?
+
+  var isRunning: Bool {
+    switch status {
+    case "preparing", "downloading", "loading", "starting-server", "verifying", "publishing":
+      return true
+    default:
+      return false
+    }
+  }
+
+  var showsDeterminateProgress: Bool { progressMode != "indeterminate" }
+
+  var stageLabel: String {
+    switch status {
+    case "preparing": return "Preparing runtime"
+    case "downloading": return "Downloading model"
+    case "loading": return "Loading model"
+    case "starting-server": return "Starting local server"
+    case "verifying": return "Verifying model"
+    case "publishing": return "Wiring Codex"
+    case "done": return "Ready for Codex"
+    case "cancelled": return "Installation cancelled"
+    case "error": return "Installation failed"
+    default: return "Not installed"
+    }
+  }
+}
+
+struct LocalMlxRuntime: Decodable, Equatable {
+  let loopbackReachable: Bool
+  let served: Bool
+  let published: Bool
+
+  var ready: Bool { loopbackReachable && served && published }
 }
 
 struct LocalRuntimeSnapshot: Decodable {
@@ -2814,6 +3412,61 @@ enum IslandMode: String, CaseIterable, Identifiable {
   }
 }
 
+enum TrayMenuBarDisplayMode: String, CaseIterable, Identifiable, Equatable {
+  case standard
+  case iconOnly
+
+  var id: String { rawValue }
+  var label: String {
+    switch self {
+    case .standard: return routerLocalized("Standard")
+    case .iconOnly: return routerLocalized("Icon only")
+    }
+  }
+}
+
+enum TrayMenuBarIconStyle: String, CaseIterable, Identifiable, Equatable {
+  case provider
+  case indicator
+  case preset
+  case custom
+
+  var id: String { rawValue }
+  var label: String {
+    switch self {
+    case .provider: return routerLocalized("Provider icon")
+    case .indicator: return routerLocalized("Activity dot")
+    case .preset: return routerLocalized("Preset icon")
+    case .custom: return routerLocalized("Custom image")
+    }
+  }
+}
+
+enum MenuBarCustomIconError: Error, Equatable {
+  case tooLarge
+}
+
+struct MenuBarSettings: Equatable {
+  var displayMode: TrayMenuBarDisplayMode
+  var showModelName: Bool
+  var iconStyle: TrayMenuBarIconStyle
+  var presetIcon: String
+  var customIconPath: String?
+}
+
+enum MenuBarLayoutMetrics {
+  static let standardReservedWidth: CGFloat = 180
+  static let iconOnlyWidth: CGFloat = 24
+
+  nonisolated static func statusItemWidth(displayMode: TrayMenuBarDisplayMode) -> CGFloat {
+    displayMode == .iconOnly ? iconOnlyWidth : standardReservedWidth
+  }
+
+  nonisolated static func showsActivityBadge(iconStyle: TrayMenuBarIconStyle, isIdle: Bool) -> Bool {
+    iconStyle != .indicator && !isIdle
+  }
+}
+
 struct DesktopQuotaRow: Identifiable {
   let id: String
   let providerID: String
@@ -2846,13 +3499,6 @@ struct ProviderSetupState: Decodable, Identifiable, Equatable {
   let configured: Bool
   let cliInstalled: Bool?
   let action: String
-  // An API provider whose official CLI mints its key through a browser
-  // sign-in (Command Code) keeps `kind == "api"` and the key field, and adds
-  // these: `signIn` marks the second route, `signedIn` says the key in play
-  // came from that session, and `signInAction` is that route's next step.
-  let signIn: Bool?
-  let signedIn: Bool?
-  let signInAction: String?
   let credentialLabel: String?
   // Set when connecting successfully still leaves the account unable to use
   // the API, because its plan does not include one. Shown before the buttons
@@ -2861,52 +3507,130 @@ struct ProviderSetupState: Decodable, Identifiable, Equatable {
   let anonymousNote: String?
 }
 
-private struct StatusItemLabel: View {
+private struct MenuBarIconView: View {
   @ObservedObject var store: RouterStore
-  @State private var pulsing = false
-  private static let reservedWidth: CGFloat = 180
+  var size: CGFloat = 13
 
   var body: some View {
-    HStack(spacing: 5) {
+    switch store.menuBarIconStyle {
+    case .provider:
+      ProviderIcon(providerID: providerID, size: size, showsHelp: false)
+    case .indicator:
       Circle()
         .fill(store.activityState.tint)
         .frame(width: 6, height: 6)
-        // Opening a menu bar app gives the user nothing to look at, so the
-        // status dot answers instead. SwiftUI offers no supported way to open a
-        // MenuBarExtra window programmatically -- the usual trick reaches into
-        // the private NSStatusItem behind it -- and a dot that visibly reacts is
-        // worth more than a private API that breaks on the next macOS release.
-        .scaleEffect(pulsing ? 2.1 : 1)
-        .opacity(pulsing ? 0.55 : 1)
-        .animation(.easeOut(duration: 0.45), value: pulsing)
-        .onChange(of: store.attentionPulse) { _ in
-          pulsing = true
-          Task {
-            try? await Task.sleep(for: .milliseconds(450))
-            pulsing = false
-          }
-        }
-      Text(store.hasConcurrentActivity ? store.activitySummaryLabel : store.selectedUsageProvider.shortName)
-        .font(.system(size: 11, weight: .medium, design: .rounded))
-        .lineLimit(1)
-        .truncationMode(.tail)
-      if store.hasConcurrentActivity {
-        Text(store.compactActivityProvidersLabel)
-          .font(.system(size: 10, weight: .medium, design: .rounded))
+    case .preset:
+      Image(systemName: store.menuBarPresetIcon)
+        .font(.system(size: size, weight: .medium))
+        .foregroundStyle(store.activityState == .idle ? Color.primary : store.activityState.tint)
+        .frame(width: size, height: size)
+    case .custom:
+      if let customImage = store.menuBarCustomIconImage {
+        Image(nsImage: customImage)
+          .resizable()
+          .interpolation(.high)
+          .scaledToFit()
+          .frame(width: size, height: size)
+      } else {
+        Image(systemName: "cpu")
+          .font(.system(size: size, weight: .medium))
           .foregroundStyle(routerMuted)
-          .lineLimit(1)
-          .truncationMode(.tail)
-      } else if let usage = store.selectedUsageText {
-        Text(usage)
-          .font(.system(size: 10, weight: .medium, design: .monospaced))
-          .foregroundStyle(routerMuted)
-          .lineLimit(1)
-          .truncationMode(.tail)
+          .frame(width: size, height: size)
       }
     }
-    // Keep the NSStatusItem anchor stable while activity text changes.
-    .frame(width: Self.reservedWidth, alignment: .leading)
-    .clipped()
+  }
+
+  private var providerID: String {
+    store.hasConcurrentActivity
+      ? (store.activeRequests.first?.provider ?? store.selectedUsageProviderID)
+      : store.selectedUsageProviderID
+  }
+}
+
+private struct StatusItemLabel: View {
+  @ObservedObject var store: RouterStore
+  @State private var pulsing = false
+
+  var body: some View {
+    if store.menuBarDisplayMode == .iconOnly {
+      HStack(spacing: 4) {
+        MenuBarIconView(store: store, size: 14)
+          .scaleEffect(pulsing ? 1.4 : 1)
+          .animation(.easeOut(duration: 0.45), value: pulsing)
+        if MenuBarLayoutMetrics.showsActivityBadge(
+          iconStyle: store.menuBarIconStyle,
+          isIdle: store.activityState == .idle
+        ) {
+          Circle()
+            .fill(store.activityState.tint)
+            .frame(width: 5, height: 5)
+        }
+      }
+      .frame(width: MenuBarLayoutMetrics.statusItemWidth(displayMode: store.menuBarDisplayMode), height: 22)
+      .clipped()
+      .contentShape(Rectangle())
+      .help(tooltipText)
+      .onChange(of: store.attentionPulse) { _ in
+        pulsing = true
+        Task {
+          try? await Task.sleep(for: .milliseconds(450))
+          pulsing = false
+        }
+      }
+    } else {
+      HStack(spacing: 5) {
+        if store.menuBarIconStyle == .indicator {
+          Circle()
+            .fill(store.activityState.tint)
+            .frame(width: 6, height: 6)
+            .scaleEffect(pulsing ? 2.1 : 1)
+            .opacity(pulsing ? 0.55 : 1)
+            .animation(.easeOut(duration: 0.45), value: pulsing)
+        } else {
+          MenuBarIconView(store: store, size: 13)
+            .scaleEffect(pulsing ? 1.4 : 1)
+            .animation(.easeOut(duration: 0.45), value: pulsing)
+        }
+        if store.menuBarShowModelName {
+          Text(store.hasConcurrentActivity ? store.activitySummaryLabel : store.selectedUsageProvider.shortName)
+            .font(.system(size: 11, weight: .medium, design: .rounded))
+            .lineLimit(1)
+            .truncationMode(.tail)
+        }
+        if store.hasConcurrentActivity {
+          Text(store.compactActivityProvidersLabel)
+            .font(.system(size: 10, weight: .medium, design: .rounded))
+            .foregroundStyle(routerMuted)
+            .lineLimit(1)
+            .truncationMode(.tail)
+        } else if let usage = store.selectedUsageText {
+          Text(usage)
+            .font(.system(size: 10, weight: .medium, design: .monospaced))
+            .foregroundStyle(routerMuted)
+            .lineLimit(1)
+            .truncationMode(.tail)
+        }
+      }
+      .frame(width: MenuBarLayoutMetrics.statusItemWidth(displayMode: store.menuBarDisplayMode), alignment: .leading)
+      .clipped()
+      .help(tooltipText)
+      .onChange(of: store.attentionPulse) { _ in
+        pulsing = true
+        Task {
+          try? await Task.sleep(for: .milliseconds(450))
+          pulsing = false
+        }
+      }
+    }
+  }
+
+  private var tooltipText: String {
+    let provider = store.activeRequests.isEmpty ? store.selectedUsageProvider.displayName : store.compactActivityProvidersLabel
+    return RouterStore.menuBarTooltip(
+      provider: provider,
+      state: store.activityState.label,
+      usage: store.selectedUsageText
+    )
   }
 }
 
@@ -2931,6 +3655,7 @@ private struct TrayView: View {
   @AppStorage("trayTab") private var tab: TrayTab = .usage
   @State private var providersExpanded = true
   @State private var savingsRange: SavingsRange = .day
+  @State private var savingsRangeSelectedByUser = false
 
   private var target: RouterTarget? { store.snapshot.targets["codex"] }
   // Rows come from the registry snapshot, not from the models in the picker.
@@ -2945,11 +3670,21 @@ private struct TrayView: View {
     if let registry = target.providers, !registry.isEmpty {
       let enabled = Set(target.enabledProviders)
       return registry
-        .map { (id: $0.id, enabled: enabled.contains($0.id)) }
+        .map {
+          (id: $0.id, enabled: store.providerEnabled(
+            $0.id,
+            authoritative: enabled.contains($0.id)
+          ))
+        }
         .sorted { $0.id < $1.id }
     }
     return Dictionary(grouping: target.models.filter { $0.provider != "openai" }, by: \.provider)
-      .map { (id: $0.key, enabled: $0.value.contains(where: \.enabled)) }
+      .map {
+        (id: $0.key, enabled: store.providerEnabled(
+          $0.key,
+          authoritative: $0.value.contains(where: \.enabled)
+        ))
+      }
       .sorted { $0.id < $1.id }
   }
 
@@ -2972,7 +3707,11 @@ private struct TrayView: View {
     let names = Dictionary(uniqueKeysWithValues: registry.map { ($0.id, $0.displayName) })
     func lone(_ entry: RouterProviderInfo) -> ProviderGroup {
       ProviderGroup(id: entry.id, vendorLabel: nil, members: [
-        ProviderGroup.Member(id: entry.id, enabled: enabled.contains(entry.id), shortName: nil)
+        ProviderGroup.Member(
+          id: entry.id,
+          enabled: store.providerEnabled(entry.id, authoritative: enabled.contains(entry.id)),
+          shortName: nil
+        )
       ])
     }
     return Dictionary(grouping: registry) { $0.ownedBy ?? $0.id }
@@ -3002,7 +3741,7 @@ private struct TrayView: View {
             // its vendor leaves nothing, so keep the full name there.
             return ProviderGroup.Member(
               id: entry.id,
-              enabled: enabled.contains(entry.id),
+              enabled: store.providerEnabled(entry.id, authoritative: enabled.contains(entry.id)),
               shortName: short.isEmpty ? full : short
             )
           }
@@ -3053,7 +3792,34 @@ private struct TrayView: View {
     }
     .preferredColorScheme(.dark)
     .foregroundStyle(routerText)
-    .task { await store.refresh() }
+    .task {
+      await store.refresh()
+      selectInitialSavingsRange()
+    }
+    .onChange(of: savingsRangeDataFingerprint) { _ in
+      selectInitialSavingsRange()
+    }
+  }
+
+  // A quiet most-recent day should not hide the savings that are already in a
+  // longer window. Keep 24H as the default when it has data, but start on the
+  // first populated range otherwise; a manual range choice always wins.
+  private func selectInitialSavingsRange() {
+    guard !savingsRangeSelectedByUser,
+          let ranges = target?.modelSettings?.toolResultAging?.stats?.ranges,
+          (ranges[savingsRange.rawValue]?.requests ?? 0) == 0,
+          let firstPopulated = SavingsRange.allCases.first(where: {
+            (ranges[$0.rawValue]?.requests ?? 0) > 0
+          }) else { return }
+    savingsRange = firstPopulated
+  }
+
+  private var savingsRangeDataFingerprint: String {
+    guard let ranges = target?.modelSettings?.toolResultAging?.stats?.ranges else { return "" }
+    return SavingsRange.allCases.map { range in
+      let value = ranges[range.rawValue]
+      return "\(range.rawValue):\(value?.requests ?? 0):\(value?.savedTokens ?? 0)"
+    }.joined(separator: "|")
   }
 
 
@@ -3145,6 +3911,38 @@ private struct TrayView: View {
       Spacer()
     }
 
+    sectionLabel(routerLocalized("Service health"), detail: serviceHealthSummary)
+    VStack(spacing: 0) {
+      ForEach(serviceHealthRows) { row in
+        HStack(spacing: 8) {
+          Circle()
+            .fill(row.state.tint)
+            .frame(width: 6, height: 6)
+          VStack(alignment: .leading, spacing: 1) {
+            Text(row.label)
+              .font(.system(size: 10, weight: .medium))
+            Text(row.detail)
+              .font(.system(size: 8))
+              .foregroundStyle(routerMuted)
+              .lineLimit(1)
+          }
+          Spacer(minLength: 6)
+          Text(row.status)
+            .font(.system(size: 8.5, weight: .semibold))
+            .foregroundStyle(row.state.tint)
+        }
+        .padding(.vertical, 6)
+        if row.id != serviceHealthRows.last?.id {
+          Divider().opacity(0.45)
+        }
+      }
+    }
+    .padding(.horizontal, 9)
+    .background(
+      Color.primary.opacity(0.045),
+      in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+    )
+
     sectionLabel(routerLocalized("Model speed"), detail: speedSampleDetail)
     HStack(alignment: .firstTextBaseline, spacing: 8) {
       VStack(alignment: .leading, spacing: 2) {
@@ -3174,7 +3972,7 @@ private struct TrayView: View {
       VStack(spacing: 0) {
         ForEach(store.recentModelSpeeds) { row in
           HStack(spacing: 8) {
-            Text(row.model.displayName ?? row.model.slug)
+            Text(row.model.displayName)
               .font(.system(size: 9))
               .lineLimit(1)
               .truncationMode(.middle)
@@ -3203,6 +4001,8 @@ private struct TrayView: View {
     if let agingStats = target?.modelSettings?.toolResultAging?.stats,
        let agedRequests = agingStats.requests, agedRequests > 0 {
       let range = agingStats.ranges?[savingsRange.rawValue]
+      let rangeRequests = range?.requests ?? 0
+      let allTimeTokens = agingStats.estimatedTokensSaved ?? 0
       sectionLabel("Context savings", detail: "\(agedRequests) requests compacted all-time")
       VStack(alignment: .leading, spacing: 8) {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -3210,7 +4010,9 @@ private struct TrayView: View {
             Text("Old tool results replaced with receipts")
               .font(.system(size: 10, weight: .medium))
               .lineLimit(1)
-            Text("\(range?.requests ?? 0) compacted requests in this window")
+            Text(rangeRequests > 0
+              ? "\(rangeRequests) compacted requests in this window"
+              : "No compactions in this window")
               .font(.system(size: 8))
               .foregroundStyle(routerMuted)
               .lineLimit(1)
@@ -3221,6 +4023,7 @@ private struct TrayView: View {
               ForEach(SavingsRange.allCases, id: \.rawValue) { candidate in
                 Button {
                   savingsRange = candidate
+                  savingsRangeSelectedByUser = true
                 } label: {
                   Text(candidate.label)
                     .font(.system(size: 8, weight: savingsRange == candidate ? .bold : .regular))
@@ -3235,10 +4038,13 @@ private struct TrayView: View {
                 .buttonStyle(.plain)
               }
             }
-            Text("~\(compactTokenCount(Double(range?.savedTokens ?? 0))) tok")
+            Text("~\(compactTokenCount(Double(allTimeTokens))) tok")
               .font(.system(size: 15, weight: .semibold, design: .monospaced))
               .foregroundStyle(routerMint)
               .monospacedDigit()
+            Text("saved all-time")
+              .font(.system(size: 7.5))
+              .foregroundStyle(routerMuted)
           }
         }
         if let buckets = range?.buckets, buckets.contains(where: { $0 > 0 }) {
@@ -3340,6 +4146,119 @@ private struct TrayView: View {
     }
   }
 
+  private var serviceHealthSummary: String {
+    guard store.routerHealth != nil else { return routerLocalized("Checking") }
+    let attention = serviceHealthRows.filter { $0.state == .offline || $0.state == .degraded }.count
+    if attention > 0 {
+      return "\(attention) \(routerLocalized(attention == 1 ? "dependency needs attention" : "dependencies need attention"))"
+    }
+    return routerLocalized("All clear")
+  }
+
+  private var serviceHealthRows: [TrayServiceHealthRow] {
+    let health = store.routerHealth
+    let degraded = Set(health?.degraded ?? [])
+    let routerState: TrayServiceHealthState
+    let routerStatus: String
+    let routerDetail: String
+    if let health {
+      if health.ok == true {
+        routerState = .ready
+        routerStatus = routerLocalized("Ready")
+        routerDetail = routerLocalized("Serving locally")
+      } else if !degraded.isEmpty {
+        routerState = .degraded
+        routerStatus = routerLocalized("Degraded")
+        routerDetail = "\(degraded.count) \(routerLocalized(degraded.count == 1 ? "dependency needs attention" : "dependencies need attention"))"
+      } else {
+        routerState = .offline
+        routerStatus = routerLocalized("Offline")
+        routerDetail = health.error ?? routerLocalized("Health endpoint unavailable")
+      }
+    } else {
+      routerState = .unknown
+      routerStatus = routerLocalized("Unknown")
+      routerDetail = routerLocalized("Waiting for health report")
+    }
+
+    var rows = [TrayServiceHealthRow(
+      id: "router",
+      label: routerLocalized("Router"),
+      state: routerState,
+      status: routerStatus,
+      detail: routerDetail
+    )]
+
+    func dependencyRow(
+      id: String,
+      label: String,
+      service: RouterServiceHealth?
+    ) -> TrayServiceHealthRow {
+      if service == nil {
+        let offline = degraded.contains(id)
+        return TrayServiceHealthRow(
+          id: id,
+          label: routerLocalized(label),
+          state: offline ? .offline : .unknown,
+          status: routerLocalized(offline ? "Offline" : "Unknown"),
+          detail: routerLocalized(offline ? "Unreachable" : "Waiting for health report")
+        )
+      }
+      if service?.enabled == false && !degraded.contains(id) {
+        return TrayServiceHealthRow(
+          id: id,
+          label: routerLocalized(label),
+          state: .standby,
+          status: routerLocalized("Standby"),
+          detail: routerLocalized("Not enabled")
+        )
+      }
+      if service?.reachable == false || degraded.contains(id) {
+        return TrayServiceHealthRow(
+          id: id,
+          label: routerLocalized(label),
+          state: .offline,
+          status: routerLocalized("Offline"),
+          detail: routerLocalized("Unreachable")
+        )
+      }
+      if service?.reachable == true {
+        return TrayServiceHealthRow(
+          id: id,
+          label: routerLocalized(label),
+          state: .ready,
+          status: routerLocalized("Ready"),
+          detail: routerLocalized("Reachable")
+        )
+      }
+      return TrayServiceHealthRow(
+        id: id,
+        label: routerLocalized(label),
+        state: .unknown,
+        status: routerLocalized("Unknown"),
+        detail: routerLocalized("Waiting for health report")
+      )
+    }
+
+    rows.append(dependencyRow(id: "gateway", label: "Gateway", service: health?.gateway))
+    let forwarders = [("oauth", "OAuth forwarder", health?.oauth), ("api", "API forwarder", health?.api)]
+      .filter { health != nil && $0.2 != nil || degraded.contains($0.0) }
+    if forwarders.isEmpty {
+      rows.append(TrayServiceHealthRow(
+        id: "forwarders",
+        label: routerLocalized("External forwarders"),
+        state: health == nil ? .unknown : .standby,
+        status: routerLocalized(health == nil ? "Unknown" : "Standby"),
+        detail: routerLocalized(health == nil ? "Waiting for health report" : "No external forwarders enabled")
+      ))
+    } else {
+      for (id, label, service) in forwarders {
+        rows.append(dependencyRow(id: id, label: label, service: service))
+      }
+    }
+    return rows
+  }
+
   private var activityDetail: String {
     guard store.activeRequestCount > 0 else { return routerLocalized("No traffic right now") }
     let chats = store.activeChatCount
@@ -3431,6 +4350,137 @@ private struct TrayView: View {
     .padding(.vertical, 2)
     HStack(spacing: 12) {
       VStack(alignment: .leading, spacing: 3) {
+        Text(routerLocalized("Menu bar mode"))
+          .font(.system(size: 12, weight: .medium))
+        Text(store.menuBarDisplayMode == .iconOnly
+          ? routerLocalized("Compact icon only, no model name text")
+          : routerLocalized("Show icon, model name, and usage"))
+          .font(.system(size: 10))
+          .foregroundStyle(routerMuted)
+      }
+      Spacer()
+      Picker("", selection: Binding(
+        get: { store.menuBarDisplayMode },
+        set: { store.setMenuBarDisplayMode($0) }
+      )) {
+        ForEach(TrayMenuBarDisplayMode.allCases) { mode in
+          Text(mode.label).tag(mode)
+        }
+      }
+      .pickerStyle(.segmented)
+      .labelsHidden()
+      .frame(width: 168)
+      .id(store.language)
+    }
+    .padding(.vertical, 2)
+
+    if store.menuBarDisplayMode == .standard {
+      settingRow(
+        title: routerLocalized("Show model name"),
+        detail: store.menuBarShowModelName
+          ? routerLocalized("Current model or provider is visible in menu bar")
+          : routerLocalized("Hide model name text in menu bar"),
+        isOn: Binding(
+          get: { store.menuBarShowModelName },
+          set: { store.setMenuBarShowModelName($0) }
+        )
+      )
+    }
+
+    HStack(spacing: 12) {
+      VStack(alignment: .leading, spacing: 3) {
+        Text(routerLocalized("Menu bar icon"))
+          .font(.system(size: 12, weight: .medium))
+        Text(routerLocalized("Choose the icon displayed in the menu bar"))
+          .font(.system(size: 10))
+          .foregroundStyle(routerMuted)
+      }
+      Spacer()
+      Picker("", selection: Binding(
+        get: { store.menuBarIconStyle },
+        set: { store.setMenuBarIconStyle($0) }
+      )) {
+        ForEach(TrayMenuBarIconStyle.allCases) { style in
+          Text(style.label).tag(style)
+        }
+      }
+      .pickerStyle(.menu)
+      .labelsHidden()
+      .frame(width: 168)
+      .id(store.language)
+    }
+    .padding(.vertical, 2)
+
+    if store.menuBarIconStyle == .preset {
+      HStack(spacing: 8) {
+        Text(routerLocalized("Preset icon"))
+          .font(.system(size: 11, weight: .medium))
+          .foregroundStyle(routerMuted)
+        Spacer()
+        ForEach(["cpu", "brain", "sparkles", "terminal", "bolt.horizontal.circle", "network"], id: \.self) { symbol in
+          Button {
+            store.setMenuBarPresetIcon(symbol)
+          } label: {
+            Image(systemName: symbol)
+              .font(.system(size: 12, weight: .medium))
+              .frame(width: 24, height: 24)
+              .background(
+                store.menuBarPresetIcon == symbol ? routerAccent.opacity(0.18) : Color.primary.opacity(0.04),
+                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+              )
+              .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                  .stroke(store.menuBarPresetIcon == symbol ? routerAccent : Color.clear, lineWidth: 1)
+              )
+          }
+          .buttonStyle(.plain)
+        }
+      }
+      .padding(.vertical, 2)
+    }
+
+    if store.menuBarIconStyle == .custom {
+      HStack(spacing: 10) {
+        if store.menuBarCustomIconMissing {
+          Text(routerLocalized("Custom image missing"))
+            .font(.system(size: 10))
+            .foregroundStyle(routerMuted)
+            .lineLimit(1)
+          Spacer()
+          Button(routerLocalized("Clear")) {
+            store.setMenuBarCustomIconPath(nil)
+          }
+          .buttonStyle(.borderless)
+          .font(.system(size: 10))
+        } else if let path = store.menuBarCustomIconPath, !path.isEmpty {
+          Text(URL(fileURLWithPath: path).lastPathComponent)
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(routerMuted)
+            .lineLimit(1)
+            .truncationMode(.middle)
+          Spacer()
+          Button(routerLocalized("Clear")) {
+            store.setMenuBarCustomIconPath(nil)
+          }
+          .buttonStyle(.borderless)
+          .font(.system(size: 10))
+        } else {
+          Text(routerLocalized("No custom image selected"))
+            .font(.system(size: 10))
+            .foregroundStyle(routerMuted)
+          Spacer()
+        }
+        Button(routerLocalized("Choose Image…")) {
+          chooseCustomIconImage()
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+      }
+      .padding(.vertical, 2)
+    }
+
+    HStack(spacing: 12) {
+      VStack(alignment: .leading, spacing: 3) {
         Text(routerLocalized("Language"))
           .font(.system(size: 12, weight: .medium))
         Text(routerLocalized("Tray language. Reopen the panel to apply everywhere."))
@@ -3490,25 +4540,25 @@ private struct TrayView: View {
     .padding(.vertical, 2)
     settingRow(
       title: routerLocalized("Use Router with ChatGPT"),
-      detail: store.signedRouting
+      detail: store.signedRoutingEnabled(authoritative: store.signedRouting)
         ? routerLocalized("Native GPT + external models · task history preserved")
         : routerLocalized("Keep ChatGPT login and the current task history"),
       isOn: Binding(
-        get: { store.signedRouting },
-        set: { enabled in Task { await store.setSignedRouting(enabled) } }
+        get: { store.signedRoutingEnabled(authoritative: store.signedRouting) },
+        set: { enabled in store.setSignedRouting(enabled) }
       ),
-      isDisabled: store.providerOperation != nil || store.loginFree
+      isDisabled: store.loginFreeEnabled(authoritative: store.loginFree)
     )
     settingRow(
       title: routerLocalized("Use without OpenAI login"),
-      detail: store.loginFree
+      detail: store.loginFreeEnabled(authoritative: store.loginFree)
         ? routerLocalized("External providers · Codex restarts automatically")
         : routerLocalized("Use connected models and restart Codex"),
       isOn: Binding(
-        get: { store.loginFree },
-        set: { enabled in Task { await store.setLoginFree(enabled) } }
+        get: { store.loginFreeEnabled(authoritative: store.loginFree) },
+        set: { enabled in store.setLoginFree(enabled) }
       ),
-      isDisabled: store.providerOperation != nil || store.signedRouting
+      isDisabled: store.signedRoutingEnabled(authoritative: store.signedRouting)
     )
     settingRow(
       title: routerLocalized("Compact old tool results"),
@@ -3521,11 +4571,14 @@ private struct TrayView: View {
         // router does with no state file (tool-result-aging-state.mjs). The row
         // says "Off by default" a line above; showing the switch on while
         // nothing is being aged contradicted it on every fresh install.
-        get: { target.modelSettings?.toolResultAging?.enabled ?? false },
-        set: { enabled in Task { await store.setToolResultAgingEnabled(enabled) } }
+        get: {
+          store.toolResultAgingEnabled(
+            authoritative: target.modelSettings?.toolResultAging?.enabled ?? false
+          )
+        },
+        set: { enabled in store.setToolResultAgingEnabled(enabled) }
       ),
-      isDisabled: store.providerOperation != nil
-        || target.modelSettings?.toolResultAging?.environmentOverride == true
+      isDisabled: target.modelSettings?.toolResultAging?.environmentOverride == true
     )
     harnessRow
     maintenanceRow
@@ -3561,10 +4614,14 @@ private struct TrayView: View {
               titleOverride: member.shortName,
               setup: store.providerSetup[member.id],
               account: store.providerUsage(for: member.id)?.account,
-              isBusy: store.providerOperation == member.id,
+              // A provider connection/login still replaces the controls with
+              // progress. A provider visibility write does not: the switch
+              // must remain clickable so a second click can supersede it.
+              isBusy: store.providerOperation == member.id
+                && !store.providerToggleIsActive(member.id),
               controlsDisabled: store.providerOperation != nil,
               onToggle: { enabled in
-                Task { await store.setProvider(member.id, enabled: enabled) }
+                store.setProvider(member.id, enabled: enabled)
               },
               onConnect: { Task { await store.connectProvider(member.id) } },
               onLogin: { Task { await store.loginProvider(member.id) } },
@@ -3687,7 +4744,7 @@ private struct TrayView: View {
     }
 
     private func pickerGroupSummary(_ group: ProviderModels) -> String {
-      "\(group.models.filter { !hiddenModels.contains($0.slug) }.count) of \(group.models.count) visible"
+      "\(group.models.filter { isPickerVisible($0) }.count) of \(group.models.count) visible"
     }
 
     var body: some View {
@@ -3700,20 +4757,22 @@ private struct TrayView: View {
           VStack(alignment: .leading, spacing: 8) {
             toggleRow(
               title: routerLocalized("All proven models"),
-              detail: settings?.subagents.mode == "all"
+              detail: store.subagentModeAll(authoritative: settings?.subagents.mode == "all")
                 ? "Every proven v2 model can run as a subagent"
                 : "Only selected proven v2 models can run as subagents",
               isOn: Binding(
-                get: { settings?.subagents.mode == "all" },
+                get: {
+                  store.subagentModeAll(authoritative: settings?.subagents.mode == "all")
+                },
                 set: { enabled in
                   let current = settings?.subagents
                   let mode = enabled
                     ? "all"
                     : current?.enabled.isEmpty == false ? "selected" : "proven"
-                  Task { await store.setSubagentMode(mode) }
+                  store.setSubagentMode(mode)
                 }
               ),
-              disabled: busy
+              disabled: false
             )
             Text(routerLocalized("Subagent choices do not hide models from Codex's picker — use Model picker below for that."))
               .font(.system(size: 9))
@@ -3749,11 +4808,14 @@ private struct TrayView: View {
                         isOn: Binding(
                           get: { isSubagent(model) },
                           set: { enabled in
-                            Task { await store.setSubagentModel(model.slug, enabled: enabled) }
+                            store.setSubagentModel(model.slug, enabled: enabled)
                           }
                         ),
-                        disabled: busy || model.visible == false
+                        disabled: !isPickerVisible(model)
                       )
+                      if isSubagent(model) {
+                        subagentStatusTags(for: model)
+                      }
                       // Only for models actually acting as subagents, and only
                       // when the model offers a choice: a one-level ladder has
                       // nothing to pick, and an off model has no child turns to
@@ -3806,12 +4868,12 @@ private struct TrayView: View {
                       title: model.displayName,
                       detail: model.slug,
                       isOn: Binding(
-                        get: { !hiddenModels.contains(model.slug) },
+                        get: { isPickerVisible(model) },
                         set: { visible in
-                          Task { await store.setPickerModel(model.slug, visible: visible) }
+                          store.setPickerModel(model.slug, visible: visible)
                         }
                       ),
-                      disabled: busy
+                      disabled: false
                     )
                   }
                 }
@@ -3871,9 +4933,10 @@ private struct TrayView: View {
     // phrases truncate in place instead of making the panel wider or taller.
     @ViewBuilder private var localLlmPanel: some View {
       VStack(alignment: .leading, spacing: 10) {
-        Text(routerLocalized("Run models locally through Ollama. Enable an installed model to make it available to Codex."))
+        Text(routerLocalized("Run local models through Ollama or the curated MLX runtime. Installed models are wired into the same Codex proxy."))
           .font(.system(size: 9))
           .foregroundStyle(routerMuted)
+        localMlxSection
         if let operation = store.localModelOperation {
           localModelOperationStatus(operation)
             .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
@@ -3898,6 +4961,164 @@ private struct TrayView: View {
         }
       }
       .animation(.easeOut(duration: 0.2), value: store.localModelOperation)
+    }
+
+    /// The curated MLX install is deliberately separate from Ollama: it has a
+    /// different runtime, download source, and lifecycle. Its stable slug is
+    /// still published through the same proxy once the local server verifies.
+    @ViewBuilder private var localMlxSection: some View {
+      let mlx = store.localMlx
+      let operation = mlx?.operation
+      let ready = mlx?.runtime?.ready == true
+      let unsupported = mlx?.host?.supported == false
+      // Runtime verification is authoritative. A terminal record can outlive
+      // the retry that made the model healthy, so do not paint a ready route
+      // red merely because an older attempt ended badly.
+      let failed = !ready && operation?.status == "error"
+      let cancelled = !ready && operation?.status == "cancelled"
+      let active = operation?.isRunning == true
+      let tint = failed || cancelled || unsupported ? routerRed : (ready ? routerMint : routerYellow)
+
+      downloadHeader("QWEN MLX", detail: "LM Studio · 4-bit · ~15 GB")
+      VStack(alignment: .leading, spacing: 7) {
+        HStack(alignment: .top, spacing: 8) {
+          VStack(alignment: .leading, spacing: 2) {
+            Text("Qwen3.8 27B Uncensored")
+              .font(.system(size: 11, weight: .semibold))
+            Text(mlx?.model.map { "\($0.precision) MLX · \($0.contextLength / 1024)K context" }
+              ?? "4-bit MLX · 32K context · Apple silicon")
+              .font(.system(size: 8))
+              .foregroundStyle(routerMutedStrong)
+          }
+          Spacer(minLength: 6)
+          if ready {
+            Label("Ready", systemImage: "checkmark.circle.fill")
+              .font(.system(size: 8, weight: .semibold))
+              .foregroundStyle(routerMint)
+          }
+        }
+
+        if active, let operation {
+          HStack(spacing: 6) {
+            OperationPulse(tint: tint)
+            Text(operation.stageLabel)
+              .font(.system(size: 9, weight: .semibold))
+              .foregroundStyle(tint)
+            Spacer(minLength: 4)
+            Button("Cancel", role: .cancel) {
+              Task { await store.cancelLocalMlx() }
+            }
+            .buttonStyle(.borderless)
+            .font(.system(size: 8, weight: .semibold))
+            .foregroundStyle(routerRed)
+            if operation.showsDeterminateProgress, let percent = operation.percent {
+              Text("\(percent)%")
+                .font(.system(size: 8, weight: .medium))
+                .foregroundStyle(routerMutedStrong)
+                .monospacedDigit()
+            }
+          }
+          if let detail = operation.detail, !detail.isEmpty {
+            Text(detail)
+              .font(.system(size: 8))
+              .foregroundStyle(routerMuted)
+              .lineLimit(2)
+          }
+          if operation.showsDeterminateProgress {
+            ProgressView(value: Double(operation.percent ?? 0), total: 100)
+              .progressViewStyle(.linear)
+              .tint(routerMint)
+          } else {
+            ProgressView()
+              .controlSize(.small)
+              .tint(routerMint)
+              .accessibilityLabel(operation.stageLabel)
+          }
+        } else if failed || cancelled, let operation {
+          Label(operation.stageLabel, systemImage: "exclamationmark.triangle.fill")
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(routerRed)
+          Text(operation.error ?? operation.detail ?? "The local MLX setup did not complete.")
+            .font(.system(size: 8))
+            .foregroundStyle(routerRed)
+            .lineLimit(3)
+        } else if ready {
+          Text(mlx?.model?.slug ?? "lmstudio/qwen38-27b-uncensored-mlx")
+            .font(.system(size: 8, design: .monospaced))
+            .foregroundStyle(routerMutedStrong)
+            .lineLimit(1)
+            .truncationMode(.middle)
+          Text("Served only on this Mac and published to the Codex model picker.")
+            .font(.system(size: 8))
+            .foregroundStyle(routerMuted)
+        } else if unsupported {
+          Label("Apple silicon required", systemImage: "cpu")
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundStyle(routerRed)
+          Text(mlx?.host?.reason ?? "This MLX model is available only on Apple silicon Macs.")
+            .font(.system(size: 8))
+            .foregroundStyle(routerRed)
+            .lineLimit(3)
+          if let host = mlx?.host {
+            Text("Detected: \(host.platform) · \(host.arch)")
+              .font(.system(size: 8, design: .monospaced))
+              .foregroundStyle(routerMuted)
+          }
+        } else {
+          localMlxPrerequisiteLine("LM Studio runtime", state: mlx?.prerequisites?.lms)
+          localMlxPrerequisiteLine("Model downloader", state: mlx?.prerequisites?.uvx)
+        }
+
+        Text("Reduced safety guardrails. Treat outputs as untrusted and keep the server local.")
+          .font(.system(size: 8))
+          .foregroundStyle(routerYellow)
+          .lineLimit(2)
+
+        if !active && !ready {
+          Button("Install runtime + ~15 GB model and wire Codex") {
+            Task { await store.installLocalMlx() }
+          }
+          .buttonStyle(.borderedProminent)
+          .controlSize(.small)
+          .tint(routerMint)
+          .disabled(unsupported || busy || store.localDownload?.isRunning == true || store.localModelOperation != nil)
+          .help(unsupported
+            ? (mlx?.host?.reason ?? "This MLX model requires an Apple silicon Mac.")
+            : "Installs official local prerequisites when missing, downloads the curated 4-bit model, and publishes it through Model Router.")
+        }
+      }
+      .padding(8)
+      .background(tint.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+      .animation(.easeOut(duration: 0.2), value: operation)
+    }
+
+    @ViewBuilder private func localMlxPrerequisiteLine(
+      _ label: String,
+      state: LocalMlxPrerequisite?
+    ) -> some View {
+      HStack(spacing: 5) {
+        Image(systemName: state?.available == true ? "checkmark.circle.fill" : "arrow.down.circle")
+          .foregroundStyle(state?.available == true ? routerMint : routerMutedStrong)
+        Text(label)
+        Spacer()
+        Text(state?.available == true
+          ? "ready"
+          : (state?.automaticWithYes == true ? "official installer on click" : "required"))
+          .foregroundStyle(routerMuted)
+      }
+      .font(.system(size: 8))
+      if state?.available != true, let hint = state?.installHint, !hint.isEmpty {
+        Text(hint)
+          .font(.system(size: 8))
+          .foregroundStyle(routerMuted)
+          .lineLimit(2)
+      } else if state?.available != true,
+        let source = state?.source,
+        let host = URL(string: source)?.host {
+        Text("Source: \(host)")
+          .font(.system(size: 8))
+          .foregroundStyle(routerMuted)
+      }
     }
 
     @ViewBuilder private func localModelOperationStatus(_ operation: LocalModelOperation) -> some View {
@@ -4433,6 +5654,7 @@ private struct TrayView: View {
 
     private var canDownloadLocalSuggestion: Bool {
       !busy && store.localModelOperation == nil && store.localDownload?.isRunning != true
+        && store.localMlx?.operation.isRunning != true
     }
 
     private var suggestedLocalModels: [AvailableLocalModel] {
@@ -4546,13 +5768,13 @@ private struct TrayView: View {
         // can never be a chat model. The checkbox goes dead rather than
         // silently doing nothing, and the role line below says why.
         Toggle("", isOn: Binding(
-          get: { model.enabled },
-          set: { on in Task { await store.setLocalModelEnabled(model.tag, enabled: on) } }
+          get: { store.localModelEnabled(model.tag, authoritative: model.enabled) },
+          set: { on in store.setLocalModelEnabled(model.tag, enabled: on) }
         ))
         .labelsHidden()
         .toggleStyle(.checkbox)
         .controlSize(.mini)
-        .disabled(busy || operation != nil || !model.canBeChatModel)
+        .disabled(operation != nil || !model.canBeChatModel)
         .frame(width: Self.checkColumnWidth, alignment: .leading)
         VStack(alignment: .leading, spacing: 3) {
           HStack(spacing: 6) {
@@ -4839,6 +6061,22 @@ private struct TrayView: View {
     }
 
     private var localLlmSummary: String {
+      if let operation = store.localMlx?.operation, operation.isRunning {
+        let percent = operation.showsDeterminateProgress
+          ? operation.percent.map { " · \($0)%" } ?? ""
+          : ""
+        return "\(operation.stageLabel)\(percent)"
+      }
+      if store.localMlx?.host?.supported == false {
+        return "MLX requires Apple silicon"
+      }
+      if store.localMlx?.runtime?.ready == true,
+        (localModels?.installed ?? 0) == 0 {
+        return "Qwen MLX ready for Codex"
+      }
+      if store.localMlx?.operation.status == "error" {
+        return "MLX install failed"
+      }
       if let download = store.localDownload, download.isRunning {
         let tag = download.tag ?? routerLocalized("local model")
         let percent = download.percent.map { " · \($0)%" } ?? ""
@@ -4866,6 +6104,7 @@ private struct TrayView: View {
 
     private var canInstall: Bool {
       !busy && store.localModelOperation == nil && store.localDownload?.isRunning != true
+        && store.localMlx?.operation.isRunning != true
         && !installTag.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
@@ -4883,20 +6122,21 @@ private struct TrayView: View {
     // Everything maps to a `control vision-bridge` command, so the tray never
     // needs the agent.
     @ViewBuilder private var visionPanel: some View {
+      let visionEnabled = store.visionBridgeEnabled(authoritative: vision?.enabled == true)
       VStack(alignment: .leading, spacing: 8) {
         Text(routerLocalized("Text-only models can't see images. When on, a vision model reads the paste and hands over the text."))
           .font(.system(size: 9))
           .foregroundStyle(routerMuted)
         toggleRow(
           title: routerLocalized("Read images for text-only models"),
-          detail: vision?.enabled == true
+          detail: visionEnabled
             ? (RouterLanguage.isSimplifiedChinese ? "读取引擎：\(currentEngineLabel)" : "Reading via \(currentEngineLabel)")
             : routerLocalized("Off — text-only models refuse pasted images"),
           isOn: Binding(
-            get: { vision?.enabled == true },
-            set: { on in Task { await store.setVisionBridgeEnabled(on) } }
+            get: { store.visionBridgeEnabled(authoritative: vision?.enabled == true) },
+            set: { on in store.setVisionBridgeEnabled(on) }
           ),
-          disabled: busy
+          disabled: false
         )
         // The row stays put when the switch flips. Showing and hiding it
         // resized the whole panel on every toggle, and because the state only
@@ -4911,8 +6151,8 @@ private struct TrayView: View {
           engineMenu
         }
         .padding(.horizontal, 2)
-        .opacity(vision?.enabled == true ? 1 : 0.45)
-        .disabled(vision?.enabled != true)
+        .opacity(visionEnabled ? 1 : 0.45)
+        .disabled(!visionEnabled)
       }
     }
 
@@ -5024,6 +6264,13 @@ private struct TrayView: View {
       Set(settings?.picker.hidden ?? [])
     }
 
+    private func isPickerVisible(_ model: RouterModel) -> Bool {
+      store.pickerModelVisible(
+        model.slug,
+        authoritative: !hiddenModels.contains(model.slug)
+      )
+    }
+
     private var disabledSubagentSet: Set<String> {
       Set(settings?.subagents.disabled ?? [])
     }
@@ -5035,14 +6282,34 @@ private struct TrayView: View {
     // Keep a selected candidate checked while its capability probe runs. The
     // backend, not this UI state, decides when it is actually advertised as v2.
     private func isSubagent(_ model: RouterModel) -> Bool {
-      if model.visible == false { return false }
-      if disabledSubagentSet.contains(model.slug) { return false }
-      return model.multiAgentVersion == "v2" || selectedSubagentSet.contains(model.slug)
+      if !isPickerVisible(model) { return false }
+      let authoritative = !disabledSubagentSet.contains(model.slug)
+        && (model.multiAgentVersion == "v2" || selectedSubagentSet.contains(model.slug))
+      return store.subagentModelEnabled(model.slug, authoritative: authoritative)
     }
 
     // Codex chooses which model a child runs on; this chooses how hard it
     // thinks once it gets there. Indented under its model so it reads as a
     // property of that row rather than another model in the list.
+    private func subagentStatusTags(for model: RouterModel) -> some View {
+      let effort = settings?.subagents.efforts?[model.slug]
+      return HStack(spacing: 5) {
+        Text(routerLocalized("Subagent"))
+          .font(.system(size: 8, weight: .semibold))
+          .foregroundStyle(routerAccent)
+          .padding(.horizontal, 6)
+          .padding(.vertical, 2)
+          .background(Capsule().fill(routerAccent.opacity(0.13)))
+        Text("\((effort ?? routerLocalized("Default")).capitalized) \(routerLocalized("thinking"))")
+          .font(.system(size: 8, weight: .medium))
+          .foregroundStyle(routerMutedStrong)
+          .padding(.horizontal, 6)
+          .padding(.vertical, 2)
+          .background(Capsule().fill(Color.primary.opacity(0.055)))
+      }
+      .padding(.leading, 14)
+    }
+
     private func subagentEffortRow(for model: RouterModel) -> some View {
       let levels = model.reasoningLevels ?? []
       let current = settings?.subagents.efforts?[model.slug]
@@ -5074,12 +6341,16 @@ private struct TrayView: View {
     }
 
     private func subagentDetail(for model: RouterModel) -> String {
-      if model.visible == false { return routerLocalized("Hidden from picker — show it below to use it here") }
+      if !isPickerVisible(model) { return routerLocalized("Hidden from picker — show it below to use it here") }
       if let proof = settings?.subagents.proofs?[model.slug] {
         if proof.status == "checking" { return routerLocalized("Checking…") }
         if proof.status == "failed" {
           return proof.reason ?? routerLocalized("Error")
         }
+      }
+      if model.multiAgentVersion == "v2" && isSubagent(model) {
+        let effort = settings?.subagents.efforts?[model.slug] ?? routerLocalized("Default")
+        return "\(routerLocalized("Proven v2")) · \(effort.capitalized) \(routerLocalized("thinking"))"
       }
       if model.multiAgentVersion == "v2" { return routerLocalized("Proven v2") }
       return routerLocalized("Not selected")
@@ -5087,16 +6358,20 @@ private struct TrayView: View {
 
   private var subagentSummary: String {
       let count = subagentModels.filter { isSubagent($0) }.count
+      let mode = store.subagentModeAll(authoritative: settings?.subagents.mode == "all")
+        ? "all"
+        : (settings?.subagents.mode ?? "proven")
       return RouterLanguage.isSimplifiedChinese
-        ? "\(count) 个已启用 · \(settings?.subagents.mode ?? "proven")"
-        : "\(count) enabled · \(settings?.subagents.mode ?? "proven")"
+        ? "\(count) 个已启用 · \(mode)"
+        : "\(count) enabled · \(mode)"
     }
 
     private var pickerSummary: String {
-      let visible = enabledModels.filter { !hiddenModels.contains($0.slug) }.count
+      let visible = enabledModels.filter { isPickerVisible($0) }.count
+      let hidden = enabledModels.count - visible
       return RouterLanguage.isSimplifiedChinese
-        ? "\(visible) 个显示 · \(hiddenModels.count) 个隐藏"
-        : "\(visible) visible · \(hiddenModels.count) hidden"
+        ? "\(visible) 个显示 · \(hidden) 个隐藏"
+        : "\(visible) visible · \(hidden) hidden"
     }
 
     private func toggleRow(
@@ -5232,6 +6507,34 @@ private struct TrayView: View {
         .disabled(isDisabled)
     }
     .padding(.vertical, 1)
+  }
+
+  private func chooseCustomIconImage() {
+    let panel = NSOpenPanel()
+    panel.allowedContentTypes = [.png, .jpeg, .svg, .icns, .tiff]
+    panel.allowsMultipleSelection = false
+    panel.canChooseDirectories = false
+    panel.canChooseFiles = true
+    panel.prompt = routerLocalized("Select")
+    if panel.runModal() == .OK, let url = panel.url {
+      guard
+        let support = FileManager.default.urls(
+          for: .applicationSupportDirectory,
+          in: .userDomainMask
+        ).first
+      else { return }
+      do {
+        let dest = try RouterStore.persistCustomMenuBarIcon(from: url, into: support)
+        let loaded = RouterStore.loadCustomMenuBarIcon(path: dest.path)
+        guard loaded.image != nil else {
+          try? FileManager.default.removeItem(at: dest)
+          return
+        }
+        store.setMenuBarCustomIconPath(dest.path)
+      } catch {
+        return
+      }
+    }
   }
 
   // Offered whether or not the harness is installed: the same button installs
@@ -5639,25 +6942,15 @@ private struct ProviderSetupRow: View {
     }
     if setup.configured {
       let visibility = provider.enabled ? routerLocalized("Available in Codex") : routerLocalized("Hidden from Codex")
-      return setup.signedIn == true
-        ? (RouterLanguage.isSimplifiedChinese ? "已登录 · \(visibility)" : "Signed in · \(visibility)")
-        : (RouterLanguage.isSimplifiedChinese ? "就绪 · \(visibility)" : "Ready · \(visibility)")
+      return RouterLanguage.isSimplifiedChinese ? "就绪 · \(visibility)" : "Ready · \(visibility)"
     }
     switch setup.action {
     case "install": return routerLocalized("Official CLI required")
     case "login": return routerLocalized("Sign in with the official CLI")
     case "add-key":
-      return offersSignIn ? routerLocalized("Sign in or paste an API key") : "\(credentialLabel) \(routerLocalized("required"))"
+      return "\(credentialLabel) \(routerLocalized("required"))"
     default: return routerLocalized("Setup required")
     }
-  }
-
-  private var offersSignIn: Bool { setup?.signIn == true }
-
-  // Names both halves when both will run, so one click never does more than
-  // the label promised.
-  private var signInTitle: String {
-    setup?.signInAction == "install" ? routerLocalized("Install & Sign In") : routerLocalized("Sign In")
   }
 
   @ViewBuilder
@@ -5687,21 +6980,6 @@ private struct ProviderSetupRow: View {
             .help(routerLocalized("Reconnect OAuth"))
             .disabled(controlsDisabled)
           }
-        }
-        // A key that came from the CLI sign-in can only be renewed by signing
-        // in again, so the row keeps that route reachable after connecting.
-        if offersSignIn {
-          Button(action: { onConnect() }) {
-            Image(systemName: "arrow.triangle.2.circlepath")
-              .font(.system(size: 10, weight: .semibold))
-              .frame(width: 20, height: 20)
-          }
-          .buttonStyle(.plain)
-          .foregroundStyle(routerAccent)
-          .help(routerLocalized(setup?.signInAction == "install"
-            ? "Install the official CLI and sign in"
-            : "Sign in again with the official CLI"))
-          .disabled(controlsDisabled)
         }
         if setup?.kind == "api" {
           Button(action: { toggleKeyField() }) {
@@ -5737,23 +7015,13 @@ private struct ProviderSetupRow: View {
           .toggleStyle(.switch)
           .controlSize(.mini)
           .tint(routerMint)
-          .disabled(controlsDisabled)
       }
     } else {
       HStack(spacing: 10) {
-        // Two ways in, both first-class: the browser sign-in the CLI drives,
-        // and the Studio key someone may already hold.
-        if offersSignIn {
-          Button(signInTitle) { onConnect() }
-            .buttonStyle(.plain)
-            .font(.system(size: 10, weight: .medium))
-            .foregroundStyle(routerAccent)
-            .disabled(controlsDisabled)
-        }
         Button(actionTitle) { performAction() }
           .buttonStyle(.plain)
           .font(.system(size: 10, weight: .medium))
-          .foregroundStyle(offersSignIn ? routerMuted : routerAccent)
+          .foregroundStyle(routerAccent)
           .disabled(controlsDisabled || setup == nil)
       }
     }
@@ -6610,14 +7878,15 @@ private struct StatusBeacon: View {
         .font(.system(size: 10, weight: .medium))
     }
     .foregroundStyle(state.tint)
-    .onAppear { animate() }
-    .onChange(of: state) { _ in animate() }
+    // A finite, task-backed transition avoids an always-running animation
+    // timeline in an otherwise idle menu-bar process.
+    .task(id: "\(state.rawValue)-\(reduceMotion)") { animate() }
   }
 
   private func animate() {
     breathing = false
     guard state == .generating || state == .starting, !reduceMotion else { return }
-    withAnimation(.easeInOut(duration: 0.72).repeatForever(autoreverses: true)) {
+    withAnimation(.easeInOut(duration: 0.72)) {
       breathing = true
     }
   }
@@ -6640,9 +7909,12 @@ private struct OperationPulse: View {
         .frame(width: 6, height: 6)
     }
     .frame(width: 14, height: 14)
-    .onAppear {
+    // Pulse once when the operation view appears. The old repeatForever kept a
+    // display-list animation alive for every open tray, even when no layout or
+    // data was changing.
+    .task(id: reduceMotion) {
       guard !reduceMotion else { return }
-      withAnimation(.easeOut(duration: 0.9).repeatForever(autoreverses: false)) {
+      withAnimation(.easeOut(duration: 0.9)) {
         pulsing = true
       }
     }

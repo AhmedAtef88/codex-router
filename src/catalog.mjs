@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 
 import { protectPrivateFile } from "./file-security.mjs";
 import { isManagedCallerBaseUrl } from "./caller-auth.mjs";
+import { applyInstructionOverlay } from "./instruction-overlays.mjs";
 import {
   ANNOUNCED_MODELS_PATH,
   CONFIG_PATH,
@@ -29,8 +30,12 @@ import {
   readMultiAgentSettings,
   subagentEligibleModels,
 } from "./multi-agent-state.mjs";
-import { readHiddenModels } from "./model-picker-state.mjs";
+import { modelPickerSnapshot, readHiddenModels, seedModelsHidden } from "./model-picker-state.mjs";
 import { buildNativeAliasAssignments } from "./native-alias.mjs";
+import {
+  NATIVE_CONTEXT_VARIANT_SLUGS,
+  withNativeContextVariants,
+} from "./native-context-variants.mjs";
 import { selectedConfiguredListedModels, configuredProviderIds } from "./provider-selection.mjs";
 import { assertStateOwnership } from "./state-owner.mjs";
 import { scanTomlDocument, tomlStringValue } from "./toml-structure.mjs";
@@ -42,6 +47,7 @@ import {
   readNativeCatalogSource,
 } from "./native-catalog-source.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
+import { withCatalogPublicationLock } from "./catalog-publication-lock.mjs";
 
 const refresh = process.argv.includes("--refresh-native");
 
@@ -467,10 +473,10 @@ function rewriteIdentity(text, model) {
   const name = identityName(model);
   return text
     .replace(
-      /\b(?:a coding agent|an agent) based on GPT-5\b/g,
+      /\b(?:a coding agent|an agent) based on GPT-5(?:\.\d+)?(?:[-\s](?:Sol|Terra|Luna))?\b/gi,
       `a coding agent based on ${name}`,
     )
-    .replace(/\bbased on GPT-5\b/g, `based on ${name}`);
+    .replace(/\bbased on GPT-5(?:\.\d+)?(?:[-\s](?:Sol|Terra|Luna))?\b/gi, `based on ${name}`);
 }
 
 function rewriteModelMessages(messages, model) {
@@ -484,9 +490,18 @@ function rewriteModelMessages(messages, model) {
   return next;
 }
 
+const NATIVE_PARALLEL_TOOL_CALL_COMPAT = new Map([["gpt-5.2", true]]);
+
 function normalizeNativeModel(model) {
+  const supportsParallelToolCalls =
+    typeof model.supports_parallel_tool_calls === "boolean"
+      ? model.supports_parallel_tool_calls
+      : NATIVE_PARALLEL_TOOL_CALL_COMPAT.get(String(model.slug));
   return {
     ...model,
+    ...(typeof supportsParallelToolCalls === "boolean"
+      ? { supports_parallel_tool_calls: supportsParallelToolCalls }
+      : {}),
     supports_reasoning_summaries:
       typeof model.supports_reasoning_summaries === "boolean"
         ? model.supports_reasoning_summaries
@@ -494,9 +509,26 @@ function normalizeNativeModel(model) {
   };
 }
 
-export function routedModel(template, model) {
+export function routedModel(template, model, behaviorTemplate = template) {
+  const behaviorModelMessages =
+    behaviorTemplate?.model_messages &&
+    typeof behaviorTemplate.model_messages === "object" &&
+    !Array.isArray(behaviorTemplate.model_messages)
+      ? behaviorTemplate.model_messages
+      : template.model_messages;
+  const derivedBehaviorInstructions = deriveBaseInstructions(behaviorModelMessages);
+  const behaviorInstructions =
+    typeof behaviorTemplate?.base_instructions === "string" &&
+    behaviorTemplate.base_instructions.trim()
+      ? behaviorTemplate.base_instructions
+      : typeof derivedBehaviorInstructions === "string" &&
+          derivedBehaviorInstructions.trim()
+        ? derivedBehaviorInstructions
+        : template.base_instructions;
   const next = {
     ...template,
+    base_instructions: behaviorInstructions,
+    model_messages: behaviorModelMessages,
     slug: model.slug,
     display_name: model.displayName,
     description: model.description,
@@ -568,6 +600,10 @@ export function routedModel(template, model) {
     // opt in after their tool and encrypted-payload relay paths are verified.
     multi_agent_version: model.multiAgentVersion || "v1",
   };
+  // Native GPT-5.6 templates may carry this transport/tool-mode switch. It is
+  // not a routed capability and must stay out even when that native entry is
+  // also the conservative fallback template.
+  delete next.tool_mode;
   // ClinePass strips these unsupported request controls, so Codex must not offer them.
   if (model.requestProfile === "clinepass") {
     delete next.default_reasoning_level;
@@ -583,10 +619,19 @@ export function routedModel(template, model) {
     next.experimental_supported_tools = [...model.experimentalSupportedTools];
   }
   if (typeof next.base_instructions === "string") {
-    next.base_instructions = rewriteIdentity(next.base_instructions, model);
+    next.base_instructions = applyInstructionOverlay(
+      rewriteIdentity(next.base_instructions, model),
+      model.instructionOverlay,
+    );
   }
   if (next.model_messages) {
     next.model_messages = rewriteModelMessages(next.model_messages, model);
+    if (typeof next.model_messages?.instructions_template === "string") {
+      next.model_messages.instructions_template = applyInstructionOverlay(
+        next.model_messages.instructions_template,
+        model.instructionOverlay,
+      );
+    }
   }
   return next;
 }
@@ -697,6 +742,12 @@ export function promoteNativeMultiAgent(models, settings, hidden = new Set()) {
   const disabled = new Set(settings.disabled || []);
   return models.map((model) => {
     const slug = String(model.slug);
+    // Extended-context aliases are manual parent-model choices, not distinct
+    // child-agent backends. Keep them out of spawn_agent model overrides so
+    // delegated work uses the base model's default context window.
+    if (NATIVE_CONTEXT_VARIANT_SLUGS.includes(slug)) {
+      return { ...model, multi_agent_version: "v1" };
+    }
     if (model.visibility !== "list") return model;
     if (hidden.has(slug) || disabled.has(slug)) return model;
     if (NATIVE_V2_BACKEND_SLUGS.has(slug)) {
@@ -707,6 +758,11 @@ export function promoteNativeMultiAgent(models, settings, hidden = new Set()) {
     }
     return model;
   });
+}
+
+function behaviorTemplateFor(nativeModels, model, fallback) {
+  if (!model.behaviorTemplate) return fallback;
+  return nativeModels.find((candidate) => candidate.slug === model.behaviorTemplate) || fallback;
 }
 
 export function buildMergedCatalog(native, routedModelsList, { includeNative = true } = {}) {
@@ -723,7 +779,8 @@ export function buildMergedCatalog(native, routedModelsList, { includeNative = t
       : [],
   );
   for (const model of routedModelsList) {
-    models.set(model.slug, routedModel(template, model));
+    const behaviorTemplate = behaviorTemplateFor(native.models, model, template);
+    models.set(model.slug, routedModel(template, model, behaviorTemplate));
   }
   return sortCatalogModels(models.values());
 }
@@ -751,7 +808,11 @@ export function buildLoginFreeCatalog(native, routedModelsList) {
   );
   const models = [
     ...assignments.map(({ nativeModel, model }) => ({
-      ...routedModel(nativeModel, model),
+      ...routedModel(
+        nativeModel,
+        model,
+        behaviorTemplateFor(native.models, model, nativeModel),
+      ),
       slug: nativeModel.slug,
       priority: nativeModel.priority,
     })),
@@ -763,14 +824,42 @@ export function buildLoginFreeCatalog(native, routedModelsList) {
   return { models: sortCatalogModels(models), aliases };
 }
 
+// A signed-in Codex catalog contains two policy domains: the account's native
+// entries and the router's routed entries. Keep the router overlay off native
+// base slugs so stale external picker state cannot erase Codex's original
+// picker. Login-free mode deliberately aliases external models onto those
+// slugs, so it is the one mode where the overlay applies to all entries.
+export function effectivePickerHiddenModels(hiddenModels, nativeBaseSlugs, { loginFree = false } = {}) {
+  const hidden = new Set([...hiddenModels || []].map((slug) => String(slug)));
+  if (loginFree) return hidden;
+  const native = new Set([...nativeBaseSlugs || []].map((slug) => String(slug)));
+  return new Set([...hidden].filter((slug) => !native.has(slug)));
+}
+
 function main() {
   // The catalog is what Codex offers in its picker. Writing it from a checkout
   // that does not own this state directory is how the picker ends up
   // advertising models the running gateway has no route for.
   assertStateOwnership("write the Codex model catalog");
   const userSlugs = new Set(readUserModels().map((model) => String(model.slug)));
-  const hiddenModels = readHiddenModels();
   const selectedModels = selectedConfiguredListedModels();
+  const loginFree = loginFreeConfigured();
+  // Before the picker state is read, not after: new router models are opt-in
+  // in a normal signed-in Codex install.  Curation or a picker "show" action
+  // records the positive selection; simply enabling a provider or updating a
+  // catalog must not make every one of its models appear.  The same one-time
+  // seeding also keeps extended-window variants off because they cost more per
+  // turn than the base model they shadow.  Login-free mode is different: its
+  // native-looking slots are router aliases and retain the existing behavior.
+  // Only slugs with no recorded decision are touched, so no later rebuild can
+  // undo an operator's choice.
+  seedModelsHidden([
+    ...NATIVE_CONTEXT_VARIANT_SLUGS,
+    ...(loginFree ? [] : selectedModels.map((model) => String(model.slug))),
+  ]);
+  const hiddenModels = readHiddenModels();
+  const pickerState = modelPickerSnapshot();
+  const visibleModels = new Set(pickerState.visible);
   const multiAgentSettings = readMultiAgentSettings();
   // Demotions first, then this machine's own recorded proofs. Settings still
   // never manufacture a v2 claim — a promotion here traces to a live probe
@@ -791,9 +880,28 @@ function main() {
     Date.now(),
   );
   const captured = nativeCatalog();
+  // The router picker overlay is for routed models.  In a normal signed-in
+  // Codex install the account's native entries remain Codex-owned; applying a
+  // stale router `hidden` decision to them can erase the original Codex picker
+  // (for example after a previous "hide all" action).  Login-free mode is the
+  // exception: its native slugs are deliberately aliases for routed models,
+  // so the overlay remains authoritative there.
+  const nativeBaseSlugs = new Set(captured.models.map((model) => String(model.slug || "")));
+  const effectiveHiddenModels = effectivePickerHiddenModels(
+    hiddenModels,
+    nativeBaseSlugs,
+    { loginFree },
+  );
   const native = {
     ...captured,
-    models: promoteNativeMultiAgent(captured.models, multiAgentSettings, hiddenModels),
+    // Variants join before the multi-agent pass so the extended-context alias
+    // can remain manually selectable while being forced parent-only; delegated
+    // work must use the base model's default context window.
+    models: promoteNativeMultiAgent(
+      withNativeContextVariants(captured.models, { enabled: !loginFree }),
+      multiAgentSettings,
+      effectiveHiddenModels,
+    ),
   };
   // Dropping every native model is destructive, so only do it when Codex
   // actually answered that the session is signed out. If the probe could not
@@ -808,7 +916,6 @@ function main() {
     );
   }
   const openaiAuthenticated = auth.authenticated;
-  const loginFree = loginFreeConfigured();
   const routedCatalog = routedCatalogActive();
   // Advertised last, and only while an engine actually resolves: Codex gates
   // the paste on `input_modalities`, so a bridge that has gone away must take
@@ -826,7 +933,7 @@ function main() {
   // the verdict back out of.
   const nativeEngines = nativeVisionEngines({
     models: captured.models,
-    hidden: hiddenModels,
+    hidden: effectiveHiddenModels,
     authorized: openaiAuthenticated && !loginFree,
   });
   const visionEngine = resolveVisionEngine(
@@ -851,11 +958,26 @@ function main() {
     atomicJson(NATIVE_ALIAS_PATH, { version: 1, aliases });
     writeAnnouncedAt(announcedAt);
     atomicJson(MERGED_CATALOG_PATH, {
-      models: merged.map((model) =>
-        hiddenModels.has(String(model.slug))
+      models: merged.map((model) => {
+        const slug = String(model.slug);
+        // In login-free mode a native-looking slot is an alias for a routed
+        // model, so visibility follows the canonical routed slug that the
+        // operator selected. Normal signed-in native base entries remain
+        // client-owned and are never removed by router picker state.
+        const policySlug = aliases[slug] || slug;
+        const routerManaged = loginFree || !nativeBaseSlugs.has(slug);
+        const hidden = effectiveHiddenModels.has(policySlug);
+        // A state file written by the new picker carries positive selections.
+        // Older installs had only `hidden`; preserve their behavior until an
+        // operator makes a picker change, at which point the write records the
+        // explicit allowlist permanently.
+        const selected = pickerState.hasExplicitVisibility
+          ? visibleModels.has(policySlug)
+          : !hidden;
+        return routerManaged && (hidden || !selected)
           ? { ...model, visibility: "hide" }
-          : model,
-      ),
+          : model;
+      }),
     });
     if (process.env.MODEL_ROUTER_TEST_FAIL_AFTER_CATALOG_WRITE === "1") {
       throw new Error("Forced failure after model catalog publication.");
@@ -913,7 +1035,10 @@ function main() {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    main();
+    // The lock begins before the first ownership or mutable-state read and is
+    // released only after probes and the coupled catalog-file transaction are
+    // complete. Every app/CLI/autonomous caller executes this same entrypoint.
+    await withCatalogPublicationLock(main);
   } catch (error) {
     // Ownership conflicts are an operator mistake with a specific remedy, so
     // print the guidance rather than a stack trace.

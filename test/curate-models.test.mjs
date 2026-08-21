@@ -14,9 +14,15 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // coverage of any kind.
 const savedArgv = [...process.argv];
 process.argv = [process.argv[0], "curate-models.mjs", "gemini-api"];
-const { parseEfforts, parseRequestProfile, planCuration, renderRows } = await import(
-  "../src/curate-models.mjs"
-);
+const {
+  curatedSizing,
+  mergeCurationIntoCurrent,
+  parseEfforts,
+  parseRequestProfile,
+  planCuration,
+  renderRows,
+} =
+  await import("../src/curate-models.mjs");
 process.argv = savedArgv;
 process.exitCode = 0;
 
@@ -24,6 +30,27 @@ const curated = (upstreamModel, metadata = {}) => ({
   upstreamModel,
   provider: "fireworks",
   ...metadata,
+});
+
+test("curation merges current unrelated providers and rejects stale same-provider edits", () => {
+  const mine = curated("accounts/fireworks/models/kimi-k3");
+  const other = { ...curated("openrouter/other"), provider: "openrouter" };
+  const replacement = curated("accounts/fireworks/models/deepseek-v4-flash");
+  assert.deepEqual(
+    mergeCurationIntoCurrent([mine, other], {
+      providerId: "fireworks",
+      expectedMine: [mine],
+      nextMine: [replacement],
+    }),
+    [other, replacement],
+  );
+  assert.throws(
+    () => mergeCurationIntoCurrent(
+      [replacement, other],
+      { providerId: "fireworks", expectedMine: [mine], nextMine: [replacement] },
+    ),
+    /changed while this command was running/,
+  );
 });
 
 test("an additive model run keeps unrelated curated metadata", () => {
@@ -189,4 +216,94 @@ test("the picker marks selection and existing curation separately", () => {
   const [first, second] = rows.split("\n");
   assert.match(first, /\[ \] 1\. gemini-3\.5-flash \(currently curated\)/);
   assert.match(second, /\[x\] 2\. gemini-3\.5-pro \(new\)/);
+});
+
+test("a curated model is sized from the context length its provider advertises", () => {
+  // #266: every scripted curation stored 131072 regardless of the model. Codex
+  // derives its compaction threshold from that number, so a 1,050,000-token
+  // model was told to summarize at 110,000 -- and did, on every turn.
+  assert.deepEqual(curatedSizing(1_050_000), {
+    contextWindow: 1_050_000,
+    autoCompact: 892_500,
+  });
+});
+
+test("a context length that is not a whole positive count sizes nothing", () => {
+  // Silence has to stay distinguishable from a number, or a catalog quirk
+  // becomes a stored window.
+  for (const value of [undefined, null, 0, -1, 1024.5, "200000", NaN, Infinity]) {
+    assert.equal(curatedSizing(value), undefined, `${String(value)} is not a size`);
+  }
+});
+
+test("scripted curation stores the advertised window, not the conservative guess", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "curate-models-context-"));
+  const file = path.join(dir, "user-models.json");
+  const fixture = path.join(dir, "models.json");
+  writeFileSync(
+    fixture,
+    JSON.stringify({
+      data: [
+        { id: "openai/gpt-5.6-luna", context_length: 1_050_000 },
+        // A model the catalog sizes in silence keeps the conservative default.
+        { id: "vendor/unsized" },
+      ],
+    }),
+  );
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        path.join(root, "src", "curate-models.mjs"),
+        "openrouter",
+        "--models",
+        "openai/gpt-5.6-luna,vendor/unsized",
+        "--fixture",
+        fixture,
+        "--no-apply",
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENROUTER_API_KEY: "",
+          MODEL_ROUTER_USER_MODELS: file,
+          MODEL_ROUTER_STATE_DIR: dir,
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const stored = JSON.parse(readFileSync(file, "utf8"));
+    const luna = stored.models.find((model) => model.upstreamModel === "openai/gpt-5.6-luna");
+    assert.equal(luna.contextWindow, 1_050_000);
+    assert.equal(luna.autoCompact, 892_500);
+    const unsized = stored.models.find((model) => model.upstreamModel === "vendor/unsized");
+    assert.equal(unsized.contextWindow, 131072);
+    assert.ok(unsized.autoCompact <= unsized.contextWindow);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Committing a curated model used to shell out to bin/install, which
+// reinstalls the background service and waits on its health. That installer's
+// own EXIT trap disables the client config when the wait fails, so adding a
+// single model could leave the router unrouted -- and on a GUI-launched app it
+// failed outright, because bin/install resolves `node` by name off a PATH a
+// desktop process does not inherit. Curation publishes through the shared
+// overlay finalizer instead; nothing here may reach for the installer again.
+test("curation publishes through the overlay finalizer, never the installer", () => {
+  const source = readFileSync(path.join(root, "src", "curate-models.mjs"), "utf8");
+  assert.equal(
+    /bin["'\s,)\]]*\s*,\s*["']install|install\.ps1/.test(source),
+    false,
+    "curate-models.mjs must not invoke the installer to publish curated models",
+  );
+  assert.equal(
+    source.includes('from "node:child_process"'),
+    false,
+    "curate-models.mjs must not spawn processes to publish curated models",
+  );
+  assert.match(source, /applyModelOverlayPublication/);
 });

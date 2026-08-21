@@ -3,7 +3,6 @@ import { closeSync, openSync, readSync, writeSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { cliSessionDescriptor } from "./cli-session-credential.mjs";
 import { detectLegacyInstallations, applyKnownMigrations, rollbackLatestMigration } from "./legacy-migration.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
@@ -11,7 +10,6 @@ import { kimiOAuthStatus } from "./oauth-status.mjs";
 import { SOURCE_ROOT, TARGET } from "./paths.mjs";
 import { credentialStatus } from "./provider-credentials.mjs";
 import {
-  hasSignInCli,
   installOauthCli,
   oauthCliPath,
   oauthLoginArgs,
@@ -262,14 +260,11 @@ function run(command, commandArgs, options = {}) {
 
 function configureProvider(provider) {
   if (providerConfigured(provider)) return;
-  const session = cliSessionDescriptor(provider);
   if (!guided) {
     const setup =
       provider.kind === "oauth"
         ? "sign in with the provider's official CLI"
-        : session
-          ? `run \`${session.loginCommand}\` or \`./bin/provider-key ${provider.id} set\``
-          : `run \`./bin/provider-key ${provider.id} set\``;
+        : `run \`./bin/provider-key ${provider.id} set\``;
     throw incomplete(`${provider.displayName} is selected but not configured; ${setup} first.`);
   }
   if (provider.kind === "oauth") {
@@ -292,31 +287,12 @@ function configureProvider(provider) {
     }
   } else {
     if (["anonymous", "per-model"].includes(provider.authMode)) return;
-    // A provider whose CLI mints its key in the browser gets that offer first,
-    // because most people have an account long before they have a key. Saying
-    // no falls through to the key prompt rather than failing the install.
-    if (session && hasSignInCli(provider.id) && signInToProvider(provider)) return;
     const prompt = provider.credential?.prompt || `${provider.displayName} API key`;
     if (!confirm(`Enter ${prompt} securely now?`)) {
       throw incomplete(`${provider.displayName} setup was cancelled.`);
     }
     run(process.execPath, [path.join(SOURCE_ROOT, "src", "provider-key.mjs"), provider.id, "set"]);
   }
-}
-
-// Returns true only when the sign-in actually produced a usable credential, so
-// the caller can fall back to the API key path for every other outcome.
-function signInToProvider(provider) {
-  if (!confirm(`Sign in to ${provider.displayName} in your browser now?`)) return false;
-  let cli = oauthCliPath(provider.id);
-  if (!cli) {
-    if (!confirm(`Install the official ${provider.displayName} CLI with npm now?`)) return false;
-    installOauthCli(provider.id);
-    cli = oauthCliPath(provider.id);
-    if (!cli) return false;
-  }
-  run(cli, oauthLoginArgs(provider.id));
-  return providerConfigured(provider);
 }
 
 // Best-effort: the router install has already succeeded, so a companion-app
@@ -473,6 +449,9 @@ async function main() {
 
   nextStep("Review and install");
   const dshTarget = TARGET === "dsh";
+  // Like the harness, Gemini CLI has no native catalog to adopt: that list is
+  // the ChatGPT-plan model set Codex publishes for itself.
+  const geminiTarget = TARGET === "gemini";
   if (guided) {
     process.stdout.write(
       `\nReady to install:\n` +
@@ -480,8 +459,10 @@ async function main() {
         `  Migration: ${migration ? "recognized older router (rollback snapshot kept)" : "none needed"}\n` +
         (dshTarget
           ? `  Changes: per-user background service and one provider route in the harness settings document\n`
-          : `  Native catalog: ${adoptNativeCatalog ? "adopt existing user catalog" : "capture from Codex"}\n` +
-            `  Changes: per-user background service and the managed Codex config block\n`),
+          : geminiTarget
+            ? `  Changes: per-user background service and one managed block in Gemini CLI's environment file\n`
+            : `  Native catalog: ${adoptNativeCatalog ? "adopt existing user catalog" : "capture from Codex"}\n` +
+              `  Changes: per-user background service and the managed Codex config block\n`),
     );
     if (!confirm("Proceed?")) {
       throw incomplete("Setup was cancelled before installing the service.");
@@ -529,7 +510,11 @@ async function main() {
     dshTarget
       ? `\nDeepSeek Harness is ready with: ${providerSummary}\n` +
         `It reloads its settings document on the next request, so there is nothing to restart.\n`
-      : `\nCodex Router is ready with: ${providerSummary}\nFully quit Codex, reopen it, and start a new task.\n`,
+      : geminiTarget
+        ? `\nGemini CLI is ready with: ${providerSummary}\n` +
+          `It reads its environment at startup, so the next \`gemini\` run picks this up.\n` +
+          `If it asks how to authenticate, choose "Use Gemini API key" once -- the key is this router's local caller capability.\n`
+        : `\nCodex Router is ready with: ${providerSummary}\nFully quit Codex, reopen it, and start a new task.\n`,
   );
   if (visionBridge?.enabled && visionBridge.engine) {
     process.stdout.write(
@@ -551,11 +536,8 @@ async function main() {
             if (provider.kind === "oauth") {
               return `  ${provider.displayName}: sign in with the provider's official CLI\n`;
             }
-            const session = cliSessionDescriptor(provider);
             const key = `./bin/provider-key ${provider.id} set`;
-            return session
-              ? `  ${provider.displayName}: ${session.loginCommand}, or ${key}\n`
-              : `  ${provider.displayName}: ${key}\n`;
+            return `  ${provider.displayName}: ${key}\n`;
           })
           .join("") +
         `These providers stay selected and start working as soon as a key is stored.\n`,

@@ -2,7 +2,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import { PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
-import { cliSessionDescriptor } from "./cli-session-credential.mjs";
+import { devinCliStatus } from "./devin-cli-status.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
 import { credentialStatus } from "./provider-credentials.mjs";
@@ -19,12 +19,14 @@ import {
   targetPickerName,
   targetRestartHint,
 } from "./target-integration.mjs";
+import { withModelOverlayLock } from "./model-overlay-lock.mjs";
 
 // One entry per OAuth vendor keeps adding a provider a registry-plus-map
 // change instead of another branch in a nested conditional.
 const SIGN_IN_STATUS = Object.freeze({
   "kimi-oauth": { status: kimiOAuthStatus, setup: "run `kimi login`" },
   "grok-oauth": { status: grokOAuthStatus, setup: "run `grok login --oauth`" },
+  "devin-cli": { status: devinCliStatus, setup: "run `devin auth login`" },
 });
 
 function configured(provider) {
@@ -50,7 +52,7 @@ function list() {
     }));
 }
 
-function main() {
+async function main() {
   const command = process.argv[2] || "list";
   const providerId = process.argv[3];
   if (command === "list") {
@@ -73,19 +75,20 @@ function main() {
     throw new Error("Usage: providers [list [--json]|enable ID|disable ID]");
   }
   if (command === "enable" && !configured(provider)) {
-    const session = cliSessionDescriptor(provider);
     const keySetup = `run \`${targetCli(`provider-key ${provider.id} set`)}\``;
     const setup = provider.kind === "oauth"
       ? SIGN_IN_STATUS[provider.id]?.setup || "sign in with the provider CLI"
-      : session
-        ? `run \`${session.loginCommand}\` or ${keySetup}`
-        : keySetup;
+      : keySetup;
     throw new Error(`${provider.displayName} is not configured; ${setup} first.`);
   }
-  const providers = command === "enable"
-    ? enableProvider(providerId)
-    : disableProvider(providerId);
-  const refreshed = refreshTargetPickerIfInstalled();
+  let providers;
+  let refreshed;
+  await withModelOverlayLock(async () => {
+    providers = command === "enable"
+      ? enableProvider(providerId)
+      : disableProvider(providerId);
+    refreshed = refreshTargetPickerIfInstalled();
+  });
   // "shown in the model picker" is false for a catalog-only provider with no
   // curated models: enabling it changes nothing the user can see. Say what
   // actually happened, and name the step that makes it true.
@@ -107,10 +110,8 @@ function main() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  try {
-    main();
-  } catch (error) {
+  main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
-    process.exit(1);
-  }
+    process.exitCode = 1;
+  });
 }

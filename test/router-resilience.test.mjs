@@ -197,10 +197,19 @@ test("a gateway that dies mid-stream ends the routed body and logs the cause", a
     assert.match(result.body, /event: response\.created/);
     assert.match(result.body, /event: error/);
     assert.match(result.body, /local_router_stream_failed/);
+    // The terminal event is the only place a cause can still reach the client
+    // once the head is committed. Without it Codex reports a stream that just
+    // stopped as `stream disconnected before completion`, which names nothing.
+    assert.match(result.body, /closed early|reset the connection/);
 
     // The log has to name the cause; the bare string it used to write is why
     // this was undiagnosable in production.
-    const deadline = Date.now() + 2_000;
+    // A wait, not a bound: nothing here is asserting how *fast* the router
+    // logs, only that it does, and 2s was short enough that a loaded machine
+    // could still be scheduling the write. Wait as long as the rest of this
+    // file waits for anything else. A router that never logs the cause still
+    // fails on the assertion below, which is the property under test.
+    const deadline = Date.now() + 10_000;
     while (!/request failed: /.test(router.testErrors()) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 25));
     }

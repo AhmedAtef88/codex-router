@@ -113,7 +113,22 @@ wire_api = "responses"
       const merged = JSON.parse(
         readFileSync(path.join(stateDir, "merged-models.json"), "utf8"),
       );
-      assert.deepEqual(merged.models.map((model) => model.slug), ["gpt-5.6-sol"]);
+      // The captured native model, plus the extended-window variant the
+      // router derives from it. Nothing routed, which is what this test is
+      // about — and the variant ships switched off, so a build that publishes
+      // it has still changed nothing the operator did not ask for.
+      assert.deepEqual(merged.models.map((model) => model.slug), [
+        "gpt-5.6-sol",
+        "gpt-5.6-sol-1m",
+      ]);
+      assert.equal(
+        merged.models.find((model) => model.slug === "gpt-5.6-sol-1m").visibility,
+        "hide",
+      );
+      assert.equal(
+        merged.models.find((model) => model.slug === "gpt-5.6-sol").visibility,
+        "list",
+      );
       assert.equal(
         readdirSync(path.join(codexHome, "agents")).filter((name) =>
           name.startsWith("router-model-"),
@@ -165,6 +180,20 @@ test(
         proofs: {
           "deepseek/deepseek-v4-pro": { status: "proven" },
         },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    // The catalog now publishes routed models only after an explicit picker
+    // selection. Keep this test focused on the doctor detecting a missing
+    // managed agent definition, rather than relying on the old implicit-show
+    // behavior.
+    writeFileSync(
+      path.join(stateDir, "model-picker.json"),
+      `${JSON.stringify({
+        version: 1,
+        hidden: [],
+        visible: ["deepseek/deepseek-v4-pro"],
+        seeded: ["deepseek/deepseek-v4-pro"],
       })}\n`,
       { mode: 0o600 },
     );

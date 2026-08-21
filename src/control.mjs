@@ -5,14 +5,28 @@ import { fileURLToPath } from "node:url";
 
 import { pickerCommandArgs } from "./control-args.mjs";
 import { promoteNativeMultiAgent } from "./catalog.mjs";
+import {
+  applyModelOverlayPublication,
+  transactModelOverlayMutation,
+} from "./model-overlay-publication.mjs";
+import { withModelOverlayLock } from "./model-overlay-lock.mjs";
+import { withNativeContextVariants } from "./native-context-variants.mjs";
 // The publish marker lives under the shared state directory, which does not
 // vary by target, so reading it here does not disturb the per-target probes
 // below that re-import paths with their own MODEL_ROUTER_TARGET.
-import { DSH_CATALOG_PATH } from "./paths.mjs";
+import {
+  CALLER_SECRET_PATH,
+  DSH_CATALOG_PATH,
+  GEMINI_CATALOG_PATH,
+  PORTS,
+  PROVIDER_SELECTION_PATH,
+} from "./paths.mjs";
 // Same reasoning: presence is a property of the shared plane, not of a target,
 // so the overview can resolve it statically without perturbing those probes.
 import { presenceSnapshot } from "./presence-state.mjs";
 import { harnessSnapshotWithWeb } from "./dsh-install.mjs";
+import { USER_MODELS_PATH } from "./user-models.mjs";
+import { refreshTargetPickerIfInstalled } from "./target-integration.mjs";
 
 // Cross-target control plane for a tray/UI (e.g. the planned pane fork). It
 // reads which registry models are enabled per target and toggles them. Toggling
@@ -27,7 +41,12 @@ const REPO_ROOT = path.resolve(path.dirname(SELF), "..");
 // run. `dsh-models.json` is written by the publish and removed by the
 // uninstall, so its presence is exactly the question being asked.
 const DSH_PUBLISHED = DSH_CATALOG_PATH;
-const TARGETS = existsSync(DSH_PUBLISHED) ? ["codex", "dsh"] : ["codex"];
+const GEMINI_PUBLISHED = GEMINI_CATALOG_PATH;
+const TARGETS = [
+  "codex",
+  ...(existsSync(DSH_PUBLISHED) ? ["dsh"] : []),
+  ...(existsSync(GEMINI_PUBLISHED) ? ["gemini"] : []),
+];
 const args = process.argv.slice(2);
 
 function targetIsActive(target) {
@@ -35,6 +54,9 @@ function targetIsActive(target) {
   // service's own status for more than one of them. For the harness it is
   // whether the route has been published into its settings document.
   if (target === "dsh") return existsSync(DSH_PUBLISHED);
+  // Same question for Gemini CLI: whether this router published its `.env`
+  // block. The CLI itself is not a resident process there is anything to poll.
+  if (target === "gemini") return existsSync(GEMINI_PUBLISHED);
   const result = spawnSync(process.execPath, [path.join(REPO_ROOT, "src", "service.mjs"), "status"], {
     env: { ...process.env, MODEL_ROUTER_TARGET: target },
     encoding: "utf8",
@@ -84,12 +106,30 @@ async function shippedNativeVisionEngines(hidden) {
   return installedNativeVisionEngines({ hidden });
 }
 
-function nativeCodexModels(catalogPath, hiddenModels = new Set(), subagentSettings = {}) {
+function nativeCodexModels(
+  catalogPath,
+  hiddenModels = new Set(),
+  subagentSettings = {},
+  { contextVariants = true } = {},
+) {
   if (!existsSync(catalogPath)) return [];
   try {
     const parsed = JSON.parse(readFileSync(catalogPath, "utf8"));
+    const nativeBaseSlugs = new Set(
+      (Array.isArray(parsed.models) ? parsed.models : [])
+        .map((model) => String(model?.slug || ""))
+        .filter(Boolean),
+    );
     return promoteNativeMultiAgent(
-      Array.isArray(parsed.models) ? parsed.models : [],
+      // The capture holds what Codex published; the extended-window variants
+      // are the router's own additions to the same group, and the tray is
+      // where they are switched on, so they have to be drawn here too. The
+      // catalog build derives them from this same list, so the rows the
+      // operator sees and the entries Codex reads cannot drift apart.
+      withNativeContextVariants(
+        Array.isArray(parsed.models) ? parsed.models : [],
+        { enabled: contextVariants },
+      ),
       subagentSettings,
       hiddenModels,
     )
@@ -101,8 +141,14 @@ function nativeCodexModels(catalogPath, hiddenModels = new Set(), subagentSettin
         gatewayModel: model.slug,
         enabled: true,
         native: true,
+        // Omit the field for base entries for compatibility with existing
+        // probe consumers; a false marker identifies synthesized variants.
+        ...(nativeBaseSlugs.has(model.slug) ? {} : { nativeClientManaged: false }),
         multiAgentVersion: model.multi_agent_version || "v1",
-        visible: !hiddenModels.has(model.slug),
+        // Base native entries belong to Codex's own catalog.  A router picker
+        // overlay must not make them disappear; synthesized context variants
+        // remain router-managed and can still be switched off explicitly.
+        visible: nativeBaseSlugs.has(model.slug) || !hiddenModels.has(model.slug),
         ...reasoningLevelField(model.supported_reasoning_levels),
       }));
   } catch {
@@ -166,7 +212,9 @@ async function emitProbe() {
   const localInstalled = localInventory.map((model) => model.tag);
 
   const enabledProviders = readProviderSelection();
-  const hiddenModels = new Set(modelPickerSnapshot().hidden);
+  const picker = modelPickerSnapshot();
+  const hiddenModels = new Set(picker.hidden);
+  const visibleModels = new Set(picker.visible);
   const subagentSettings = subagentSettingsSnapshot();
   const usageEvents = TARGET === "codex"
     ? (await import("./usage-events.mjs")).recentUsageEvents()
@@ -196,21 +244,30 @@ async function emitProbe() {
     gatewayModel: model.gatewayModel,
     enabled: enabledProviders.includes(model.provider),
     multiAgentVersion: model.multiAgentVersion || "v1",
-    visible: !hiddenModels.has(model.slug),
+    visible: picker.hasExplicitVisibility
+      ? visibleModels.has(model.slug)
+      : !hiddenModels.has(model.slug),
+    isFree: model.isFree === true,
     // The ladders differ per model, so a surface offering a subagent effort
     // has to be told which levels this one accepts rather than guessing from a
     // global list. Omitted when the model advertises none, so an entry without
     // a ladder keeps the exact shape it always had.
     ...reasoningLevelField(model.reasoningLevels),
   }));
+  const selectedModel = TARGET === "codex" ? configuredDefaultModel(CONFIG_PATH) : undefined;
+  const codexConfig = TARGET === "codex" ? codexConfigSnapshot() : undefined;
   const models = TARGET === "codex"
     ? [
-        ...nativeCodexModels(NATIVE_CATALOG_PATH, hiddenModels, subagentSettings),
+        ...nativeCodexModels(NATIVE_CATALOG_PATH, hiddenModels, subagentSettings, {
+          // A login-free install republishes external models under the native
+          // slugs Codex allowlists, and a synthesized slug is not one of them.
+          // The catalog build drops the variants there for the same reason, so
+          // the tray must not offer a row the picker will never show.
+          contextVariants: !codexConfig?.login_free,
+        }),
         ...routedModels,
       ]
     : routedModels;
-  const selectedModel = TARGET === "codex" ? configuredDefaultModel(CONFIG_PATH) : undefined;
-  const codexConfig = TARGET === "codex" ? codexConfigSnapshot() : undefined;
 
   process.stdout.write(
     JSON.stringify({
@@ -243,6 +300,8 @@ async function emitProbe() {
             loginFreeManaged: Boolean(codexConfig.login_free_managed),
             signedRouting: Boolean(codexConfig.signed_routing),
             signedRoutingManaged: Boolean(codexConfig.signed_routing_managed),
+            routerDefaultModel: codexConfig.router_default_model || undefined,
+            routerDefaultManaged: Boolean(codexConfig.router_default_managed),
           }
         : {}),
       ...(TARGET === "codex"
@@ -328,6 +387,47 @@ async function emitProbeSet(provider, desired) {
   process.stdout.write(JSON.stringify({ target: TARGET, enabledProviders: next }));
 }
 
+// The client probes below intentionally include client-specific details (for
+// example Codex's native catalog and login-free aliases).  Model visibility and
+// routed model identity do not belong to any of those clients, so expose one
+// adapter-independent snapshot for the Control Center and other local tools.
+// This is the router's source of truth: every client publisher consumes the
+// same selected registry, picker state, and subagent policy.
+async function routerCatalogSnapshot() {
+  const { canonicalProviderId, readProviderSelection, selectedConfiguredListedModels } =
+    await import("./provider-selection.mjs");
+  const { modelPickerSnapshot } = await import("./model-picker-state.mjs");
+  const { subagentSettingsSnapshot } = await import("./multi-agent-state.mjs");
+  const { applySubagentProofs } = await import("./subagent-proofs.mjs");
+  const settings = subagentSettingsSnapshot();
+  const picker = modelPickerSnapshot();
+  const hidden = new Set(picker.hidden);
+  const visible = new Set(picker.visible);
+  const models = applySubagentProofs(
+    selectedConfiguredListedModels(),
+    settings.proofs,
+    { hidden, disabled: settings.disabled },
+  ).map((model) => ({
+    slug: model.slug,
+    displayName: model.displayName,
+    provider: canonicalProviderId(model.provider),
+    gatewayModel: model.gatewayModel,
+    enabled: true,
+    multiAgentVersion: model.multiAgentVersion || "v1",
+    visible: picker.hasExplicitVisibility ? visible.has(model.slug) : !hidden.has(model.slug),
+    isFree: model.isFree === true,
+    ...reasoningLevelField(model.reasoningLevels),
+  }));
+  return {
+    source: "codex-router",
+    configured: existsSync(PROVIDER_SELECTION_PATH),
+    enabledProviders: readProviderSelection(),
+    models,
+    picker,
+    subagents: settings,
+  };
+}
+
 // --- aggregate over all targets --------------------------------------------
 
 function probeTargets() {
@@ -357,7 +457,15 @@ async function printOverview(asJson) {
     // harness as stopped and offers to start one that is already up.
     process.stdout.write(
       `${JSON.stringify(
-        { targets, presence: presenceSnapshot(), harness: await harnessSnapshotWithWeb() },
+        {
+          targets,
+          // Keep this separate from `targets.codex`: native Codex entries and
+          // login-free aliases are client concerns, while this catalog is the
+          // durable router policy shared by Codex, DSH, and Gemini.
+          catalog: await routerCatalogSnapshot(),
+          presence: presenceSnapshot(),
+          harness: await harnessSnapshotWithWeb(),
+        },
         null,
         2,
       )}\n`,
@@ -378,11 +486,17 @@ async function printOverview(asJson) {
   }
 }
 
-async function runSet(provider, desired) {
+function requestedControlTargets() {
   const requested = optionValue("--targets");
   const selected = requested ? requested.split(",").map((value) => value.trim()) : TARGETS;
   for (const target of selected) {
     if (!TARGETS.includes(target)) throw new Error(`Unknown target: ${target}`);
+  }
+  return selected;
+}
+
+function setProviderSelectionForTargets(provider, desired, selected) {
+  for (const target of selected) {
     const result = spawnSync(process.execPath, [SELF, "--probe-set", provider, desired], {
       env: { ...process.env, MODEL_ROUTER_TARGET: target },
       encoding: "utf8",
@@ -391,6 +505,15 @@ async function runSet(provider, desired) {
       throw new Error(`${target}: ${(result.stderr || "").trim() || "toggle failed"}`);
     }
   }
+}
+
+async function runSet(provider, desired) {
+  // The probe child performs the read/modify/write, so the parent must hold
+  // the shared model-overlay lock around the whole fan-out. Otherwise two
+  // target-aware CLI invocations can each publish a stale provider selection
+  // even though the target files themselves are private and atomic.
+  const selected = requestedControlTargets();
+  await withModelOverlayLock(() => setProviderSelectionForTargets(provider, desired, selected));
   process.stderr.write(
     `Set ${provider} ${desired} for: ${selected.join(", ")}. Run \`bin/control apply\` to make it live.\n`,
   );
@@ -403,7 +526,9 @@ function refreshActiveTarget(target) {
       ? [process.execPath, [path.join(REPO_ROOT, "src", "catalog.mjs")]]
       : target === "dsh"
         ? [process.execPath, [path.join(REPO_ROOT, "src", "dsh-config-manager.mjs"), "install"]]
-        : undefined;
+        : target === "gemini"
+          ? [process.execPath, [path.join(REPO_ROOT, "src", "gemini-config-manager.mjs"), "install"]]
+          : undefined;
   if (!command) return;
   const result = spawnSync(command[0], command[1], {
     env: { ...process.env, MODEL_ROUTER_TARGET: target },
@@ -414,14 +539,10 @@ function refreshActiveTarget(target) {
 
 // Active routers read provider selection on each request, so only their picker
 // catalog needs refreshing. The full enable path is reserved for inactive targets.
-async function runApply() {
-  const requested = optionValue("--targets");
-  const selected = requested ? requested.split(",").map((value) => value.trim()) : TARGETS;
-  const activate = args.includes("--activate");
+async function applyProviderSelectionForTargets(selected, { activate = false } = {}) {
   const applied = [];
   const skipped = [];
   for (const target of selected) {
-    if (!TARGETS.includes(target)) throw new Error(`Unknown target: ${target}`);
     if (!targetIsActive(target) && !activate) {
       skipped.push(target);
       continue;
@@ -446,8 +567,47 @@ async function runApply() {
     }
     applied.push(target);
   }
+  return { applied, skipped };
+}
+
+async function runApply() {
+  // Publication is the second half of the same transaction as the provider
+  // selection write. Hold the model lock while the catalog child takes its
+  // own inner catalog lock (model -> catalog is the sole lock ordering).
+  const selected = requestedControlTargets();
+  const result = await withModelOverlayLock(() => applyProviderSelectionForTargets(
+    selected,
+    { activate: args.includes("--activate") },
+  ));
   process.stderr.write(
-    `Applied: ${applied.join(", ") || "none"}. Skipped (not active): ${skipped.join(", ") || "none"}.\n`,
+    `Applied: ${result.applied.join(", ") || "none"}. ` +
+      `Skipped (not active): ${result.skipped.join(", ") || "none"}.\n`,
+  );
+}
+
+// The Control Center needs a single failure boundary for a provider toggle.
+// Holding one model-overlay transaction across both operations prevents a
+// failed publication from restoring a snapshot taken before another process's
+// successful selection change. Rollback restores the selection and republishes
+// it before the lock is released.
+async function runSetApply(provider, desired) {
+  const selected = requestedControlTargets();
+  const activate = args.includes("--activate");
+  let publication;
+  await transactModelOverlayMutation({
+    files: [PROVIDER_SELECTION_PATH],
+    mutate: () => setProviderSelectionForTargets(provider, desired, selected),
+    // Selection belongs to the shared router plane. Republish every installed
+    // client even when the initiating UI named only its own target.
+    applyPublication: async () => {
+      publication = await applyProviderSelectionForTargets(TARGETS, { activate });
+      return publication;
+    },
+  });
+  process.stderr.write(
+    `Set ${provider} ${desired} for: ${selected.join(", ")}. ` +
+      `Applied: ${publication.applied.join(", ") || "none"}. ` +
+      `Skipped (not active): ${publication.skipped.join(", ") || "none"}.\n`,
   );
 }
 
@@ -491,13 +651,45 @@ async function readSecretFromStdin() {
 
 async function saveProviderCredential(providerId) {
   const { providerOnboardingSnapshot, saveApiCredential } = await import("./provider-onboarding.mjs");
-  saveApiCredential(providerId, await readSecretFromStdin());
+  const value = await readSecretFromStdin();
+  // The control-center sends this command before it refreshes its provider
+  // snapshot. Keep credential persistence, selection, and target publication
+  // together so a concurrent remove cannot create an enabled credentialless
+  // provider between the child processes.
+  await withModelOverlayLock(async () => {
+    saveApiCredential(providerId, value);
+    const { enableProvider } = await import("./provider-selection.mjs");
+    enableProvider(providerId);
+    const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
+    refreshTargetPickerIfInstalled();
+    // The stored catalog is what the previous credential could see. A new key
+    // may be a different account with a different entitlement, so the next
+    // read has to come from the provider rather than from the old account's
+    // list. Removal drops the entry for the same reason.
+    const { forgetProviderCatalogCache } = await import("./model-catalog-cache.mjs");
+    forgetProviderCatalogCache(providerId);
+  });
   process.stdout.write(`${JSON.stringify(providerOnboardingSnapshot())}\n`);
 }
 
 async function deleteProviderCredential(providerId) {
   const { providerOnboardingSnapshot, removeApiCredential } = await import("./provider-onboarding.mjs");
-  const removal = removeApiCredential(providerId);
+  // Removing a managed credential also withdraws its provider selection. Keep
+  // that low-level write under the same cross-process lock as the picker and
+  // local-model mutations; status reads remain outside the lock.
+  let removal;
+  await withModelOverlayLock(async () => {
+    removal = removeApiCredential(providerId);
+    if (removal.removedFiles) {
+      const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
+      refreshTargetPickerIfInstalled();
+      // The cached catalog was what this credential could see. Another key may
+      // see a different one, so drop it rather than let a disconnected
+      // provider keep showing the previous account's model list.
+      const { forgetProviderCatalogCache } = await import("./model-catalog-cache.mjs");
+      forgetProviderCatalogCache(providerId);
+    }
+  });
   process.stdout.write(
     `${JSON.stringify({ ...providerOnboardingSnapshot(), removal })}\n`,
   );
@@ -692,6 +884,43 @@ async function setLoginFreeModel(slug) {
   process.stdout.write(result.stdout);
 }
 
+async function setRouterDefault(action, slug) {
+  if (!["set", "clear"].includes(action)) {
+    throw new Error("Usage: control router-default <set MODEL|clear>");
+  }
+  let value;
+  if (action === "set") {
+    value = String(slug || "").trim();
+    if (!value) throw new Error("Usage: control router-default set MODEL");
+    const { selectedConfiguredListedModels } = await import("./provider-selection.mjs");
+    if (!selectedConfiguredListedModels().some((model) => model.slug === value)) {
+      throw new Error(`${value} is not an enabled, authenticated external model.`);
+    }
+    const { modelPickerSnapshot } = await import("./model-picker-state.mjs");
+    const picker = modelPickerSnapshot();
+    const visible = picker.hasExplicitVisibility
+      ? picker.visible.includes(value)
+      : !picker.hidden.includes(value);
+    if (!visible) {
+      throw new Error(`${value} is not selected for the model picker. Show it before making it default.`);
+    }
+  }
+  const command = action === "set" ? "router-default-set" : "router-default-clear";
+  const result = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "src", "config-manager.mjs"), command, ...(value ? [value] : [])],
+    {
+      cwd: REPO_ROOT,
+      env: { ...process.env, MODEL_ROUTER_TARGET: "codex" },
+      encoding: "utf8",
+    },
+  );
+  if (result.status !== 0) {
+    throw new Error((result.stderr || "The Codex router default could not be changed.").trim());
+  }
+  process.stdout.write(result.stdout);
+}
+
 async function updateAndVerifyCodex() {
   const { runCodexMaintenance } = await import("./codex-maintenance.mjs");
   process.stdout.write(`${JSON.stringify(runCodexMaintenance())}\n`);
@@ -738,33 +967,19 @@ function runDoctor(args) {
   process.stdout.write(`${JSON.stringify({ ok: true })}\n`);
 }
 
-function refreshModelSettingsCatalog({ routes = false } = {}) {
-  // The catalog decides what Codex offers; the gateway config decides what it
-  // can route. A change that adds or removes models has to write both, or the
-  // picker advertises a model whose request has nowhere to go -- the exact
-  // drift doctor's "Catalog matches gateway routes" check exists to catch.
-  if (routes) {
-    const rendered = spawnSync(
-      process.execPath,
-      ["-e", "import('./src/litellm-config.mjs').then((m) => m.writeLiteLlmConfig())"],
-      { cwd: REPO_ROOT, env: { ...process.env, MODEL_ROUTER_TARGET: "codex" }, stdio: "ignore" },
-    );
-    if (rendered.status !== 0) {
-      throw new Error("The gateway routing config could not be refreshed.");
-    }
-  }
-  const result = spawnSync(
-    process.execPath,
-    [path.join(REPO_ROOT, "src", "catalog.mjs")],
-    {
-      cwd: REPO_ROOT,
-      env: { ...process.env, MODEL_ROUTER_TARGET: "codex" },
-      stdio: "ignore",
-    },
-  );
-  if (result.status !== 0) {
+function refreshModelSettingsCatalog() {
+  // The router owns the model policy.  Rebuilding only merged-models.json
+  // leaves a published DSH route with the previous picker state (and makes
+  // Gemini look different again at its next process start).  The target
+  // integration helper refreshes every installed client from this same state,
+  // while preserving the Codex-only native catalog capture where applicable.
+  try {
+    return refreshTargetPickerIfInstalled();
+  } catch (error) {
     throw new Error(
-      (result.stderr || "The model settings catalog could not be refreshed.").trim(),
+      error instanceof Error
+        ? error.message
+        : "The router model catalogs could not be refreshed.",
     );
   }
 }
@@ -782,18 +997,15 @@ async function restartRouterForLocalRoutes() {
 }
 
 async function finalizeLocalModelPublication() {
-  const warnings = {};
-  try {
-    refreshModelSettingsCatalog({ routes: true });
-  } catch (error) {
-    warnings.catalogError = error instanceof Error ? error.message : String(error);
-  }
-  try {
-    await restartRouterForLocalRoutes();
-  } catch (error) {
-    warnings.restartError = error instanceof Error ? error.message : String(error);
-  }
-  return warnings;
+  // Finalization runs in a separate process after a detached uninstall worker
+  // has removed the weights. It still needs the same lock as a full mutation,
+  // or it could publish a snapshot between another operation's state write and
+  // its catalog publication.
+  return withModelOverlayLock(() => applyModelOverlayPublication({
+    warningOnly: true,
+    restart: true,
+    restartService: restartRouterForLocalRoutes,
+  }));
 }
 
 // What this model says it supports, read from the merged catalog Codex reads
@@ -831,6 +1043,21 @@ async function knownModelSlug(slug) {
   return MODEL_BY_SLUG.has(slug);
 }
 
+async function nativeCodexBaseSlugs() {
+  const { NATIVE_CATALOG_PATH } = await import("./paths.mjs");
+  if (!existsSync(NATIVE_CATALOG_PATH)) return new Set();
+  try {
+    const parsed = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));
+    return new Set(
+      (Array.isArray(parsed.models) ? parsed.models : [])
+        .map((model) => String(model?.slug || ""))
+        .filter(Boolean),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
 async function handleSubagents(action, value, flag, rest = []) {
   const {
     replaceMultiAgentState,
@@ -848,13 +1075,17 @@ async function handleSubagents(action, value, flag, rest = []) {
     replaceMultiAgentState({ mode: "all", enabled: [], disabled: [] });
   } else if (action === "unselect-all") {
     const { selectedConfiguredListedModels } = await import("./provider-selection.mjs");
-    const { readHiddenModels } = await import("./model-picker-state.mjs");
+    const { modelPickerSnapshot } = await import("./model-picker-state.mjs");
     const { NATIVE_CATALOG_PATH } = await import("./paths.mjs");
-    const hidden = readHiddenModels();
+    const picker = modelPickerSnapshot();
+    const hidden = new Set(picker.hidden);
+    const visible = new Set(picker.visible);
     const visibleModels = [
       ...nativeCodexModels(NATIVE_CATALOG_PATH, hidden).map((model) => model.slug),
       ...selectedConfiguredListedModels()
-        .filter((model) => !hidden.has(model.slug))
+        .filter((model) => !hidden.has(model.slug) && (
+          !picker.hasExplicitVisibility || visible.has(model.slug)
+        ))
         .map((model) => model.slug),
     ];
     replaceMultiAgentState({
@@ -944,9 +1175,80 @@ async function handleSubagents(action, value, flag, rest = []) {
   process.stdout.write(`${JSON.stringify(subagentSettingsSnapshot())}\n`);
 }
 
-async function handleToolResultAging(action, nativeAction) {
+const TOOL_RESULT_AGING_USAGE =
+  "Usage: control tool-result-aging status|on|off|native <on|off>|ttl <days|off|default>|" +
+  "purge [--yes] [--dry-run] [--expired]";
+
+// Emptying the store deletes the only copy of bytes the model already saw, so
+// the default is the report and not the deletion: an invocation without --yes
+// says exactly what it would remove and removes nothing. --dry-run says the
+// same thing on purpose rather than by omission, and outranks --yes so a
+// wrapper that always passes consent can still preview.
+//
+// --expired removes only what the TTL has outlived. The store expires on the
+// next write to it, so this is the same sweep run by hand: it is what an
+// operator uses to reclaim a store that filled before the TTL existed, or one
+// on an install where compaction is off and nothing is going to write again.
+async function handleToolResultAgingPurge(flags) {
+  const {
+    describeRetentionAge,
+    describeRetentionTtl,
+    expireRetainedToolResults,
+    formatRetentionBytes,
+    purgeRetainedToolResults,
+  } = await import("./tool-result-retention.mjs");
+  const { retentionTtlMs } = await import("./tool-result-aging-state.mjs");
+  const requested = new Set(flags);
+  const previewOnly = requested.has("--dry-run") || !(requested.has("--yes") || requested.has("-y"));
+  const expiredOnly = requested.has("--expired");
+  const ttlMs = retentionTtlMs();
+  if (expiredOnly && ttlMs === 0) {
+    throw new Error(
+      "Retained tool results have no TTL: this install was told to keep them. " +
+        "Set one with ./bin/control tool-result-aging ttl <days>, or purge without --expired.",
+    );
+  }
+  const result = expiredOnly
+    ? expireRetainedToolResults({ dryRun: previewOnly, ttlMs })
+    : purgeRetainedToolResults({ dryRun: previewOnly });
+  const age =
+    result.oldestAgeMs === undefined ? "" : `, oldest ${describeRetentionAge(result.oldestAgeMs)} old`;
+  const scope = expiredOnly ? ` older than ${describeRetentionTtl(ttlMs)}` : "";
+  if (!result.exists || result.files === 0) {
+    process.stderr.write(`No retained tool results in ${result.path}; nothing to purge.\n`);
+  } else if (expiredOnly && result.expired === 0) {
+    process.stderr.write(
+      `Nothing in ${result.path} is older than ${describeRetentionTtl(ttlMs)}` +
+        ` (${result.results} retained result(s)${age}); nothing to purge.\n`,
+    );
+  } else if (previewOnly) {
+    process.stderr.write(
+      `Would remove ${result.removed} file(s)${scope} ` +
+        `(${result.results} retained result(s)${age}) ` +
+        `and reclaim ${formatRetentionBytes(result.reclaimedBytes)} from ${result.path}.\n` +
+        `Nothing was deleted. Re-run with --yes to empty it: ` +
+        `./bin/control tool-result-aging purge${expiredOnly ? " --expired" : ""} --yes\n`,
+    );
+  } else {
+    process.stderr.write(
+      `Removed ${result.removed} file(s)${scope} and reclaimed ` +
+        `${formatRetentionBytes(result.reclaimedBytes)} from ${result.path}.\n`,
+    );
+  }
+  if (result.foreign.length) {
+    process.stderr.write(
+      `Left ${result.foreign.length} entry/entries this store did not write in place: ` +
+        `${result.foreign.slice(0, 5).join(", ")}\n`,
+    );
+  }
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  if (result.failed.length) process.exitCode = 1;
+}
+
+async function handleToolResultAging(action, nativeAction, flags = []) {
   const {
     setNativeToolResultAgingEnabled,
+    setRetentionTtlDays,
     setToolResultAgingEnabled,
     toolResultAgingSnapshot,
   } = await import("./tool-result-aging-state.mjs");
@@ -955,16 +1257,36 @@ async function handleToolResultAging(action, nativeAction) {
     process.stdout.write(`${JSON.stringify(toolResultAgingSnapshot())}\n`);
     return;
   }
+  if (desired === "purge") {
+    await handleToolResultAgingPurge(flags);
+    return;
+  }
+  // How long a retained original lives. `off` is a real answer and is kept
+  // verbatim -- an operator who wants the archive keeps it -- while `default`
+  // clears the answer so a later release's number applies again.
+  if (desired === "ttl") {
+    const requested = String(nativeAction ?? "").trim();
+    if (!requested) throw new Error(TOOL_RESULT_AGING_USAGE);
+    if (requested === "default") {
+      setRetentionTtlDays(undefined);
+    } else if (requested === "off" || requested === "never") {
+      setRetentionTtlDays(0);
+    } else {
+      setRetentionTtlDays(requested.replace(/d$/u, ""));
+    }
+    process.stdout.write(`${JSON.stringify(toolResultAgingSnapshot())}\n`);
+    return;
+  }
   if (desired === "native") {
     if (nativeAction !== "on" && nativeAction !== "off") {
-      throw new Error("Usage: control tool-result-aging status|on|off|native <on|off>");
+      throw new Error(TOOL_RESULT_AGING_USAGE);
     }
     setNativeToolResultAgingEnabled(nativeAction === "on");
     process.stdout.write(`${JSON.stringify(toolResultAgingSnapshot())}\n`);
     return;
   }
   if (desired !== "on" && desired !== "off") {
-    throw new Error("Usage: control tool-result-aging status|on|off|native <on|off>");
+    throw new Error(TOOL_RESULT_AGING_USAGE);
   }
   setToolResultAgingEnabled(desired === "on");
   process.stdout.write(`${JSON.stringify(toolResultAgingSnapshot())}\n`);
@@ -1083,6 +1405,7 @@ async function handleVisionBridge(action, value, extra) {
     setVisionBridgeEngine,
     setVisionBridgeLocal,
     visionBridgeSnapshot,
+    VISION_BRIDGE_STATE_PATH,
     VISION_EFFORT_LEVELS,
   } = await import("./vision-bridge-state.mjs");
   const {
@@ -1151,35 +1474,63 @@ async function handleVisionBridge(action, value, extra) {
     if (!ollamaAvailable()) {
       throw new Error(`Ollama is not installed. ${ollamaInstallMessage()}`);
     }
-    const { readVisionDownload, writeVisionDownload } = await import(
-      "./vision-download.mjs"
-    );
-    const active = readVisionDownload();
-    if (active?.status === "downloading" && active.tag !== tag) {
-      throw new Error(`${active.tag} is already downloading (${active.percent || 0}%).`);
+    const {
+      activeVisionDownloadResult,
+      claimVisionDownloadStart,
+      readVisionDownload,
+      writeVisionDownload,
+    } = await import("./vision-download.mjs");
+    const claim = claimVisionDownloadStart();
+    if (!claim.acquired) {
+      const existing = activeVisionDownloadResult(readVisionDownload(), tag);
+      if (existing) {
+        process.stdout.write(`${JSON.stringify(existing)}\n`);
+        return;
+      }
+      throw new Error("Another vision model download is starting. Try again shortly.");
     }
-    // Seeded here rather than in the worker so a poll that lands before the
-    // child has started still sees the download, not a stale previous run.
-    writeVisionDownload({
-      version: 1,
-      tag,
-      status: "downloading",
-      detail: "starting",
-      percent: 0,
-      startedAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-    const child = spawn(
-      process.execPath,
-      [path.join(REPO_ROOT, "src", "vision-download.mjs"), tag],
-      // windowsHide matters more here than anywhere else: a detached child
-      // gets its own console on Windows, and this one lives for the length of
-      // a multi-gigabyte pull. The local-model worker below already hides.
-      { detached: true, stdio: "ignore", windowsHide: true },
-    );
-    child.unref();
-    process.stdout.write(`${JSON.stringify({ started: true, tag })}\n`);
-    return;
+    try {
+      const existing = activeVisionDownloadResult(readVisionDownload(), tag);
+      if (existing) {
+        process.stdout.write(`${JSON.stringify(existing)}\n`);
+        return;
+      }
+      // Seeded here rather than in the worker so a poll that lands before the
+      // child has started still sees the download, not a stale previous run.
+      writeVisionDownload({
+        version: 1,
+        tag,
+        status: "downloading",
+        detail: "starting",
+        percent: 0,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        controllerPid: process.pid,
+        workerPid: null,
+      });
+      const child = spawn(
+        process.execPath,
+        [path.join(REPO_ROOT, "src", "vision-download.mjs"), tag],
+        // windowsHide matters more here than anywhere else: a detached child
+        // gets its own console on Windows, and this one lives for the length of
+        // a multi-gigabyte pull. The local-model worker below already hides.
+        { detached: true, stdio: "ignore", windowsHide: true },
+      );
+      child.unref();
+      const workerState = readVisionDownload({ persist: false });
+      if (workerState?.status === "downloading" && workerState.tag === tag) {
+        writeVisionDownload({
+          ...workerState,
+          controllerPid: null,
+          workerPid: child.pid,
+          updatedAt: Date.now(),
+        });
+      }
+      process.stdout.write(`${JSON.stringify({ started: true, tag })}\n`);
+      return;
+    } finally {
+      claim.release();
+    }
   }
   if (action === "benchmark") {
     // Measures an installed model against the checked-in ground-truth image and
@@ -1215,13 +1566,16 @@ async function handleVisionBridge(action, value, extra) {
     // running runtime is pinned outright; a needed pull requires --yes; and a
     // missing runtime prints one install line rather than installing it.
     const consent = value === "--yes" || value === "-y" || extra === "--yes";
-    await runVisionBridgeSetup({ consent });
-    refreshModelSettingsCatalog();
+    await transactModelOverlayMutation({
+      files: [VISION_BRIDGE_STATE_PATH],
+      mutate: () => runVisionBridgeSetup({ consent }),
+    });
     process.stdout.write(`${JSON.stringify(snapshot())}\n`);
     return;
   }
+  let mutate;
   if (action === "on" || action === "off") {
-    setVisionBridgeEnabled(action === "on");
+    mutate = () => setVisionBridgeEnabled(action === "on");
   } else if (action === "local") {
     // control vision-bridge local [model] [baseUrl] -- pins a local model and
     // turns the bridge on in the same step. With no model, the machine picks
@@ -1241,8 +1595,10 @@ async function handleVisionBridge(action, value, extra) {
           `${suggestion.needsPull ? ` — run: ${suggestion.pullCommand}` : " — already pulled"}\n`,
       );
     }
-    setVisionBridgeLocal({ model, baseUrl });
-    setVisionBridgeEnabled(true);
+    mutate = () => {
+      setVisionBridgeLocal({ model, baseUrl });
+      setVisionBridgeEnabled(true);
+    };
   } else if (action === "engine") {
     const slug = String(value || "").trim();
     if (slug && slug !== "auto" && slug !== LOCAL_ENGINE_SLUG) {
@@ -1261,20 +1617,30 @@ async function handleVisionBridge(action, value, extra) {
         );
       }
     }
-    setVisionBridgeEngine(slug && slug !== "auto" ? slug : null);
+    const engine = slug && slug !== "auto" ? slug : null;
+    const effort = extra === undefined
+      ? undefined
+      : effortArgument(extra, VISION_EFFORT_LEVELS);
     // The tray picks an engine and a level in one click, so the level rides
     // along here. Left out, whatever was pinned before stays pinned.
-    if (extra !== undefined) setVisionBridgeEffort(effortArgument(extra, VISION_EFFORT_LEVELS));
+    mutate = () => {
+      setVisionBridgeEngine(engine);
+      if (effort !== undefined) setVisionBridgeEffort(effort);
+    };
   } else if (action === "effort") {
-    setVisionBridgeEffort(effortArgument(value, VISION_EFFORT_LEVELS));
+    const effort = effortArgument(value, VISION_EFFORT_LEVELS);
+    mutate = () => setVisionBridgeEffort(effort);
   } else {
     throw new Error(
       "Usage: control vision-bridge status|probe|models|setup [--yes]|on|off|" +
         "engine <model-slug|local|auto> [effort]|effort <level|default>|" +
-        "local [model] [baseUrl]|pull <model-tag>",
+      "local [model] [baseUrl]|pull <model-tag>",
     );
   }
-  refreshModelSettingsCatalog();
+  await transactModelOverlayMutation({
+    files: [VISION_BRIDGE_STATE_PATH],
+    mutate,
+  });
   process.stdout.write(`${JSON.stringify(snapshot())}\n`);
 }
 
@@ -1291,8 +1657,8 @@ async function handleLocalModels(action, value, ...rest) {
   const positional = options.find((item) => !item.startsWith("--"));
   const {
     isLocalModelEnabled,
+    LOCAL_MODELS_STATE_PATH,
     localModelsSnapshot,
-    removeLocalModel,
     setLocalModelEnabled,
   } = await import("./local-models.mjs");
   const { readBenchmarkResults } = await import("./vision-benchmark.mjs");
@@ -1308,10 +1674,15 @@ async function handleLocalModels(action, value, ...rest) {
   // HTTP call with a short timeout, so an LM Studio that is simply off costs
   // the snapshot a bounded wait, not an error.
   const { lmstudioSnapshot } = await import("./lmstudio-models.mjs");
-  const snapshot = async () => ({
-    ...localModelsSnapshot({ benchmarks: localAndVisionBenchmarks }),
-    lmstudio: await lmstudioSnapshot(),
-  });
+  const { localMlxUiSnapshot } = await import("./local-mlx-operation.mjs");
+  const snapshot = async () => {
+    const [lmstudio, mlx] = await Promise.all([lmstudioSnapshot(), localMlxUiSnapshot()]);
+    return {
+      ...localModelsSnapshot({ benchmarks: localAndVisionBenchmarks }),
+      lmstudio,
+      mlx,
+    };
+  };
   if (action === "list" || action === "status" || !action) {
     const current = await snapshot();
     // The tray and any script read JSON; a person at a terminal was handed a
@@ -1415,6 +1786,21 @@ async function handleLocalModels(action, value, ...rest) {
     process.stdout.write(`${JSON.stringify(result)}\n`);
     return;
   }
+  if (action === "mlx-status") {
+    process.stdout.write(`${JSON.stringify(await localMlxUiSnapshot())}\n`);
+    return;
+  }
+  if (action === "mlx-install") {
+    const { startLocalMlxOperation } = await import("./local-mlx-operation.mjs");
+    const result = startLocalMlxOperation({ yes: value === "--yes" || flags.has("--yes") });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return;
+  }
+  if (action === "mlx-cancel") {
+    const { cancelLocalMlxOperation } = await import("./local-mlx-operation.mjs");
+    process.stdout.write(`${JSON.stringify(cancelLocalMlxOperation())}\n`);
+    return;
+  }
   if (action === "cancel") {
     const { cancelLocalDownload } = await import("./local-download.mjs");
     const result = cancelLocalDownload(value);
@@ -1475,6 +1861,13 @@ async function handleLocalModels(action, value, ...rest) {
     // installation. The tray may refresh while either one is in progress, and
     // the operator should still see that the click was accepted.
     try {
+      const { isLocalMlxOperationActive, readLocalMlxOperation } = await import(
+        "./local-mlx-operation.mjs"
+      );
+      const mlxOperation = readLocalMlxOperation();
+      if (isLocalMlxOperationActive(mlxOperation)) {
+        throw new Error(`The curated MLX model is already ${mlxOperation.status}.`);
+      }
       const active = readLocalDownload();
       if (isLocalOperationActive(active) && active.tag !== tag) {
         throw new Error(
@@ -1610,6 +2003,9 @@ async function handleLocalModels(action, value, ...rest) {
   if (action === "uninstall") {
     const rawTag = String(value || "").trim();
     if (!rawTag) throw new Error("Usage: control local-models uninstall <model-tag> --yes");
+    if (!flags.has("--yes")) {
+      throw new Error(`Removing ${rawTag} deletes it from disk. Pass --yes to confirm.`);
+    }
     const { normalizeLocalModelTag } = await import("./local-model-ref.mjs");
     const tag = normalizeLocalModelTag(rawTag);
     const {
@@ -1634,6 +2030,13 @@ async function handleLocalModels(action, value, ...rest) {
       throw new Error("Another local model operation is starting. Try again shortly.");
     }
     try {
+    const { isLocalMlxOperationActive, readLocalMlxOperation } = await import(
+      "./local-mlx-operation.mjs"
+    );
+    const mlxOperation = readLocalMlxOperation();
+    if (isLocalMlxOperationActive(mlxOperation)) {
+      throw new Error(`The curated MLX model is already ${mlxOperation.status}.`);
+    }
     const active = readLocalDownload();
     if (isLocalOperationActive(active) && active.tag !== tag) {
       throw new Error(
@@ -1693,7 +2096,10 @@ async function handleLocalModels(action, value, ...rest) {
       process.stdout.write(`${JSON.stringify({ started: true, tag, kind: "uninstall" })}\n`);
       return;
     }
-    removeLocalModel(tag, { confirmed: flags.has("--yes") || value === "--yes" });
+    const { uninstallLocalModelTransaction } = await import("./local-uninstall.mjs");
+    await uninstallLocalModelTransaction(tag, {
+      restartService: restartRouterForLocalRoutes,
+    });
     const warnings = await finalizeLocalModelPublication();
     const finishedAt = Date.now();
     writeLocalDownload({
@@ -1726,10 +2132,18 @@ async function handleLocalModels(action, value, ...rest) {
     // Compared across spellings: the downloader stores `gemma3:latest` and a
     // hand-typed `gemma3` is the same model, so a raw string match here would
     // skip the router restart that publishes the route change.
-    const wasEnabled = isLocalModelEnabled(value);
-    setLocalModelEnabled(value, enabled);
-    refreshModelSettingsCatalog({ routes: true });
-    if (wasEnabled !== enabled) await restartRouterForLocalRoutes();
+    await transactModelOverlayMutation({
+      files: [
+        LOCAL_MODELS_STATE_PATH,
+        USER_MODELS_PATH,
+        PROVIDER_SELECTION_PATH,
+      ],
+      mutate: () => setLocalModelEnabled(value, enabled),
+      // Evaluated after the transaction lock is held, so a queued toggle does
+      // not make its restart decision from a stale pre-lock read.
+      restart: () => isLocalModelEnabled(value) !== enabled,
+      restartService: restartRouterForLocalRoutes,
+    });
   } else if (action === "lmstudio-set") {
     if (!["on", "off"].includes(positional)) {
       throw new Error("Usage: control local-models lmstudio-set <model-id> <on|off>");
@@ -1741,15 +2155,18 @@ async function handleLocalModels(action, value, ...rest) {
       "./lmstudio-models.mjs"
     );
     const enabled = positional === "on";
-    const wasEnabled = isLmstudioModelEnabled(value);
-    setLmstudioModelEnabled(value, enabled);
-    refreshModelSettingsCatalog({ routes: true });
-    if (wasEnabled !== enabled) await restartRouterForLocalRoutes();
+    await transactModelOverlayMutation({
+      files: [USER_MODELS_PATH, PROVIDER_SELECTION_PATH],
+      mutate: () => setLmstudioModelEnabled(value, enabled),
+      restart: () => isLmstudioModelEnabled(value) !== enabled,
+      restartService: restartRouterForLocalRoutes,
+    });
   } else {
     throw new Error(
       "Usage: control local-models list [--json]|inspect <tag-or-url>|" +
         "install <tag-or-url> [--yes] [--force]|benchmark <tag>|" +
         "runtime status|runtime start [--yes]|runtime update --yes|" +
+        "mlx-install --yes|mlx-status|mlx-cancel|" +
         "uninstall <tag> --yes|cancel [<tag>]|set <tag> <on|off>|" +
         "lmstudio-set <id> <on|off>\n" +
         "  --yes    consent to installing/starting Ollama itself (headless)\n" +
@@ -1770,63 +2187,84 @@ async function handlePicker(action, value, flag) {
     process.stdout.write(`${JSON.stringify(modelPickerSnapshot())}\n`);
     return;
   }
-  if (action === "all") {
-    if (!["show", "hide"].includes(flag)) {
-      throw new Error("Usage: control picker all <show|hide>");
-    }
-    const { MERGED_CATALOG_PATH } = await import("./paths.mjs");
-    const parsed = JSON.parse(readFileSync(MERGED_CATALOG_PATH, "utf8"));
-    const slugs = Array.isArray(parsed.models)
-      ? parsed.models.map((model) => String(model.slug))
-      : [];
-    setAllModelsVisible(slugs, flag === "show");
-  } else if (action === "set") {
-    if (!["show", "hide"].includes(flag)) {
-      throw new Error("Usage: control picker set <model-slug> <show|hide>");
-    }
-    if (!(await knownModelSlug(value))) {
-      throw new Error(`Unknown model slug: ${value}`);
-    }
-    setModelVisible(value, flag === "show");
-  } else if (action === "provider") {
-    if (!["show", "hide"].includes(flag)) {
-      throw new Error("Usage: control picker provider <provider-id> <show|hide>");
-    }
-    const provider = String(value || "").trim();
-    let slugs;
-    if (provider === "openai") {
-      const { NATIVE_CATALOG_PATH } = await import("./paths.mjs");
-      const parsed = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));
-      slugs = Array.isArray(parsed.models)
-        ? parsed.models
-            .filter((model) => model.visibility === "list")
-            .map((model) => String(model.slug))
-        : [];
+  await withModelOverlayLock(async () => {
+    const nativeBaseSlugs = await nativeCodexBaseSlugs();
+    if (action === "all") {
+      if (!["show", "hide"].includes(flag)) {
+        throw new Error("Usage: control picker all <show|hide>");
+      }
+      // Do not use only merged-models.json here. That file belongs to the
+      // Codex adapter and may not exist on a DSH/Gemini-only installation;
+      // the router's selected registry plus the captured native catalog is
+      // the complete local policy surface for every installed client.
+      const { MERGED_CATALOG_PATH } = await import("./paths.mjs");
+      const { selectedConfiguredListedModels } = await import("./provider-selection.mjs");
+      const slugs = new Set(selectedConfiguredListedModels().map((model) => String(model.slug)));
+      // The router owns routed models; Codex owns its native picker entries.
+      // Keep routed aliases/context variants from the last publication so a
+      // refresh cannot lose a model merely because its native capture is
+      // temporarily unavailable.
+      if (existsSync(MERGED_CATALOG_PATH)) {
+        try {
+          const parsed = JSON.parse(readFileSync(MERGED_CATALOG_PATH, "utf8"));
+          for (const model of Array.isArray(parsed?.models) ? parsed.models : []) {
+            if (model?.slug && !nativeBaseSlugs.has(String(model.slug))) {
+              slugs.add(String(model.slug));
+            }
+          }
+        } catch {
+          // The next publication will repair the merged catalog. The shared
+          // router model set above is still enough to persist this mutation.
+        }
+      }
+      setAllModelsVisible([...slugs], flag === "show");
+    } else if (action === "set") {
+      if (!["show", "hide"].includes(flag)) {
+        throw new Error("Usage: control picker set <model-slug> <show|hide>");
+      }
+      if (!(await knownModelSlug(value))) {
+        throw new Error(`Unknown model slug: ${value}`);
+      }
+      if (nativeBaseSlugs.has(String(value))) {
+        throw new Error(
+          "Native Codex model visibility is managed by Codex and is not part of the router picker overlay.",
+        );
+      }
+      setModelVisible(value, flag === "show");
+    } else if (action === "provider") {
+      if (!["show", "hide"].includes(flag)) {
+        throw new Error("Usage: control picker provider <provider-id> <show|hide>");
+      }
+      const provider = String(value || "").trim();
+      let slugs;
+      if (provider === "openai") {
+        throw new Error(
+          "Native Codex model visibility is managed by Codex and is not part of the router picker overlay.",
+        );
+      } else {
+        const { canonicalProviderId, selectedConfiguredListedModels } = await import(
+          "./provider-selection.mjs",
+        );
+        const canonical = canonicalProviderId(provider);
+        slugs = selectedConfiguredListedModels()
+          .filter((model) => canonicalProviderId(model.provider) === canonical)
+          .map((model) => model.slug);
+      }
+      if (slugs.length === 0) {
+        throw new Error(`No enabled models found for provider: ${value}`);
+      }
+      setModelsVisible(slugs, flag === "show");
     } else {
-      const { canonicalProviderId, readProviderSelection } = await import(
-        "./provider-selection.mjs"
+      throw new Error(
+        "Usage: control picker status|all <show|hide>|set <model-slug> <show|hide>|" +
+          "provider <provider-id> <show|hide>",
       );
-      const { LISTED_MODELS } = await import("./model-registry.mjs");
-      const canonical = canonicalProviderId(provider);
-      const selected = new Set(readProviderSelection());
-      slugs = LISTED_MODELS
-        .filter(
-          (model) =>
-            selected.has(model.provider) && canonicalProviderId(model.provider) === canonical,
-        )
-        .map((model) => model.slug);
     }
-    if (slugs.length === 0) {
-      throw new Error(`No enabled models found for provider: ${value}`);
-    }
-    setModelsVisible(slugs, flag === "show");
-  } else {
-    throw new Error(
-      "Usage: control picker status|all <show|hide>|set <model-slug> <show|hide>|" +
-        "provider <provider-id> <show|hide>",
-    );
-  }
-  refreshModelSettingsCatalog();
+    // The write above is the router's durable source of truth. Publish it to
+    // Codex, DSH, and Gemini while the same model-overlay lock is held so a
+    // second command cannot race a client snapshot between the two steps.
+    refreshModelSettingsCatalog();
+  });
   process.stdout.write(`${JSON.stringify(modelPickerSnapshot())}\n`);
 }
 
@@ -1990,6 +2428,62 @@ async function handlePresence(action, value) {
   process.stdout.write(`${JSON.stringify(setPresenceMode(value))}\n`);
 }
 
+// The public `/health` leaf intentionally contains only the router summary and
+// a closed set of degraded dependency names. Desktop surfaces need the richer
+// local service view, but should not be handed the forwarders' credential
+// metadata. Read the protected health leaf here, then project it to the small
+// contract the tray and Control Center render.
+async function printHealth() {
+  const { assertCallerSecret, callerBaseUrl } = await import("./caller-auth.mjs");
+  let callerSecret;
+  try {
+    callerSecret = assertCallerSecret(readFileSync(CALLER_SECRET_PATH, "utf8").trim());
+  } catch {
+    process.stdout.write(`${JSON.stringify({
+      ok: false,
+      status: 0,
+      error: "The local router caller key is unavailable.",
+      activity: { state: "offline", active: [], activeCount: 0 },
+    })}\n`);
+    return;
+  }
+
+  const safeService = (service) => {
+    if (!service || typeof service !== "object") return undefined;
+    return {
+      reachable: service.reachable === true,
+      ...(typeof service.enabled === "boolean" ? { enabled: service.enabled } : {}),
+    };
+  };
+  try {
+    const response = await fetch(`${callerBaseUrl(PORTS.router, callerSecret)}/health`, {
+      headers: { Accept: "application/json" },
+      signal: AbortSignal.timeout(3_000),
+    });
+    const raw = await response.json().catch(() => ({}));
+    const body = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+    process.stdout.write(`${JSON.stringify({
+      ok: response.ok,
+      status: response.status,
+      ...(typeof body.service === "string" ? { service: body.service } : {}),
+      ...(typeof body.version === "string" ? { version: body.version } : {}),
+      ...(typeof body.router === "string" ? { router: body.router } : {}),
+      ...(Array.isArray(body.degraded) ? { degraded: body.degraded } : {}),
+      ...(body.activity && typeof body.activity === "object" ? { activity: body.activity } : {}),
+      ...(safeService(body.gateway) ? { gateway: safeService(body.gateway) } : {}),
+      ...(safeService(body.oauth) ? { oauth: safeService(body.oauth) } : {}),
+      ...(safeService(body.api) ? { api: safeService(body.api) } : {}),
+    })}\n`);
+  } catch (error) {
+    process.stdout.write(`${JSON.stringify({
+      ok: false,
+      status: 0,
+      error: error?.name === "AbortError" ? "Health check timed out." : "Router is unreachable.",
+      activity: { state: "offline", active: [], activeCount: 0 },
+    })}\n`);
+  }
+}
+
 // --- dispatch ---------------------------------------------------------------
 
 if (args.includes("--probe")) {
@@ -1999,6 +2493,11 @@ if (args.includes("--probe")) {
 } else if (args[0] === "set") {
   if (!args[1] || !args[2]) throw new Error("Usage: control set <provider> <on|off> [--targets ...]");
   await runSet(args[1], args[2]);
+} else if (args[0] === "set-apply") {
+  if (!args[1] || !args[2]) {
+    throw new Error("Usage: control set-apply <provider> <on|off> [--targets ...] [--activate]");
+  }
+  await runSetApply(args[1], args[2]);
 } else if (args[0] === "apply") {
   await runApply();
 } else if (args[0] === "account") {
@@ -2026,10 +2525,12 @@ if (args.includes("--probe")) {
   await setSignedRouting(args[1]);
 } else if (args[0] === "model-set") {
   await setLoginFreeModel(args[1]);
+} else if (args[0] === "router-default") {
+  await setRouterDefault(args[1], args[2]);
 } else if (args[0] === "subagents") {
   await handleSubagents(args[1], args[2], args[3], args.slice(2));
 } else if (args[0] === "tool-result-aging") {
-  await handleToolResultAging(args[1], args[2]);
+  await handleToolResultAging(args[1], args[2], args.slice(2));
 } else if (args[0] === "local-models") {
   await handleLocalModels(args[1], args[2], ...args.slice(3));
 } else if (args[0] === "vision-bridge") {
@@ -2048,6 +2549,8 @@ if (args.includes("--probe")) {
   await handleHarness(args[1]);
 } else if (args[0] === "presence") {
   await handlePresence(args[1], args[2]);
+} else if (args[0] === "health") {
+  await printHealth();
 } else if (args[0] === "maintenance") {
   await updateAndVerifyCodex();
 } else if (args[0] === "doctor") {

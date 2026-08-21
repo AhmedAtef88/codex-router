@@ -2,11 +2,13 @@ import http from "node:http";
 
 import {
   applyKeepAliveTimeouts,
+  foldInterveningAssistantMessages,
   formatErrorChain,
   HOP_BY_HOP_HEADERS,
   httpErrorStatus,
   pipeResponse,
   readRequestBody,
+  reportListenFailure,
   requireInternalAuth,
   writeJson,
 } from "./http-utils.mjs";
@@ -47,46 +49,6 @@ const QUIET =
     (process.env.CODEX_ROUTER_QUIET === "1" || process.env.KIMI_PROXY_QUIET === "1"));
 
 if (!INTERNAL_KEY) throw new Error("MODEL_ROUTER_INTERNAL_KEY is required.");
-
-function foldInterveningAssistantMessages(messages) {
-  if (!Array.isArray(messages)) return;
-  for (let index = 0; index < messages.length; index += 1) {
-    const callingMessage = messages[index];
-    const callIds = new Set(
-      Array.isArray(callingMessage?.tool_calls)
-        ? callingMessage.tool_calls.map((call) => call?.id).filter(Boolean)
-        : [],
-    );
-    if (callingMessage?.role !== "assistant" || callIds.size === 0) continue;
-    let cursor = index + 1;
-    const intervening = [];
-    while (
-      messages[cursor]?.role === "assistant" &&
-      !Array.isArray(messages[cursor]?.tool_calls)
-    ) {
-      intervening.push(messages[cursor]);
-      cursor += 1;
-    }
-    if (intervening.length === 0) continue;
-    const followingIds = new Set();
-    while (messages[cursor]?.role === "tool") {
-      if (messages[cursor]?.tool_call_id) followingIds.add(messages[cursor].tool_call_id);
-      cursor += 1;
-    }
-    if (![...callIds].every((id) => followingIds.has(id))) continue;
-    const text = [callingMessage, ...intervening]
-      .flatMap((message) => {
-        if (typeof message.content === "string") return [message.content];
-        if (!Array.isArray(message.content)) return [];
-        return message.content
-          .filter((part) => part?.type === "text" && typeof part.text === "string")
-          .map((part) => part.text);
-      })
-      .filter((value) => value.trim());
-    if (text.length) callingMessage.content = text.join("\n");
-    messages.splice(index + 1, intervening.length);
-  }
-}
 
 function normalizeKimiBody(buffer, contentType) {
   if (!buffer.length || !String(contentType || "").includes("application/json")) {
@@ -253,6 +215,7 @@ const server = http.createServer((request, response) => {
 });
 
 applyKeepAliveTimeouts(server);
+reportListenFailure(server, { label: "kimi-oauth", host: LISTEN_HOST, port: LISTEN_PORT });
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.error("[kimi-oauth] listening");
 });

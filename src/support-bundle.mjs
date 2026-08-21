@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 
 import { redactCallerUrl } from "./caller-auth.mjs";
 import { readInstallManifest } from "./install-manifest.mjs";
+import { redactProxyCredentials } from "./proxy-environment.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
 import { detectLegacyInstallations } from "./legacy-migration.mjs";
 import { PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
@@ -24,7 +25,6 @@ import {
   SOURCE_ROOT,
   SUPPORT_DIR,
 } from "./paths.mjs";
-import { readCliSessionCredential } from "./cli-session-credential.mjs";
 import {
   credentialPaths,
   credentialStatus,
@@ -101,15 +101,25 @@ function knownLocalSecrets() {
     const value = readFileSync(target, "utf8").trim();
     if (value) values.add(value);
   }
-  // A key that arrived from a provider CLI's sign-in is just as sensitive as
-  // one stored here, and it lives in a file this bundle never reads, so it
-  // has to join the redaction set explicitly.
-  for (const provider of PROVIDERS.values()) {
-    if (provider.kind !== "openai-compatible") continue;
-    const session = readCliSessionCredential(provider);
-    if (session?.value) values.add(session.value);
-  }
   return [...values].filter((value) => value.length >= 8);
+}
+
+// The manifest records the proxy the service was installed with so a later
+// repair can restore it. That file is owner-only, but this bundle exists to be
+// handed to somebody else, and a proxy URL may carry `user:password@`. The
+// host and port stay -- they are the diagnostic value -- and only the
+// credential is removed, from past installs as well as the current one.
+function sharableInstallManifest() {
+  const manifest = readInstallManifest();
+  if (!manifest) return { installed: false };
+  const scrub = (entry) => (entry && entry.proxyEnvironment
+    ? { ...entry, proxyEnvironment: redactProxyCredentials(entry.proxyEnvironment) }
+    : entry);
+  return {
+    ...manifest,
+    current: scrub(manifest.current),
+    history: Array.isArray(manifest.history) ? manifest.history.map(scrub) : manifest.history,
+  };
 }
 
 function redactBundle(contents) {
@@ -173,7 +183,7 @@ export function createSupportBundle(options = {}) {
     selection,
     credentialSources,
     ownership: detectLegacyInstallations(),
-    install: readInstallManifest() || { installed: false },
+    install: sharableInstallManifest(),
     files: {
       config: fileMetadata(CONFIG_PATH),
       log: fileMetadata(LOG_PATH),

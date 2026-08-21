@@ -67,6 +67,17 @@ test("a retried turn's doubled prompt count is not evidence of capacity", () => 
     acceptedInputTokens(event("m", 900_000, { emptyCompletionRetried: true })),
     undefined,
   );
+  assert.equal(
+    acceptedInputTokens(event("m", 525_000, { progressOnlyRetried: true })),
+    undefined,
+  );
+  assert.equal(
+    acceptedInputTokens(
+      event("m", 262_500, { progressOnlyRetried: true, billedInputTokens: 525_000 }),
+    ),
+    262_500,
+  );
+  assert.equal(acceptedInputTokens(event("m", 900_000, { retries: 2 })), 900_000);
   assert.equal(acceptedInputTokens(event("m", 900_000)), 900_000);
   const drift = contextWindowDrift(MODELS, [
     event("qwen-plan/qwen3.8-max", 524_288, { emptyCompletionRetried: true }),

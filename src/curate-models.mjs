@@ -1,13 +1,23 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
 
 import { discoverProviderModels } from "./model-discovery.mjs";
 import { MODELS, PROVIDERS, USER_MODEL_WARNINGS } from "./model-registry.mjs";
-import { SOURCE_ROOT } from "./paths.mjs";
 import { confirm, promptLine } from "./setup-shared.mjs";
 import { toggleSelection } from "./setup-ui.mjs";
-import { readUserModels, userModelEntry, writeUserModels } from "./user-models.mjs";
+import {
+  DEFAULT_CONTEXT_WINDOW,
+  USER_MODELS_PATH,
+  readUserModels,
+  userModelEntry,
+  userModelIdentity,
+  writeUserModels,
+} from "./user-models.mjs";
+import {
+  applyModelOverlayPublication,
+  transactModelOverlayMutation,
+} from "./model-overlay-publication.mjs";
+import { MODEL_PICKER_STATE_PATH, setModelsVisible } from "./model-picker-state.mjs";
 
 // Interactive curation: list the provider's live models that are not part of
 // the checked-in registry, let the user toggle the ones they want, and persist
@@ -24,6 +34,8 @@ const removeOption = (() => {
 })();
 const apply = process.argv.includes("--apply");
 const noApply = process.argv.includes("--no-apply");
+const freeOnly = process.argv.includes("--free-only");
+const refreshCatalog = process.argv.includes("--refresh");
 const effortsOption = (() => {
   const index = process.argv.indexOf("--efforts");
   return index === -1 ? undefined : process.argv[index + 1];
@@ -57,10 +69,32 @@ const REQUEST_PROFILE_DESCRIPTIONS = {
     'reject a forced tool_choice ("required") while still calling tools under "auto"',
 };
 
+// Codex compacts at this fraction of the declared window.
+const AUTO_COMPACT_RATIO = 0.85;
+
+// The sizing to store for a context window, from the provider's catalog or from
+// the interactive prompt. Both have to derive `autoCompact` the same way: it is
+// the number Codex actually reads to decide when to summarize, and a window
+// stored without it keeps whatever the conservative default said.
+//
+// Guessing 131072 for a model the provider advertises at 1,050,000 does not
+// fail safe. The estimate the router substitutes when an upstream reports zero
+// prompt tokens errs high on purpose, so against an eight-times-too-small
+// threshold it lands above the compaction limit on turn after turn and the
+// session compacts forever without finishing anything (#266).
+export function curatedSizing(contextLength) {
+  if (!Number.isInteger(contextLength) || contextLength < 1) return undefined;
+  return {
+    contextWindow: contextLength,
+    autoCompact: Math.floor(contextLength * AUTO_COMPACT_RATIO),
+  };
+}
+
 function usage() {
   console.error(
     "Usage: curate-models.mjs PROVIDER [--models id1,id2 | interactive] " +
-      "[--remove id1,id2] [--apply|--no-apply] [--efforts minimal,low,medium,high,xhigh] " +
+      "[--free-only] [--remove id1,id2] [--refresh] [--apply|--no-apply] " +
+      "[--efforts minimal,low,medium,high,xhigh] " +
       `[--request-profile ${Object.keys(REQUEST_PROFILE_DESCRIPTIONS).join("|")}]`,
   );
   process.exit(2);
@@ -96,6 +130,28 @@ export function planCuration({ mine, chosen, removals, interactive }) {
     surviving,
     additions: chosenIds.filter((id) => !existingIds.has(id)),
   };
+}
+
+// Apply a prompt/discovery result to the document observed at commit time.
+// Unrelated providers are merged from that current document; replacing the
+// whole array from the pre-prompt read would lose a concurrent curation. The
+// same provider is intentionally compare-and-swap: its current entries may
+// contain a newer user's edit that this run cannot safely reconcile.
+export function mergeCurationIntoCurrent(
+  current,
+  { providerId, expectedMine, nextMine },
+) {
+  const models = Array.isArray(current) ? current : [];
+  const currentMine = models.filter((model) => model.provider === providerId);
+  if (JSON.stringify(currentMine) !== JSON.stringify(expectedMine)) {
+    throw new Error(
+      `Curated ${providerId} models changed while this command was running; review them and retry.`,
+    );
+  }
+  return [
+    ...models.filter((model) => model.provider !== providerId),
+    ...nextMine,
+  ];
 }
 
 export function parseEfforts(raw) {
@@ -174,35 +230,17 @@ function chooseInteractively(candidates, curated) {
   return [...selected].sort((a, b) => a - b).map((position) => candidates[position - 1]);
 }
 
-function applyInstall() {
-  const result =
-    process.platform === "win32"
-      ? spawnSync(
-          "powershell.exe",
-          [
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            path.join(SOURCE_ROOT, "install.ps1"),
-            "-CheckoutInstall",
-          ],
-          { stdio: "inherit" },
-        )
-      : spawnSync(path.join(SOURCE_ROOT, "bin", "install"), [], { stdio: "inherit" });
-  if (result.status !== 0) {
-    throw new Error("Applying the curated models did not finish; run the install command manually.");
-  }
-}
 
 async function main() {
   for (const warning of USER_MODEL_WARNINGS) console.error(warning);
   const existing = readUserModels();
   const mine = existing.filter((model) => model.provider === providerId);
-  const others = existing.filter((model) => model.provider !== providerId);
   const curated = new Set(mine.map((model) => model.upstreamModel));
   if (modelsOption !== undefined && removeOption !== undefined) {
     throw new Error("Use --models to add models or --remove to prune them, not both.");
+  }
+  if (freeOnly && (modelsOption !== undefined || removeOption !== undefined)) {
+    throw new Error("Use --free-only, --models, or --remove by itself.");
   }
   if (modelsOption !== undefined && (!modelsOption.trim() || modelsOption.startsWith("--"))) {
     throw new Error("--models requires at least one model id.");
@@ -224,10 +262,24 @@ async function main() {
 
   // Removing local curation must not depend on provider credentials or network
   // availability. Discovery is needed only for additions and the picker.
+  //
+  // Additions read the provider's cached list by default: it is the same list
+  // the caller chose from, and re-asking the provider makes every add pay for
+  // a network round trip it does not need. `--refresh` re-asks.
   const discovery = removeOption === undefined
-    ? await discoverProviderModels(providerId)
+    ? await discoverProviderModels(providerId, { refresh: refreshCatalog })
     : { unregistered: [] };
   const candidates = [...new Set([...discovery.unregistered, ...curated])].sort();
+
+  if (freeOnly && !Array.isArray(discovery.free)) {
+    throw new Error(`${provider.displayName} does not publish a supported free-model catalog.`);
+  }
+  const freeCandidates = freeOnly
+    ? discovery.free.filter((id) => candidates.includes(id))
+    : [];
+  if (freeOnly && freeCandidates.length === 0) {
+    throw new Error(`${provider.displayName} currently advertises no unregistered free OpenAI-compatible models.`);
+  }
 
   if (candidates.length === 0 && removeOption === undefined) {
     process.stdout.write(
@@ -236,9 +288,11 @@ async function main() {
     return;
   }
 
-  const interactiveSelection = modelsOption === undefined && removeOption === undefined;
+  const interactiveSelection = modelsOption === undefined && removeOption === undefined && !freeOnly;
   const chosen = modelsOption
     ? modelsOption.split(",").map((value) => value.trim()).filter(Boolean)
+    : freeOnly
+      ? freeCandidates
     : interactiveSelection
       ? chooseInteractively(candidates, curated)
       : [];
@@ -262,17 +316,26 @@ async function main() {
   const interactive = interactiveSelection && Boolean(process.stdin.isTTY);
 
   const metadataFor = (id) => {
-    const metadata = { ...(flagEfforts || {}) };
-    if (!interactive) return flagEfforts ? metadata : undefined;
+    const metadata = {
+      ...(flagEfforts || {}),
+      ...(discovery.free?.includes(id) ? { isFree: true } : {}),
+    };
+    // The provider already published this model's size; asking the user to
+    // retype it, or defaulting past it, is how a million-token model ends up
+    // stored as a 131K one. A catalog that said nothing still falls back.
+    const advertised = curatedSizing(discovery.contextLengths?.[id]);
+    if (advertised) Object.assign(metadata, advertised);
+    if (!interactive) return Object.keys(metadata).length > 0 ? metadata : undefined;
     process.stdout.write(`\nMetadata for ${id} (Enter keeps the default):\n`);
-    const rawContext = promptLine("  Context window in tokens [131072]").trim();
+    const suggested = advertised?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+    const rawContext = promptLine(
+      `  Context window in tokens [${suggested}${advertised ? ", advertised" : ""}]`,
+    ).trim();
     if (rawContext) {
       const context = Number.parseInt(rawContext, 10);
-      if (!Number.isInteger(context) || context < 1) {
-        throw new Error(`Invalid context window: ${rawContext}`);
-      }
-      metadata.contextWindow = context;
-      metadata.autoCompact = Math.floor(context * 0.85);
+      const sizing = curatedSizing(context);
+      if (!sizing) throw new Error(`Invalid context window: ${rawContext}`);
+      Object.assign(metadata, sizing);
     }
     if (confirm(`  Does ${id} accept image input?`)) {
       metadata.inputModalities = ["text", "image"];
@@ -306,10 +369,16 @@ async function main() {
       : undefined;
   };
 
+  // Older builds included OrcaRouter's moving free meta-router. A free-only
+  // refresh replaces it with the concrete free models the live catalog names,
+  // while preserving every paid model the operator curated separately.
+  const effectiveRemovals = freeOnly && curated.has("orcarouter/free")
+    ? [...removals, "orcarouter/free"]
+    : removals;
   const { surviving, additions } = planCuration({
     mine,
     chosen,
-    removals,
+    removals: effectiveRemovals,
     interactive: interactiveSelection,
   });
   const nextMine = [
@@ -326,25 +395,76 @@ async function main() {
         metadata,
       });
     }),
-  ];
-  const target = writeUserModels([...others, ...nextMine]);
+  ].map((model) => {
+    if (providerId !== "orca" || !discovery.free?.includes(model.upstreamModel)) return model;
+    return {
+      ...model,
+      ...userModelIdentity({
+        providerId,
+        upstreamId: model.upstreamModel,
+        metadata: { ...model, isFree: true },
+      }),
+      isFree: true,
+    };
+  });
+  let target;
   const added = nextMine.filter((model) => !curated.has(model.upstreamModel)).length;
   const removed = mine.length - (nextMine.length - added);
+  // Selecting a model in curation means selecting it for the picker as well.
+  // Provider enablement alone remains deliberately non-expansive: it must not
+  // flood every installed client's picker with that provider's whole catalog.
+  const pickerSelections = nextMine
+    .filter((model) => chosen.includes(model.upstreamModel))
+    .map((model) => model.slug);
+
+  const wantsApply =
+    !noApply && (
+      apply ||
+      confirm("Apply now? This rebuilds gateway routes and restarts the background service.")
+    );
+  await transactModelOverlayMutation({
+    files: [USER_MODELS_PATH, MODEL_PICKER_STATE_PATH],
+    mutate: () => {
+      // Discovery and prompts intentionally happen before the lock, but the
+      // document merge cannot: another provider's curation may have landed
+      // while this command was waiting. Re-read both sides under the lock and
+      // merge current unrelated entries. A same-provider edit is ambiguous
+      // (the user's choices were based on an older list), so fail closed rather
+      // than overwrite it with a stale interactive result.
+      const current = readUserModels();
+      target = writeUserModels(mergeCurationIntoCurrent(current, {
+        providerId,
+        expectedMine: mine,
+        nextMine,
+      }));
+      if (pickerSelections.length) setModelsVisible(pickerSelections, true);
+    },
+    restart: wantsApply,
+    // Publishing curated models is a catalog operation, not an installation.
+    // This used to shell out to bin/install, which reinstalls the background
+    // service and waits on its health -- and whose own EXIT trap disables the
+    // client config when that wait fails. Adding one model could therefore
+    // leave the router unrouted. rebuildModelOverlayPublication already writes
+    // the gateway routes and republishes every installed client's picker --
+    // the same catalog steps the installer ran -- and the restart requested
+    // above is the only reload the new gateway routes actually need.
+    //
+    // --no-apply still publishes nothing: it persists the overlay and leaves
+    // the routing plane untouched until the operator asks for it.
+    applyPublication: async (options) => (
+      wantsApply ? applyModelOverlayPublication(options) : {}
+    ),
+  });
   process.stdout.write(
     `Saved ${nextMine.length} curated ${provider.displayName} model${
       nextMine.length === 1 ? "" : "s"
     } (${added} added, ${removed} removed) to ${target}.\n`,
   );
-
   if (noApply) {
     process.stdout.write("Run ./bin/install to regenerate routes and the picker catalog.\n");
     return;
   }
-  const wantsApply =
-    apply ||
-    confirm("Apply now? This rebuilds gateway routes and restarts the background service.");
   if (wantsApply) {
-    applyInstall();
     process.stdout.write("Curated models are live. Fully quit and reopen the app to refresh its picker.\n");
   } else {
     process.stdout.write("Run ./bin/install to regenerate routes and the picker catalog.\n");

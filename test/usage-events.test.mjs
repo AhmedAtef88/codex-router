@@ -17,8 +17,10 @@ test("usage events persist only bounded request metadata in a private file", asy
       durationMs: 321,
       responseStartMs: 121,
       inputTokens: 120,
+      billedInputTokens: 240,
       cachedInputTokens: 90,
       outputTokens: 35,
+      billedOutputTokens: 70,
       totalTokens: 155,
       toolResultsAged: 2,
       toolResultBytesBefore: 80_000,
@@ -36,8 +38,10 @@ test("usage events persist only bounded request metadata in a private file", asy
         durationMs: 321,
         responseStartMs: 121,
         inputTokens: 120,
+        billedInputTokens: 240,
         cachedInputTokens: 90,
         outputTokens: 35,
+        billedOutputTokens: 70,
         totalTokens: 155,
         toolResultsAged: 2,
         toolResultBytesBefore: 80_000,
@@ -48,6 +52,38 @@ test("usage events persist only bounded request metadata in a private file", asy
     if (process.platform !== "win32") {
       assert.equal(statSync(usage.USAGE_EVENTS_PATH).mode & 0o777, 0o600);
     }
+  } finally {
+    if (previousStateDir === undefined) delete process.env.MODEL_ROUTER_STATE_DIR;
+    else process.env.MODEL_ROUTER_STATE_DIR = previousStateDir;
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("all usage events can include history beyond the recent probe window", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-usage-"));
+  const previousStateDir = process.env.MODEL_ROUTER_STATE_DIR;
+  process.env.MODEL_ROUTER_STATE_DIR = stateDir;
+  try {
+    const usage = await import(`../src/usage-events.mjs?all=${Date.now()}`);
+    const now = Date.now();
+    usage.recordUsageEvent({
+      model: "deepseek/deepseek-v4",
+      provider: "deepseek",
+      status: 200,
+      durationMs: 10,
+      totalTokens: 10,
+      at: now - 2 * 24 * 60 * 60 * 1_000,
+    });
+    usage.recordUsageEvent({
+      model: "deepseek/deepseek-v4",
+      provider: "deepseek",
+      status: 200,
+      durationMs: 10,
+      totalTokens: 20,
+      at: now,
+    });
+    assert.equal(usage.recentUsageEvents({ sinceMs: 24 * 60 * 60 * 1_000 }).length, 1);
+    assert.equal(usage.allUsageEvents().length, 2);
   } finally {
     if (previousStateDir === undefined) delete process.env.MODEL_ROUTER_STATE_DIR;
     else process.env.MODEL_ROUTER_STATE_DIR = previousStateDir;

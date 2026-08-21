@@ -13,9 +13,11 @@ import { promisify } from "node:util";
 import {
   assertCallerSecret,
   authenticatedRoute,
+  callerBaseUrl,
   secretEqual,
 } from "./caller-auth.mjs";
 import { handlePanelRequest, isPanelRoute } from "./desktop-panel.mjs";
+import { handleGeminiRequest, isGeminiRoute } from "./gemini-surface.mjs";
 import {
   applyKeepAliveTimeouts,
   endStreamedResponse,
@@ -29,6 +31,7 @@ import {
   writeStreamErrorEvent,
 } from "./http-utils.mjs";
 import { EmptyCompletionGuard } from "./empty-completion-guard.mjs";
+import { zaiResponsesCompatTransform } from "./zai-responses-compat.mjs";
 import {
   MERGED_CATALOG_PATH,
   NATIVE_CATALOG_PATH,
@@ -39,6 +42,7 @@ import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs
 import { createHealthCache } from "./health-cache.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
+import { nativeContextVariantBase } from "./native-context-variants.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
 import {
   canonicalProviderId,
@@ -56,6 +60,7 @@ import {
   NamespaceToolCallTransform,
   flattenNamespacedHistory,
   flattenNamespaceTools,
+  flattenToolSearchHistory,
   repairToolSchemaRoots,
 } from "./namespace-relay.mjs";
 import { collaborationToolAvailable, pendingInterruptTargets } from "./subagent-completion.mjs";
@@ -73,12 +78,18 @@ import {
   awaitingSpawnProof,
   recordSpawnFailure,
   recordSpawnObserved,
+  spawnProofRevocable,
   subagentProofSnapshot,
 } from "./subagent-proofs.mjs";
+import { forgetChildSpawn, observeChildTurn } from "./subagent-turns.mjs";
 import { subagentEffort } from "./multi-agent-state.mjs";
 import { mergeCodexAppTools } from "./codex-app-tools.mjs";
-import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
-import { translateGatewayError } from "./error-translation.mjs";
+import {
+  activityMetadataFromHeaders,
+  threadIdFromHeaders,
+} from "./codex-session-names.mjs";
+import { gatewayErrorStatus, translateGatewayError } from "./error-translation.mjs";
+import { describeTransportFailure } from "./transport-failure.mjs";
 import { recordUsageEvent } from "./usage-events.mjs";
 import {
   classifySsePrefix,
@@ -471,6 +482,20 @@ function normalizeNativeForSubstitutedCaller(payload) {
   return payload;
 }
 
+/**
+ * Remove the legacy cache-retention shape that GPT-5.6 rejects.
+ *
+ * Current Codex builds can still emit the old top-level field on a later turn.
+ * Omitting it keeps implicit prompt caching active. A caller that already uses
+ * `prompt_cache_options` passes through unchanged.
+ */
+function normalizeNativePromptCacheCompatibility(payload) {
+  if (/^gpt-5\.6(?:-|$)/.test(String(payload.model || ""))) {
+    delete payload.prompt_cache_retention;
+  }
+  return payload;
+}
+
 function routedHeaders() {
   return {
     Authorization: `Bearer ${INTERNAL_KEY}`,
@@ -757,11 +782,24 @@ async function healthPayload() {
     apiEnabled ? serviceHealth(API_HEALTH) : { reachable: true, enabled: false },
     serviceHealth(GATEWAY_HEALTH),
   ]);
+  // Naming the unreachable dependency is the difference between "the router is
+  // broken" and "the gateway is restarting". It costs nothing to carry: these
+  // are three fixed local service names, so it is safe on the unauthenticated
+  // leaf too, which is the only one `waitForRouterHealth` and therefore doctor
+  // can read.
+  const degraded = [
+    ["oauth", oauth],
+    ["api", api],
+    ["gateway", gateway],
+  ]
+    .filter(([, service]) => !service.reachable)
+    .map(([name]) => name);
   return {
-    ok: oauth.reachable && api.reachable && gateway.reachable,
+    ok: degraded.length === 0,
     service: "codex-router",
     version: VERSION,
     router: "ready",
+    degraded,
     activity: activityPayload(),
     oauth,
     api,
@@ -1191,47 +1229,96 @@ async function readVisionEvidence({ url, engine, nativeCall, effort, question, k
   }
 }
 
-// DeepSeek thinking mode rejects a tool-call turn whose assistant message
-// carries no reasoning_content. LiteLLM's Responses->chat translation drops
-// `reasoning` input items entirely, so the reasoning text never reaches the
-// provider. Replace each reasoning item with a synthetic assistant message
-// carrying the reasoning text; LiteLLM merges it into the following
-// function_call's assistant message, and the forwarder's replay attaches it as
-// `reasoning_content` on the tool-call message. In-place, no-op when there is
-// nothing to carry.
-function carryReasoningThroughInput(input) {
+// DeepSeek thinking mode rejects a turn whose assistant message carries no
+// reasoning_content. LiteLLM's Responses->chat translation drops `reasoning`
+// input items entirely (`_transform_responses_api_input_item_to_chat_completion_message`
+// returns nothing for an item whose `content` is null, which is the shape
+// Codex stores), so the reasoning text never reaches the provider at all.
+// Carry each run of reasoning items onto the assistant turn it belongs to, and
+// the translation keeps it as that message's content. In-place, no-op when
+// there is nothing to carry.
+//
+// Every assistant turn needs covering, not only the ones that call a tool.
+// This used to carry the reasoning solely into a following `function_call` or
+// an empty assistant filler, which is the shape of a tool loop -- so a turn
+// that answers in prose lost its reasoning, and the provider refused the
+// *next* request for a reasoning_content it had never been given. A subagent
+// always ends that way, which is why spawning one failed every time and an
+// ordinary tool loop did not (#256).
+function carryReasoningThroughInput(input, { nativeThinking = false } = {}) {
   if (!Array.isArray(input) || input.length < 2) return;
-  for (let i = 0; i < input.length - 1; i += 1) {
-    const item = input[i];
-    if (item?.type !== "reasoning") continue;
-    const text = reasoningItemText(item);
-    if (!text) continue;
-    const next = input[i + 1];
-    // DeepSeek emits reasoning directly before a function_call, or before an
-    // empty assistant message that announces the call. Carry the reasoning in
-    // both cases; otherwise LiteLLM's Responses->chat translation drops it and
-    // the tool-call turn 400s for missing `reasoning_content`.
-    const nextIsCall = next?.type === "function_call";
-    const nextIsEmptyAssistant =
-      next?.type === "message" &&
-      next?.role === "assistant" &&
-      assistantMessageText(next) === "";
-    if (!nextIsCall && !nextIsEmptyAssistant) continue;
-    // Replace the reasoning item with an assistant message carrying its text.
-    input[i] = {
-      type: "message",
-      role: "assistant",
-      content: [{ type: "output_text", text }],
-    };
+  for (let index = 0; index < input.length - 1; index += 1) {
+    if (input[index]?.type !== "reasoning") continue;
+    // One assistant turn can emit several reasoning items in a row, and they
+    // all belong to the turn that follows. Carrying only the item nearest the
+    // turn dropped everything the model thought before it.
+    let end = index;
+    const texts = [];
+    while (end < input.length && input[end]?.type === "reasoning") {
+      const text = reasoningItemText(input[end]);
+      if (text) texts.push(text);
+      end += 1;
+    }
+    const text = texts.join("\n");
+    const next = input[end];
+    // Only the last item of the run is rewritten. The earlier ones stay
+    // `reasoning` items, which the translation drops -- their text is already
+    // in the joined value, and leaving them in place keeps the array the same
+    // length for every other pass over it.
+    if (text && next) {
+      if (next.type === "function_call" || next.type === "custom_tool_call") {
+        input[end - 1] = assistantTextItem(text, nativeThinking);
+      } else if (next.type === "message" && next.role === "assistant") {
+        // Merged into the assistant message rather than inserted in front of
+        // it. A separate message would put two assistant turns back to back,
+        // which the same strict chat-completions providers reject outright --
+        // and the tool-call branch above ends up merged anyway, because
+        // LiteLLM folds a following function_call into the assistant message
+        // it already emitted.
+        input[end] = mergeAssistantText(next, text, nativeThinking);
+      }
+    }
+    index = end - 1;
   }
 }
 
-// Text of an assistant message item, or "" when it has no readable text.
-function assistantMessageText(item) {
-  if (!Array.isArray(item?.content)) return "";
-  return item.content
-    .map((part) => (part && typeof part.text === "string" ? part.text : ""))
-    .join("");
+// A trailing model turn is a destructive rewrite: it discards part of the
+// caller's conversation. Only Google's own provider gets that behavior from
+// identity. Resellers and custom endpoints must opt in per model after their
+// endpoint has proved that it rejects a prefilled model turn.
+function requiresTrailingUserTurn(route) {
+  const provider = providerForModel(route);
+  if (provider?.id === "gemini-api" || provider?.ownedBy?.toLowerCase?.() === "google") {
+    return true;
+  }
+  return route?.requiresTrailingUserTurn === true;
+}
+
+function assistantTextItem(text, nativeThinking = false) {
+  return {
+    type: "message",
+    role: "assistant",
+    content: [{ type: nativeThinking ? "thinking" : "output_text", text }],
+  };
+}
+
+// The reasoning goes in front of the answer it produced. `content` is an array
+// of parts on everything Codex stores, but a bare string is equally legal on
+// the Responses API, so both shapes are handled rather than assumed away.
+function mergeAssistantText(item, text, nativeThinking = false) {
+  const part = { type: nativeThinking ? "thinking" : "output_text", text };
+  if (typeof item.content === "string") {
+    return {
+      ...item,
+      content: item.content
+        ? [part, { type: "output_text", text: item.content }]
+        : [part],
+    };
+  }
+  return {
+    ...item,
+    content: [part, ...(Array.isArray(item.content) ? item.content : [])],
+  };
 }
 
 function reasoningItemText(item) {
@@ -1639,7 +1726,13 @@ async function summarize(request, payload, route, signal) {
     if (!verdict.swap) return { ...last, failed };
     recordProviderCooldown(attemptRoute.provider, verdict);
     if (index + 1 < attempts.length) {
-      logFailover(attemptRoute, attempts[index + 1], `compaction/${verdict.reason}`, sent.upstream.status);
+      logFailover(
+        attemptRoute,
+        attempts[index + 1],
+        `compaction/${verdict.reason}`,
+        sent.upstream.status,
+        "retrying",
+      );
     }
   }
   return last && { ...last, failed };
@@ -1742,6 +1835,25 @@ async function handleModels(response) {
   writeJson(response, 200, { object: "list", data });
 }
 
+// What the Gemini surface will accept a turn for.
+//
+// Deliberately the catalog the router already serves on `/v1/models`, not the
+// narrower set the Gemini settings document was published with. The gate exists
+// so a typo cannot fall through to the native path and quietly become a
+// ChatGPT-session request; being *stricter* than the published list would
+// instead refuse a model the user was legitimately offered, and a native model
+// whose session has since expired is better served by the provider's own 401
+// than by a 404 that misdescribes why.
+function geminiRoutedModels() {
+  return catalogModels().map((model) => ({
+    slug: String(model.slug),
+    displayName: model.display_name || model.displayName || String(model.slug),
+    contextWindow: Number.isFinite(model.context_window)
+      ? model.context_window
+      : model.contextWindow,
+  }));
+}
+
 function requireCodexTransport(request, response) {
   if (request.headers.origin || request.headers["sec-fetch-site"]) {
     writeJson(response, 403, {
@@ -1771,31 +1883,90 @@ function requireCodexTransport(request, response) {
 // A model in the experimental subagent window earns its durable proof — or
 // its demotion — from real traffic: Codex marks child turns with
 // x-openai-subagent, so the first clean completion of one settles "this model
-// can hold the child role" without a dedicated probe session. Only structural
+// can hold the child role" without a dedicated probe session. Structural
 // rejections demote (400/422, the shape a schema or encrypted-payload refusal
 // takes); transient failures — 429s, 5xx, disconnects — prove nothing either
-// way and leave the window open. Neither line is QUIET-gated: a promotion or
+// way and leave the window open. No line here is QUIET-gated: a promotion or
 // demotion that happens silently is how a picker entry becomes unexplainable.
-function observeSubagentOutcome(request, route, status, { emptyCompletion = false } = {}) {
+//
+// What the promotion claims is exactly one HTTP turn, and the log line has to
+// say so. A child agent makes many turns — one per tool-call round trip — and
+// this observer sees each of them separately; it never sees the agent loop
+// that strings them together, so "the child reached done" is not a fact
+// available here. An operator who read the old "subagent proven … completed a
+// live child turn" as *the delegated work finished* was reading a promise the
+// router cannot make (issue #257).
+//
+// The two halves of that issue meet here, and both are about the gate rather
+// than the thresholds. The gate used to be `awaitingSpawnProof`, true only for
+// `experimental` — so the instant turn one promoted a slug this function
+// stopped looking at it, and a hard 400/422 on turn two was discarded along
+// with everything else. That made the *oldest* observation win over the
+// newest, which no comment ever argued for. The gate is now revocability, so a
+// slug keeps being watched for as long as this machine's traffic is what the
+// v2 advertisement rests on; promotion alone stays scoped to the experimental
+// window, because a first clean turn is only news once.
+//
+// Watching a `proven` slug is also what makes the convergence signal usable. A
+// looping child emits 200s forever, so no status-shaped branch could ever fire
+// for it; the evidence is instead how much of its own budget one spawn burns
+// without stopping, accounted per child thread in subagent-turns.mjs against
+// the model's declared auto-compact limit.
+
+function observeSubagentOutcome(request, route, status, options = {}) {
   if (!route) return;
   try {
     if (!request.headers["x-openai-subagent"]) return;
-    if (!awaitingSpawnProof(route.slug, subagentProofSnapshot())) return;
-    if (status === 200 && !emptyCompletion) {
-      recordSpawnObserved(route.slug, { status });
+    const proofs = subagentProofSnapshot();
+    if (!spawnProofRevocable(route.slug, proofs)) return;
+    const spawnId = threadIdFromHeaders(request.headers);
+    const settle = (reason, detail = { status }) => {
+      recordSpawnFailure(route.slug, { reason, ...detail });
+      forgetChildSpawn(spawnId);
       console.error(
-        `[codex-router] subagent proven: ${route.slug} completed a live child turn`,
-      );
-    } else if (status === 400 || status === 422) {
-      recordSpawnFailure(route.slug, {
-        status,
-        reason: `child turn rejected with HTTP ${status}`,
-      });
-      console.error(
-        `[codex-router] subagent demoted: ${route.slug} child turn rejected with HTTP ${status}; ` +
+        `[codex-router] subagent demoted: ${route.slug} ${reason}; ` +
           "it stays v1 until 'control subagents verify' passes again",
       );
+    };
+    if (status === 400 || status === 422) {
+      settle(
+        `child turn rejected with HTTP ${status}` +
+          (proofs[route.slug]?.status === "proven"
+            ? ", revoking the child role it had already served"
+            : ""),
+      );
+      return;
     }
+    if (status !== 200 || options.emptyCompletion) return;
+    if (awaitingSpawnProof(route.slug, proofs)) {
+      recordSpawnObserved(route.slug, { status });
+      console.error(
+        `[codex-router] subagent child role verified: ${route.slug} served a live child turn; ` +
+          "the model holds the child role on the wire, which is not a claim the child finished its task",
+      );
+    }
+    const spawn = observeChildTurn({
+      spawnId,
+      slug: route.slug,
+      autoCompact: route.autoCompact,
+      event: {
+        status,
+        inputTokens: options.usage?.inputTokens,
+        estimatedInputTokens: options.estimatedInputTokens,
+        emptyCompletionRetried: options.emptyCompletionRetried,
+        progressOnlyRetried: options.progressOnlyRetried === true,
+      },
+    });
+    if (!spawn?.exceeded) return;
+    settle(
+      `one child spawn ran ${spawn.turns} turns and produced ${spawn.newInputTokens} new input ` +
+        `tokens without converging, past the ${spawn.budget}-token ceiling this model's own ` +
+        "auto-compact budget sets",
+      // Deliberately no `status`: every turn of this spawn answered 200, and
+      // recording one of them as the failure would read as a rejection that
+      // never happened. The counts are the evidence.
+      { turns: spawn.turns, newInputTokens: spawn.newInputTokens },
+    );
   } catch {
     // Observation is bookkeeping; it must never fail the turn it watched.
   }
@@ -1834,14 +2005,31 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   // -- a turn that still reaches the provider, and still reads as a 200,
   // having quietly replaced the prompt with its own letters.
   const input = Array.isArray(bridged) ? [...bridged] : bridged;
-  // DeepSeek thinking mode requires the assistant's reasoning to be replayed on
-  // tool-call turns, but LiteLLM's Responses->chat translation drops
-  // `reasoning` input items entirely. Merge each reasoning summary into the
-  // following assistant function_call message's content so the translation
-  // carries it; the forwarder then attaches it as `reasoning_content` on the
-  // tool-call message.
-  carryReasoningThroughInput(input);
   const provider = providerForModel(route);
+  const chatCompletionsProvider = provider?.protocol !== "openai-responses";
+  // Thinking chat providers need the assistant's reasoning replayed, but
+  // LiteLLM drops Responses `reasoning` input items. Generic providers keep
+  // the established visible-content carry used for DeepSeek. GLM's native
+  // preserved-thinking contract needs reasoning kept structurally separate so
+  // the API forwarder can restore it as `reasoning_content` before Z.ai.
+  carryReasoningThroughInput(input, {
+    nativeThinking: chatCompletionsProvider && route.requestProfile === "glm-thinking",
+  });
+  // Models marked requiresTrailingUserTurn reject requests ending with a model
+  // turn. Pop trailing assistant messages, reasoning, or subagent outputs.
+  if (requiresTrailingUserTurn(route)) {
+    while (
+      input.length > 0 &&
+      (input[input.length - 1]?.role === "assistant" ||
+        input[input.length - 1]?.type === "reasoning" ||
+        input[input.length - 1]?.type === "function_call" ||
+        input[input.length - 1]?.type === "custom_tool_call" ||
+        (input[input.length - 1]?.type === "message" &&
+          input[input.length - 1]?.role === "assistant"))
+    ) {
+      input.pop();
+    }
+  }
   let tools = payload.tools;
   // LiteLLM's Responses -> Chat Completions bridge drops namespace tools, which
   // is how the client ships the collaboration runtime, the app toolset
@@ -1849,7 +2037,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   // peekaboo, github, ...). Chat-completions providers need every namespace
   // flattened into ordinary functions; the response transform maps calls back
   // to the client's native namespace shape.
-  if (provider?.protocol !== "openai-responses") {
+  if (chatCompletionsProvider) {
     // Relay the app's full native toolset (threads, automations, app
     // navigation) to the provider. The client registers these tools with
     // deferLoading and executes the calls natively, but only sends a reduced
@@ -1861,9 +2049,9 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     if (merged.merged) tools = merged.tools;
     const flattened = flattenNamespaceTools(tools);
     namespacesFlattened = flattened.flattened;
+    flattenedNamespaces = flattened.namespaces;
     if (namespacesFlattened) {
       tools = flattened.tools;
-      flattenedNamespaces = flattened.namespaces;
     }
   } else {
     // Responses-native providers keep the namespace tools untouched, so nothing
@@ -1871,7 +2059,9 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     // because the response transform reads the exact spawn_agent model enum off
     // it to drop an invented or stale optional override before Codex validates
     // the call.
-    flattenedNamespaces = flattenNamespaceTools(tools).namespaces;
+    flattenedNamespaces = flattenNamespaceTools(tools, {
+      bridgeToolSearch: false,
+    }).namespaces;
     // Keeping the namespace shape is not the same as keeping a root the
     // upstream rejects. `opencode-go-responses/gpt-5.6-luna` 400s a
     // `type: ["object","null"]` parameter root while accepting the same request
@@ -1880,6 +2070,15 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     tools = repairToolSchemaRoots(tools);
   }
   let routedInput = input;
+  if (chatCompletionsProvider) {
+    const searchHistory = flattenToolSearchHistory(
+      routedInput,
+      tools,
+      flattenedNamespaces,
+    );
+    routedInput = searchHistory.input;
+    tools = searchHistory.tools;
+  }
   // The stored call history must use the same tool names as the tool list, or
   // the model copies the bare names out of its own transcript.
   if (namespacesFlattened) {
@@ -1968,14 +2167,21 @@ function failoverCandidates({ route, routedBody, agedInput, flattenedNamespaces,
   );
 }
 
-function logFailover(from, to, reason, status) {
-  // Never gated on CODEX_ROUTER_QUIET, which a production LaunchAgent hard-sets.
-  // A silent swap makes an exhausted provider look healthy and leaves the
-  // operator wondering why the answers changed character.
+// `status` is always what the *asked-for* model said; `outcome` is what the
+// candidate did about it. Reporting one number for both was actively
+// misleading: a hop rejected with its own 400 printed
+// `reason=out_of_usage status=400`, which reads as the exhausted provider
+// having answered 400 and sent a reader looking for a quota bug that was not
+// there. They are two different events and now say so.
+//
+// Never gated on CODEX_ROUTER_QUIET, which a production LaunchAgent hard-sets.
+// A silent swap makes an exhausted provider look healthy and leaves the
+// operator wondering why the answers changed character.
+function logFailover(from, to, reason, status, outcome) {
   console.error(
-    `[codex-router] failover model=${from.slug} reason=${reason} status=${status} -> ${
+    `[codex-router] failover model=${from.slug} status=${status} reason=${reason} -> ${
       to ? to.slug : "none"
-    }`,
+    } outcome=${outcome}`,
   );
 }
 
@@ -2007,7 +2213,7 @@ async function attemptModelFailover({
     chain: settings.chain,
   }).slice(0, MAX_FAILOVER_HOPS);
   if (!candidates.length) {
-    logFailover(route, undefined, verdict.reason, status);
+    logFailover(route, undefined, verdict.reason, status, "no-candidate");
     return undefined;
   }
   const startedAt = Date.now();
@@ -2032,11 +2238,11 @@ async function attemptModelFailover({
       });
     } catch (error) {
       if (signal.aborted) throw error;
-      logFailover(route, model, verdict.reason, `transport/${error?.name || "Error"}`);
+      logFailover(route, model, verdict.reason, status, `transport/${error?.name || "Error"}`);
       continue;
     }
     if (upstream.ok) {
-      logFailover(route, model, verdict.reason, status);
+      logFailover(route, model, verdict.reason, status, upstream.status);
       return { route: model, built, upstream };
     }
     // The candidate failed too. If it failed the same way, believe it and take
@@ -2048,7 +2254,7 @@ async function attemptModelFailover({
       retryAfterSeconds: Number(upstream.headers.get("retry-after")),
     });
     if (hopVerdict.swap) recordProviderCooldown(model.provider, hopVerdict);
-    logFailover(route, model, verdict.reason, upstream.status);
+    logFailover(route, model, verdict.reason, status, upstream.status);
   }
   return undefined;
 }
@@ -2077,6 +2283,7 @@ async function handleResponses(request, response, requestUrl) {
   let requestedModel = "";
   let route;
   let upstreamRetries;
+  let upstreamStatus;
   let upstreamLatencyMs;
   let firstTokenMs;
   let usageTransform;
@@ -2286,7 +2493,7 @@ async function handleResponses(request, response, requestUrl) {
           chain: settings.chain,
         });
         if (next) {
-          logFailover(route, next.model, `cooled_until_${cooled.until}`, "skipped");
+          logFailover(route, next.model, `cooled_until_${cooled.until}`, "not-sent", "swapped");
           adoptRoute(
             next.model,
             await buildRoutedRequest({ request, payload, route: next.model, agedInput }),
@@ -2295,6 +2502,16 @@ async function handleResponses(request, response, requestUrl) {
       }
     } else {
       const native = { ...payload };
+      // An extended-window variant is the model it was derived from, published
+      // under a second slug so the picker can offer a different context
+      // window (`src/native-context-variants.mjs`). chatgpt.com has never
+      // heard of that slug, so it is translated back here -- the last point
+      // before the turn leaves. Everything the operator reads keeps the slug
+      // they picked: `requestedModel` is untouched, so activity, usage, and
+      // the log still name the model the picker showed.
+      const variantBase = nativeContextVariantBase(native.model);
+      if (variantBase) native.model = variantBase;
+      normalizeNativePromptCacheCompatibility(native);
       if (Array.isArray(payload.input)) {
         native.input = normalizeNativeInput(payload.input);
         // Native turns leave here as stateless full conversations (the
@@ -2313,7 +2530,9 @@ async function handleResponses(request, response, requestUrl) {
       // SF and other native multi-agent parents hit this path (model_provider
       // openai). They have the same Working-badge bug, so inventory the tools
       // and queue missing interrupt_agent closes the same way as routed turns.
-      flattenedNamespaces = flattenNamespaceTools(payload.tools).namespaces;
+      flattenedNamespaces = flattenNamespaceTools(payload.tools, {
+        bridgeToolSearch: false,
+      }).namespaces;
       pendingInterrupts = pendingInterruptTargets(native.input ?? payload.input, {
         namespaces: flattenedNamespaces,
       });
@@ -2353,6 +2572,7 @@ async function handleResponses(request, response, requestUrl) {
       },
     );
     upstreamRetries = retries;
+    upstreamStatus = upstream.status;
     // Time until the upstream chain answered the request. Everything before
     // this is router-side work (body read, normalization, flattening, vision
     // bridge) plus the upstream's own time to produce response headers. For a
@@ -2401,6 +2621,7 @@ async function handleResponses(request, response, requestUrl) {
           });
           adoptRoute(moved.route, moved.built);
           upstream = moved.upstream;
+          upstreamStatus = upstream.status;
           failedBodyText = undefined;
         }
       }
@@ -2417,17 +2638,24 @@ async function handleResponses(request, response, requestUrl) {
       const provider = providerForModel(route);
       const retryAfterHeader = upstream.headers.get("retry-after");
       const retryAfterSeconds = Number(retryAfterHeader);
+      const translatedStatus = gatewayErrorStatus({
+        status: upstream.status,
+        bodyText: failedBodyText,
+      });
       if (retryAfterHeader) response.setHeader("Retry-After", retryAfterHeader);
       writeJson(
         response,
-        upstream.status,
+        translatedStatus,
         translateGatewayError({
           status: upstream.status,
           // Already drained above so the failover classifier could read it; a
           // second `.text()` on the same response yields "".
           bodyText: failedBodyText ?? (await upstream.text().catch(() => "")),
           modelName: route.displayName || route.slug,
-          providerName: provider?.ownedBy || provider?.displayName || route.provider,
+          providerName:
+            provider?.transport === "ollama"
+              ? "Ollama"
+              : provider?.ownedBy || provider?.displayName || route.provider,
           providerKind: provider?.kind,
           retryAfterSeconds: Number.isFinite(retryAfterSeconds)
             ? retryAfterSeconds
@@ -2443,8 +2671,8 @@ async function handleResponses(request, response, requestUrl) {
         firstTokenMs,
       });
       observeSubagentOutcome(request, route, upstream.status);
-      finalStatus = upstream.status;
-      activityStatus = upstream.status;
+      finalStatus = translatedStatus;
+      activityStatus = translatedStatus;
       usageRecorded = true;
       if (!QUIET) {
         console.error(
@@ -2473,6 +2701,10 @@ async function handleResponses(request, response, requestUrl) {
             : undefined,
       });
       const transforms = [usageObserver];
+      const zaiCompat = route
+        ? zaiResponsesCompatTransform(route.provider, contentType)
+        : undefined;
+      if (zaiCompat) transforms.push(zaiCompat);
       // Restore flattened namespace calls for routed chat-completions providers,
       // and inject missing finished-child interrupts for both routed and native
       // multi-agent parents (San Francisco uses native GPT).
@@ -2514,8 +2746,11 @@ async function handleResponses(request, response, requestUrl) {
     // goes away, but `pipeResponse` can resolve before that event fires: the
     // response socket is already destroyed at that point. Read the state
     // directly as well so a cancel that races the close event still meters 0.
+    const nativeCompletedBeforeClose =
+      !route && usageTransform?.completedResponseObserved() === true;
     const clientWalkedAway =
-      clientGone || (response.destroyed && !response.writableFinished);
+      (clientGone || (response.destroyed && !response.writableFinished)) &&
+      !nativeCompletedBeforeClose;
     finalStatus = clientWalkedAway ? 0 : upstream.status;
     emptyCompletion = emptyCompletionGuard?.isEmpty() === true && !clientWalkedAway;
     // The guard releases long turns at its byte/time budget without a verdict.
@@ -2671,17 +2906,27 @@ async function handleResponses(request, response, requestUrl) {
       durationMs: Date.now() - startedAt,
       responseStartMs: upstreamLatencyMs,
       firstTokenMs,
-      retries: upstreamRetries,
       ...usage,
       estimatedInputTokens,
       ...toolResultAging,
+      retries: (upstreamRetries || 0) + (usage?.retries || 0) || undefined,
       ...(emptyCompletion ? { emptyCompletion: true } : {}),
       ...(emptyCompletionRetried ? { emptyCompletionRetried: true } : {}),
+      ...(usage?.progressOnlyRetried ? { progressOnlyRetried: true } : {}),
       ...(emptyCompletionUnrepairable ? { emptyCompletionUnrepairable: true } : {}),
       ...(guardReleasedForBudget ? { emptyCompletionGuardReleased: true } : {}),
       ...(failoverFrom ? { failoverFrom } : {}),
     });
-    observeSubagentOutcome(request, route, finalStatus, { emptyCompletion });
+    // The same usage this turn just metered, and the same two disqualifiers
+    // context-window-drift.mjs applies to it: a substituted estimate and a
+    // retry-doubled count are not measurements of what the child sent.
+    observeSubagentOutcome(request, route, finalStatus, {
+      emptyCompletion,
+      usage,
+      estimatedInputTokens,
+      emptyCompletionRetried,
+      progressOnlyRetried: usage?.progressOnlyRetried === true,
+    });
     usageRecorded = true;
     activityStatus = finalStatus;
     if (!QUIET) {
@@ -2724,6 +2969,37 @@ async function handleResponses(request, response, requestUrl) {
         usageTransform.substitutedInputTokens(),
         retryUsageTransform?.substitutedInputTokens(),
       );
+      const firstTokenAt = usageTransform.firstTokenAt?.();
+      if (firstTokenAt !== undefined) firstTokenMs = firstTokenAt - startedAt;
+    }
+    // Codex may close a native stream immediately after response.completed.
+    // That is a successful terminal turn, not a canceled generation.
+    if (!route && clientGone && usageTransform?.completedResponseObserved() === true) {
+      finalStatus = upstreamStatus ?? response.statusCode;
+      activityStatus = finalStatus;
+      if (!usageRecorded) {
+        recordUsageEvent({
+          model: requestedModel,
+          provider: "openai",
+          status: finalStatus,
+          durationMs: Date.now() - startedAt,
+          responseStartMs: upstreamLatencyMs,
+          firstTokenMs,
+          ...usage,
+          estimatedInputTokens,
+          ...toolResultAging,
+          retries: (upstreamRetries || 0) + (usage?.retries || 0) || undefined,
+        });
+        usageRecorded = true;
+      }
+      if (!QUIET) {
+        console.error(
+          `[codex-router] model=${requestedModel || "unknown"} provider=openai status=${finalStatus}${
+            upstreamRetries ? ` retries=${upstreamRetries}` : ""
+          }`,
+        );
+      }
+      return;
     }
     // A client that walked away (canceled generation, closed stream) is not
     // a router failure; only surface errors the router or upstream produced.
@@ -2836,9 +3112,19 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
     });
 
     const headers = nativeHeaders(request);
+    // The same slug translation the turn path does, for the same reason: these
+    // endpoints normally carry their own model ("gpt-image-2", the search
+    // model), but nothing stops a client from naming the picked one, and an
+    // extended-window slug means nothing to chatgpt.com. The bytes are only
+    // re-encoded when a variant is actually present, so every other request on
+    // this path is forwarded exactly as it arrived.
+    const variantBase = nativeContextVariantBase(payload.model);
+    const outgoing = variantBase
+      ? Buffer.from(JSON.stringify({ ...payload, model: variantBase }), "utf8")
+      : body;
     // Same replayable-Buffer rule as the turn path: encode once, outside the
     // retry, so every attempt carries identical bytes under identical headers.
-    const imageBody = await compressedNativeBody(body, headers);
+    const imageBody = await compressedNativeBody(outgoing, headers);
     const { response: upstream, retries: upstreamRetries } = await fetchWithRetry(
       nativeTarget(requestUrl.pathname, nativeRequestSearch(requestUrl)),
       {
@@ -2915,6 +3201,7 @@ async function handleRequest(request, response) {
       ok: health.ok,
       service: health.service,
       version: health.version,
+      degraded: health.degraded,
       activity: health.activity,
     });
     return;
@@ -2948,6 +3235,17 @@ async function handleRequest(request, response) {
   }
   if (request.method === "GET" && ["/models", "/v1/models"].includes(requestUrl.pathname)) {
     await handleModels(response);
+    return;
+  }
+  // Gemini CLI speaks nothing but the Gemini API, so it gets its own leaf
+  // behind the same capability. The handler translates and re-enters
+  // `/v1/responses` over the loopback rather than reaching a provider itself --
+  // there is still exactly one request path to keep correct.
+  if (isGeminiRoute(requestUrl.pathname)) {
+    await handleGeminiRequest(request, response, requestUrl.pathname, {
+      responsesUrl: `${callerBaseUrl(LISTEN_PORT, CALLER_KEY)}/responses`,
+      routedModels: geminiRoutedModels,
+    });
     return;
   }
   if (request.method === "OPTIONS") {
@@ -2986,18 +3284,33 @@ const server = http.createServer((request, response) => {
     // `TypeError: fetch failed` with the socket-level code buried on its cause
     // (#171). The whole chain belongs in the log; response bodies never do.
     console.error(`[codex-router] request failed: ${formatErrorChain(error)}`);
+    // A socket-level failure is the one class of error whose cause is safe to
+    // state and useless to withhold: it names a host and a network condition,
+    // never a credential or an upstream body. Without it Codex reports only
+    // its own transport wording -- `stream disconnected before completion` --
+    // and an unreachable upstream is indistinguishable from a router bug.
+    const transport = describeTransportFailure(error);
     if (!response.headersSent) {
       writeJson(response, status, {
         error: {
           type: "local_router_error",
-          message: "The local router could not complete the request.",
+          code: transport?.code,
+          message: transport
+            ? `The local router could not complete the request: ${transport.cause}.${transport.hint}`
+            : "The local router could not complete the request.",
         },
       });
     } else {
       // The body is already streaming, so there is no status left to change.
       // Destroying here reset the socket and cost the chunked terminator,
-      // which the client reported only as a decode failure.
-      endStreamedResponse(response);
+      // which the client reported only as a decode failure. The event code
+      // stays `local_router_stream_failed`: a diagnosed cause is extra detail
+      // about the same failure, not a different one for a client to branch on.
+      endStreamedResponse(response, {
+        message: transport
+          ? `The local router lost the upstream response stream: ${transport.cause}.${transport.hint}`
+          : undefined,
+      });
     }
   });
 });

@@ -618,7 +618,7 @@ private struct IslandOverlayView: View {
     if provider == "openai" { return routerLocalized("CHATGPT • NATIVE") }
     if provider == "grok-oauth" { return routerLocalized("XAI • OAUTH SESSION") }
     if provider == "grok-api" { return routerLocalized("XAI • METERED API") }
-    if provider.hasSuffix("-api") || ["deepseek", "chutes"].contains(provider) {
+    if provider.hasSuffix("-api") || ["deepseek", "chutes", "orca"].contains(provider) {
       if RouterLanguage.isSimplifiedChinese { return "计量 API" }
       return "METERED API"
     }
@@ -942,9 +942,10 @@ private struct IslandUsageLineChart: View {
 struct ProviderIcon: View {
   let providerID: String
   let size: CGFloat
+  var showsHelp: Bool = true
 
   var body: some View {
-    Group {
+    let mark = Group {
       if let providerImage {
         Image(nsImage: providerImage)
           .resizable()
@@ -957,8 +958,13 @@ struct ProviderIcon: View {
       }
     }
     .frame(width: size, height: size)
-    .help(providerName)
     .accessibilityLabel(providerName)
+
+    if showsHelp {
+      mark.help(providerName)
+    } else {
+      mark
+    }
   }
 
   private var providerImage: NSImage? {

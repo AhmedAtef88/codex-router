@@ -35,7 +35,9 @@
         "text",
         "image"
       ],
+      "instructionOverlay": "filesystem-mcp-discipline",
       "requestProfile": "xai-reasoning",
+      "supportsReasoningSummaries": true,
       "searchTool": {
         "mode": "hosted"
       },
