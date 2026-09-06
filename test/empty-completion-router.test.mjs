@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -281,8 +282,9 @@ async function mockServer(handler) {
   return { server, port: server.address().port };
 }
 
-function run(env) {
+function run(env, setupState) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "empty-completion-router-state-"));
+  setupState?.(stateDir);
   const child = spawn(process.execPath, [path.join(root, "src", "router.mjs")], {
     cwd: root,
     env: {
@@ -420,6 +422,7 @@ function routerEnv(gatewayPort, routerPort) {
     CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gatewayPort}/v1`,
     CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
     CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gatewayPort}/health`,
   };
 }
@@ -483,6 +486,119 @@ test("an empty completion is retried once and the retry's content reaches the cl
   }
 });
 
+test("an empty-completion retry stops when its search sidecar disappears", async () => {
+  const providerId = "perplexity-sidecar";
+  const credentialRef = "cred_perplexity_sidecar_01";
+  const model = "deepseek/deepseek-v4-pro";
+  let sidecarsFile;
+  let stateDir;
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    if (posts === 1) {
+      writeFileSync(
+        sidecarsFile,
+        `${JSON.stringify({ version: 1, bindings: [] })}\n`,
+        { mode: 0o600 },
+      );
+    }
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "public, max-age=300",
+      "X-Upstream-Attempt": "discarded-first",
+    });
+    response.end(posts === 1 ? EMPTY_SSE_METERED : CONTENT_SSE);
+  });
+  const routerPort = await openPort();
+  const router = run(routerEnv(gw.port, routerPort), (directory) => {
+    stateDir = directory;
+    sidecarsFile = path.join(directory, "search-sidecars.json");
+    writeFileSync(
+      path.join(directory, "generic-providers.json"),
+      `${JSON.stringify({
+        version: 1,
+        providers: [{
+          id: providerId,
+          displayName: "Perplexity Search",
+          baseUrl: "https://api.perplexity.ai",
+          adapter: "openai-chat",
+          headers: {},
+          credentialRef,
+          allowPrivate: false,
+          enabled: true,
+        }],
+      })}\n`,
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      sidecarsFile,
+      `${JSON.stringify({
+        version: 1,
+        bindings: [{
+          model,
+          providerId,
+          adapter: "perplexity-search",
+          enabled: true,
+          timeoutMs: 1_000,
+          maxResults: 8,
+          cacheTtlMs: 60_000,
+          cacheMaxEntries: 128,
+          maxAttempts: 2,
+          retryDelayMs: 100,
+        }],
+      })}\n`,
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      path.join(directory, "provider-credentials.json"),
+      `${JSON.stringify({
+        schemaVersion: 2,
+        credentials: [{
+          id: credentialRef,
+          providerId,
+          providerType: "generic",
+          kind: "api_key",
+          secretRef: { type: "provider-file", providerId, target: "codex" },
+          state: "active",
+          createdAt: "2026-08-31T00:00:00.000Z",
+          updatedAt: "2026-08-31T00:00:00.000Z",
+        }],
+      })}\n`,
+      { mode: 0o600 },
+    );
+    mkdirSync(path.join(directory, "generic-provider-credentials"), { mode: 0o700 });
+    writeFileSync(
+      path.join(directory, "generic-provider-credentials", `${providerId}.key`),
+      "pplx-0123456789abcdefghijklmnopqrstuv\n",
+      { mode: 0o600 },
+    );
+  });
+
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const result = await readRouted(routerPort, {
+      ...TURN_BODY,
+      tools: [{ type: "web_search" }],
+    });
+
+    assert.equal(result.status, 400, router.testErrors());
+    assert.equal(JSON.parse(result.body).error.type, "model_search_not_supported");
+    assert.equal(result.headers["cache-control"], undefined);
+    assert.equal(result.headers["x-upstream-attempt"], undefined);
+    assert.equal(posts, 1, "the retry must not reach the gateway after sidecar removal");
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 400);
+    assert.equal(event.inputTokens, 100);
+    assert.equal(event.cachedInputTokens, 60);
+    assert.equal(event.emptyCompletion, true);
+    assert.equal(event.emptyCompletionRetried, undefined);
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 // The counterpart to the test above. Once the upstream streams reasoning, the
 // hold is over and the attempt is on the wire, so the router cannot substitute
 // a retry for it. It states the failure into the open stream instead. Holding
@@ -514,15 +630,54 @@ test("a reasoning turn that ends empty is relayed and stated, never retried", as
     // ...followed by a stated failure rather than a silent stop.
     assert.match(result.body, /event: error/);
     assert.match(result.body, /empty_completion/);
+    assert.doesNotMatch(result.body, /event: response\.(?:completed|done)/);
     // No second attempt: the response had already started.
     assert.equal(posts, 1, "a relayed attempt must not be retried");
     assert.doesNotMatch(result.body, /Recovered|r-content/);
     assert.equal(result.headers["x-upstream-attempt"], "first");
 
     const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 502);
     assert.equal(event.emptyCompletion, true);
     assert.equal(event.emptyCompletionUnrepairable, true);
     assert.equal(event.emptyCompletionRetried, undefined);
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a headers-only attempt times out, retries once, and returns content", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "X-Upstream-Attempt": posts === 1 ? "first" : "retry",
+    });
+    response.flushHeaders();
+    if (posts === 1) return;
+    response.end(CONTENT_SSE);
+  });
+  const routerPort = await openPort();
+  const router = run({
+    ...routerEnv(gw.port, routerPort),
+    CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS: "25",
+  });
+
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const result = await readRouted(routerPort, TURN_BODY);
+
+    assert.equal(result.status, 200);
+    assert.match(result.body, /Recovered/);
+    assert.equal(result.headers["x-upstream-attempt"], "retry");
+    assert.equal(posts, 2);
+
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 200);
+    assert.equal(event.emptyCompletionRetried, true);
+    assert.equal(event.emptyCompletionPreludeLimit, "time");
   } finally {
     await stopChild(router);
     await closeServer(gw.server);
@@ -638,7 +793,7 @@ test("a retried turn meters the tokens of both attempts", async () => {
   }
 });
 
-test("a retry that crosses the guard byte budget records the release", async () => {
+test("a retry that crosses the guard byte limit returns an explicit error", async () => {
   let posts = 0;
   const gw = await gateway((_request, response) => {
     posts += 1;
@@ -652,15 +807,46 @@ test("a retry that crosses the guard byte budget records the release", async () 
     await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
     const result = await readRouted(routerPort, TURN_BODY);
 
+    assert.equal(result.status, 502);
+    assert.equal(result.complete, true);
+    assert.doesNotMatch(result.body, /r-budget/);
+    assert.match(result.body, /precontent_limit/);
+    assert.equal(posts, 2);
+
+    const [event] = await waitForUsageEvents(router.stateDir, 1, router);
+    assert.equal(event.status, 502);
+    assert.equal(event.emptyCompletionRetried, true);
+    assert.equal(event.emptyCompletionPreludeLimit, "bytes");
+  } finally {
+    await stopChild(router);
+    await closeServer(gw.server);
+  }
+});
+
+test("a first-attempt byte limit retries without leaking its staged response", async () => {
+  let posts = 0;
+  const gw = await gateway((_request, response) => {
+    posts += 1;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(posts === 1 ? BUDGET_RELEASE_REASONING_SSE : CONTENT_SSE);
+  });
+  const routerPort = await openPort();
+  const router = run(routerEnv(gw.port, routerPort));
+
+  try {
+    await waitFor(`${callerBaseUrl(routerPort, CALLER_KEY)}/models`, router);
+    const result = await readRouted(routerPort, TURN_BODY);
+
     assert.equal(result.status, 200);
     assert.equal(result.complete, true);
-    assert.match(result.body, /r-budget/);
+    assert.match(result.body, /Recovered/);
+    assert.doesNotMatch(result.body, /r-budget/);
     assert.equal(posts, 2);
 
     const [event] = await waitForUsageEvents(router.stateDir, 1, router);
     assert.equal(event.status, 200);
     assert.equal(event.emptyCompletionRetried, true);
-    assert.equal(event.emptyCompletionGuardReleased, true);
+    assert.equal(event.emptyCompletionPreludeLimit, "bytes");
   } finally {
     await stopChild(router);
     await closeServer(gw.server);

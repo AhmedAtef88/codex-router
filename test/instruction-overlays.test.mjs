@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { applyInstructionOverlay } from "../src/instruction-overlays.mjs";
+import {
+  applyInstructionOverlay,
+} from "../src/instruction-overlays.mjs";
 import { MODEL_BY_SLUG } from "../src/model-registry.mjs";
 
 test("Grok 4.6 OAuth distinguishes local files from discovered MCP resources", () => {

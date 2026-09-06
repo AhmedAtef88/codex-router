@@ -9,9 +9,10 @@ import {
   Server,
   Waypoints,
 } from "lucide-react";
-import { Badge, Button, EmptyState, InlineNotice, PageHeader, SectionHeading } from "../components";
+import { Badge, Button, EmptyState, InlineNotice, PageHeader, PanelSkeleton, SectionHeading, SkeletonBlock } from "../components";
 import { ProviderLogo } from "../provider-branding";
 import { ServiceHealthPanel } from "../ServiceHealth";
+import { useOptimisticValues, type RunAction } from "../useOptimisticValues";
 import {
   classNames,
   compactNumber,
@@ -27,6 +28,8 @@ import type {
   ProviderSetupSnapshot,
   ProviderUsageSnapshot,
   RouterControlApi,
+  RouterDataReady,
+  RouterDashboardSnapshot,
   RouterHealth,
   RouterTarget,
   UsageEvent,
@@ -49,6 +52,7 @@ interface SummaryTile {
   meter?: number;
   view: ViewId;
   viewLabel: string;
+  pending?: boolean;
 }
 
 interface MetricEntry {
@@ -124,26 +128,38 @@ const TOKEN_ACTIVITY_WEEKS = 53;
 
 export function DashboardPage({
   target,
+  dashboard,
   health,
   account,
   providerUsage,
   api,
   refreshing,
+  dataReady,
   onRefresh,
   onNavigate,
+  runAction,
 }: {
   target?: RouterTarget;
+  dashboard?: RouterDashboardSnapshot;
   health?: RouterHealth;
   account?: AccountUsage;
   providerUsage?: ProviderUsageSnapshot;
   setup?: ProviderSetupSnapshot;
   presence?: PresenceSnapshot;
   api?: RouterControlApi;
+  runAction?: RunAction;
   refreshing: boolean;
+  dataReady: RouterDataReady;
   onRefresh: () => void;
   onNavigate: (view: ViewId, modelFocus?: ModelViewFocus) => void;
 }) {
   const [trafficRange, setTrafficRange] = useState<TrafficRange>(24);
+  const healthPending = !dataReady.health && !health;
+  const snapshotPending = !dataReady.snapshot && !target;
+  const routesPending = !dataReady.snapshot && !dashboard;
+  const accountPending = !dataReady.accountUsage && !account;
+  const providerUsagePending = !dataReady.providerUsage && !providerUsage;
+  const quotaPending = !account && !providerUsage && (accountPending || providerUsagePending);
   // Every prop can be undefined on first paint and after a failed refresh, so
   // each tile below separates three cases: still loading, reported-but-absent,
   // and a genuine zero. A missing field must never render as 0.
@@ -166,6 +182,15 @@ export function DashboardPage({
     : refreshing ? "starting" : "offline";
 
   const providers = providerUsage?.providers ?? [];
+  const routeProviders = dashboard?.providers ?? [];
+  const authoritativeRoutes = useMemo(
+    () => new Map(routeProviders.map((provider) => [provider.id, provider.enabled])),
+    [routeProviders],
+  );
+  const routeMutations = useOptimisticValues(
+    authoritativeRoutes,
+    runAction ?? (async (_label, action) => { await action(); }),
+  );
   const telemetryEvents24h = recentWindowEvents(target?.usageEvents, Date.now());
   const eventTokens24h = sumEventTokens(telemetryEvents24h);
   const eventRequests24h = eventsCountOrNull(target?.usageEvents, telemetryEvents24h);
@@ -226,6 +251,7 @@ export function DashboardPage({
       tone: health ? health.ok ? "success" : "danger" : undefined,
       view: "status",
       viewLabel: "Status",
+      pending: healthPending,
     },
     {
       id: "live",
@@ -240,6 +266,7 @@ export function DashboardPage({
       tone: activityMeasured && (liveCount || 0) > 0 ? "accent" : undefined,
       view: "status",
       viewLabel: "Status",
+      pending: healthPending,
     },
     {
       id: "tokens",
@@ -253,6 +280,7 @@ export function DashboardPage({
           : `${exactNumber(tokens24h)} router tokens${requests24h === null ? "" : ` · ${exactNumber(requests24h)} ${plural(requests24h, "request")}`} · ${reportedTokens24h !== null ? "sum of provider rows" : "sum of recent event details"}`,
       view: "usage",
       viewLabel: "Usage",
+      pending: snapshotPending && !providerUsage,
     },
     {
       id: "reset",
@@ -266,6 +294,7 @@ export function DashboardPage({
           : "No connected account exposed a reset timestamp",
       view: "usage",
       viewLabel: "Usage",
+      pending: quotaPending,
     },
     {
       id: "allowance",
@@ -283,6 +312,7 @@ export function DashboardPage({
       meter: lowestAllowance ? lowestAllowance.percent : undefined,
       view: "usage",
       viewLabel: "Usage",
+      pending: quotaPending,
     },
   ];
 
@@ -304,8 +334,6 @@ export function DashboardPage({
         <InlineNotice tone="danger" title="Router health check failed">{health.error}</InlineNotice>
       ) : null}
 
-      <ServiceHealthPanel health={health} compact onOpen={() => onNavigate("status")} />
-
       <div className="db-summary-grid" role="list" aria-label="Router summary">
         {tiles.map((tile) => {
           const Icon = tile.icon;
@@ -322,13 +350,17 @@ export function DashboardPage({
                 <Icon aria-hidden size={12} strokeWidth={1.8} />
                 {tile.label}
               </span>
-              <strong className="db-summary-value">{tile.value}</strong>
+              {tile.pending ? (
+                <SkeletonBlock className="db-skeleton-summary-value" />
+              ) : <strong className="db-summary-value">{tile.value}</strong>}
               {tile.meter === undefined ? null : (
                 <span className="db-summary-meter" aria-hidden="true">
                   <i style={{ width: `${Math.max(2, Math.min(100, tile.meter))}%` }} />
                 </span>
               )}
-              <small className="db-summary-detail">{tile.detail}</small>
+              {tile.pending ? (
+                <SkeletonBlock className="db-skeleton-summary-detail" />
+              ) : <small className="db-summary-detail">{tile.detail}</small>}
               <span className="db-summary-link" aria-hidden="true">
                 View {tile.viewLabel}
                 <ArrowUpRight aria-hidden size={11} strokeWidth={1.9} />
@@ -353,7 +385,9 @@ export function DashboardPage({
               </div>
             )}
           />
-          {!events ? (
+          {snapshotPending ? (
+            <PanelSkeleton label="Loading router traffic" count={4} />
+          ) : !events ? (
             <EmptyState
               icon={<BarChart3 size={20} />}
               title={refreshing ? "Reading router telemetry" : "Router telemetry unavailable"}
@@ -385,6 +419,7 @@ export function DashboardPage({
         events={events}
         providerUsage={providerUsage}
         refreshing={refreshing}
+        loading={snapshotPending && !providerUsage}
       />
 
       <div className="db-panel-grid db-dashboard-details">
@@ -399,7 +434,9 @@ export function DashboardPage({
               </Button>
             )}
           />
-          <div className="db-breakdown-stack">
+          {providerUsagePending ? (
+            <PanelSkeleton label="Loading provider and model usage" count={4} />
+          ) : <div className="db-breakdown-stack">
             <BreakdownGroup
               title="Providers"
               emptyTitle={providerUsage ? "No metered provider traffic" : refreshing ? "Reading providers" : "Provider usage unavailable"}
@@ -413,7 +450,7 @@ export function DashboardPage({
               emptyBody={modelBreakdown.length ? "" : "A model appears after it serves a request with usage metadata."}
               rows={modelBreakdown}
             />
-          </div>
+          </div>}
         </section>
       </div>
 
@@ -428,7 +465,9 @@ export function DashboardPage({
             </Button>
           )}
         />
-        {recentEvents.length ? (
+        {snapshotPending ? (
+          <PanelSkeleton label="Loading recent router activity" count={5} />
+        ) : recentEvents.length ? (
           <div className="db-event-list">
             {recentEvents.map((event, index) => (
               <DashboardEventRow key={`${event.at}-${event.model || "model"}-${index}`} event={event} />
@@ -444,7 +483,89 @@ export function DashboardPage({
           />
         )}
       </section>
+
+      <RouteDashboardPanel
+        providers={routeProviders}
+        routeMutations={routeMutations}
+        api={api}
+        onNavigate={onNavigate}
+        loading={routesPending}
+      />
+
+      {healthPending ? (
+        <SkeletonBlock className="db-skeleton-health" />
+      ) : (
+        <ServiceHealthPanel health={health} compact onOpen={() => onNavigate("status")} />
+      )}
     </div>
+  );
+}
+
+function RouteDashboardPanel({
+  providers,
+  routeMutations,
+  api,
+  onNavigate,
+  loading,
+}: {
+  providers: RouterDashboardSnapshot["providers"];
+  routeMutations: {
+    value: (key: string, fallback: boolean) => boolean;
+    mutate: (key: string, next: boolean, label: string, action: () => Promise<unknown>) => Promise<void>;
+  };
+  api?: RouterControlApi;
+  onNavigate: (view: ViewId, modelFocus?: ModelViewFocus) => void;
+  loading: boolean;
+}) {
+  const visible = providers.filter((provider) => provider.kind !== "per-model");
+  return (
+    <section className="db-route-dashboard" aria-labelledby="db-route-dashboard-title">
+      <SectionHeading
+        title="Provider routes"
+        description="Enable or disable validated provider routes. Changes are saved atomically and shared with the tray."
+        action={<Button variant="ghost" onClick={() => onNavigate("models")}>Manage models</Button>}
+      />
+      {loading ? (
+        <PanelSkeleton label="Loading provider routes" count={3} />
+      ) : visible.length === 0 ? (
+        <EmptyState title="No provider routes" body="Connect a provider to make a route available here." />
+      ) : (
+        <div className="db-route-list" role="list" aria-label="Provider routes">
+          {visible.map((provider) => {
+            const enabled = routeMutations.value(provider.id, provider.enabled);
+            return (
+              <div className="db-route-row" key={provider.id} role="listitem">
+                <ProviderLogo providerId={provider.id} displayName={provider.displayName} size="small" />
+                <div className="db-route-copy">
+                  <strong>{provider.displayName}</strong>
+                  <small>{enabled ? "Route enabled" : "Route disabled"}</small>
+                </div>
+                <Badge tone={enabled ? "success" : "neutral"}>{enabled ? "Enabled" : "Disabled"}</Badge>
+                <Button
+                  variant={enabled ? "secondary" : "primary"}
+                  type="button"
+                  disabled={!api}
+                  aria-pressed={enabled}
+                  aria-label={`${enabled ? "Disable" : "Enable"} ${provider.displayName}`}
+                  onClick={() => {
+                    if (!api) return;
+                    const next = !enabled;
+                    void routeMutations.mutate(
+                      provider.id,
+                      next,
+                      `${next ? "Enable" : "Disable"} ${provider.displayName}`,
+                      () => api.setProviderEnabled(provider.id, next),
+                    );
+                  }}
+                >
+                  {enabled ? "Disable" : "Enable"}
+                </Button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -452,10 +573,12 @@ function TokenActivity({
   events,
   providerUsage,
   refreshing,
+  loading,
 }: {
   events?: UsageEvent[];
   providerUsage?: ProviderUsageSnapshot;
   refreshing: boolean;
+  loading: boolean;
 }) {
   const [mode, setMode] = useState<TokenActivityMode>("daily");
   const activity = useMemo(
@@ -504,7 +627,9 @@ function TokenActivity({
         </div>
       </div>
 
-      <div className="db-token-calendar-scroll">
+      {loading ? (
+        <PanelSkeleton label="Loading retained token activity" count={2} />
+      ) : <><div className="db-token-calendar-scroll">
         <div className="db-token-calendar">
           <div className="db-token-cells" role="grid" aria-label={`${capitalize(mode)} token activity for the last year`}>
             {viewDays.map((day) => {
@@ -553,7 +678,7 @@ function TokenActivity({
           {[0, 1, 2, 3, 4].map((level) => <i key={level} className={`level-${level}`} />)}
           More
         </span>
-      </div>
+      </div></>}
     </section>
   );
 }
@@ -1377,7 +1502,12 @@ function tokensPerSecondFromEvent(event: UsageEvent): number | null {
   ) return null;
   const generationDurationMs = durationMs - firstTokenMs;
   if (generationDurationMs <= 0) return null;
-  const rate = (output * 1_000) / generationDurationMs;
+  // Subtract reasoning tokens from output for tok/s numerator (same as provider-usage).
+  // Industry TTFT measures time to first visible token; reasoning tokens are generated
+  // during silent thinking before any visible output.
+  const reasoningTokens = optionalNumber(event.reasoningTokens) ?? 0;
+  const speedOutput = Math.max(0, output - reasoningTokens);
+  const rate = (speedOutput * 1_000) / generationDurationMs;
   return Number.isFinite(rate) && rate <= 500 ? Math.round(rate * 10) / 10 : null;
 }
 

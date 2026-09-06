@@ -10,22 +10,34 @@ import {
 } from "./grok-cli.mjs";
 import { devinCliStatus } from "./devin-cli-status.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
+import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
+import { removeAntigravityToken } from "./antigravity-oauth-session.mjs";
 import { KIMI_CLI_NPM_PACKAGE } from "./kimi-oauth-onboarding.mjs";
 import { MODELS, PROVIDERS, providerNeedsNoKey } from "./model-registry.mjs";
+import {
+  forgetProviderCatalogFamilyCache,
+  providerCatalogSources,
+} from "./provider-catalogs.mjs";
+import { curationProviderIds } from "./opencode-curation.mjs";
 import { kimiOAuthStatus } from "./oauth-status.mjs";
 import {
   apiProvider,
   credentialLabel,
-  credentialStatus,
   removeProviderCredential,
   writeProviderCredential,
 } from "./provider-credentials.mjs";
+import {
+  effectiveProviderCredentialStatus,
+  providerApiKeyAuthoritySnapshot,
+} from "./provider-api-key-routing.mjs";
 import { disableProvider } from "./provider-selection.mjs";
 import {
+  installFailureDetail,
   npmGlobalBinary,
   npmInstallGlobal,
   spawnEnvironment,
 } from "./npm-global-install.mjs";
+import { ensureNodeDependencies } from "./node-dependency-install.mjs";
 import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
 
 const SIGN_IN_CLIS = Object.freeze({
@@ -83,6 +95,7 @@ export function oauthLoginArgs(providerId) {
 function oauthConfigured(providerId) {
   if (providerId === "kimi-oauth") return kimiOAuthStatus().configured;
   if (providerId === "grok-oauth") return grokOAuthStatus().configured;
+  if (providerId === "antigravity-oauth") return antigravityOAuthStatus().configured;
   if (providerId === "devin-cli") return devinCliStatus().configured;
   return false;
 }
@@ -91,9 +104,58 @@ export function providerOnboardingSnapshot() {
   // Protocol variants share their parent's key and selection, so onboarding
   // surfaces (tray, guided setup) offer one entry per family.
   const selectable = [...PROVIDERS.values()].filter((provider) => !provider.variantOf);
+  const poolAuthoritySnapshot = providerApiKeyAuthoritySnapshot();
   return {
     providers: selectable.map((provider) => {
+      const catalogSources = providerCatalogSources(provider.id);
       if (provider.kind === "oauth") {
+        // Antigravity has no vendor CLI to install or reuse: its sign-in is
+        // this router's own browser OAuth flow.
+        if (provider.id === "antigravity-oauth") {
+          const status = antigravityOAuthStatus();
+          const configured = status.configured;
+          return {
+            id: provider.id,
+            displayName: provider.displayName,
+            kind: "oauth",
+            credentialLabel: "Operator OAuth client",
+            configured,
+            signedIn: status.signedIn === true,
+            verified: status.verified === true,
+            // A rejected or damaged session is not configured, but its
+            // router-managed file must remain removable from every UI.
+            disconnectable: status.credentialPresent,
+            cliInstalled: true,
+            cliRunnable: true,
+            action: configured
+              ? "ready"
+              : status.activationPending
+                ? "blocked"
+              : status.signedIn
+                ? "probe"
+                : status.credentialPresent && status.clientReady !== true
+                  ? "blocked"
+                  : "login",
+            ...(!configured && status.signedIn && !status.activationPending
+              ? { probeNote: "A live compatibility test is required before enabling this route; it sends a small prompt and uses provider quota." }
+              : {}),
+            ...(status.activationPending
+              ? {
+                  blockedNote:
+                    "The live proof is pending router health activation. Restart the managed router service, then enable the provider to republish it.",
+                }
+              : {}),
+            ...(!status.signedIn && status.credentialPresent && status.clientReady !== true
+              ? {
+                  blockedNote: status.reconnectRequired
+                    ? "Google rejected this operator OAuth client. Disconnect it, then sign in with a valid operator-owned Google Desktop app client."
+                    : status.recoveryNote ||
+                      "An incompatible router record is preserved. Disconnect it explicitly before starting the operator-owned OAuth sign-in.",
+                }
+              : {}),
+            ...(catalogSources.length ? { catalogSources } : {}),
+          };
+        }
         const cliPath = oauthCliPath(provider.id);
         const cli = provider.id === "grok-oauth"
           ? grokCliPreflight({ executable: cliPath })
@@ -114,11 +176,15 @@ export function providerOnboardingSnapshot() {
               : configured
                 ? "ready"
                 : "login",
+          ...(catalogSources.length ? { catalogSources } : {}),
         };
       }
       const configured = providerNeedsNoKey(provider)
         ? true
-        : credentialStatus(provider, { persistent: true }).configured;
+        : effectiveProviderCredentialStatus(provider, {
+            persistent: true,
+            poolAuthoritySnapshot,
+          }).configured;
       const entry = {
         id: provider.id,
         displayName: provider.displayName,
@@ -126,6 +192,7 @@ export function providerOnboardingSnapshot() {
         ...(provider.credential?.label ? { credentialLabel: credentialLabel(provider) } : {}),
         configured,
         action: configured ? "ready" : "add-key",
+        ...(catalogSources.length ? { catalogSources } : {}),
         // Carried to the tray so the plan requirement is visible at the
         // moment someone decides to connect, not after Codex 403s.
         ...(provider.planNote ? { planNote: provider.planNote } : {}),
@@ -198,7 +265,22 @@ export function installOauthCli(providerId) {
 // CLI waits on a terminal it will never get.
 const LOGIN_TIMEOUT_MS = 10 * 60_000;
 
-export function loginOauthProvider(providerId) {
+export async function loginOauthProvider(providerId, { signal, deadline } = {}) {
+  if (providerId === "antigravity-oauth") {
+    // Prepare the checkout before opening a browser so a fresh install cannot
+    // fail only after the operator has authorized Google and returned to the
+    // callback.
+    await ensureNodeDependencies({ signal, deadline });
+    const { signInAntigravity } = await import("./antigravity-oauth-onboarding.mjs");
+    await signInAntigravity({ signal, deadline });
+    if (!antigravityOAuthStatus().signedIn) {
+      throw new Error("Sign-in finished without a usable Antigravity OAuth session. Please try again.");
+    }
+    if (providerCatalogSources(providerId).length) {
+      await forgetProviderCatalogFamilyCache(providerId);
+    }
+    return;
+  }
   const executable = oauthCliPath(providerId);
   if (!executable) throw new Error("Install the provider CLI before signing in.");
   if (providerId === "grok-oauth") {
@@ -231,6 +313,9 @@ export function loginOauthProvider(providerId) {
   if (!oauthConfigured(providerId)) {
     throw new Error("Sign-in finished without a usable OAuth session. Please try again.");
   }
+  if (providerCatalogSources(providerId).length) {
+    await forgetProviderCatalogFamilyCache(providerId);
+  }
 }
 
 export function saveApiCredential(providerId, value) {
@@ -240,11 +325,26 @@ export function saveApiCredential(providerId, value) {
 // Deleting the managed key files cannot reach a key that also lives in the
 // macOS Keychain or the environment, so report what still resolves afterwards
 // instead of claiming the credential itself is gone.
-export function removeApiCredential(providerId) {
+export async function removeApiCredential(providerId) {
+  if (providerId === "antigravity-oauth") {
+    const provider = PROVIDERS.get(providerId);
+    const removedFiles = (await removeAntigravityToken()) ? 1 : 0;
+    // Disconnect is also a routing decision. Withdraw the provider even when
+    // the credential vanished between the snapshot and this action.
+    disableProvider(providerId);
+    const remaining = antigravityOAuthStatus();
+    return {
+      provider: providerId,
+      displayName: provider?.displayName || "Google Antigravity OAuth",
+      removedFiles,
+      stillConfigured: remaining.configured === true,
+      remainingSource: remaining.configured ? remaining.source : undefined,
+    };
+  }
   const provider = apiProvider(providerId);
   const removedFiles = removeProviderCredential(provider);
   if (removedFiles) disableProvider(provider.id);
-  const remaining = credentialStatus(provider, { persistent: true });
+  const remaining = effectiveProviderCredentialStatus(provider, { persistent: true });
   return {
     provider: provider.id,
     displayName: provider.displayName,
@@ -259,5 +359,6 @@ export function removeApiCredential(providerId) {
 // use this to name the curation step instead of reporting a provider that
 // looks enabled but shows nothing.
 export function providerNeedsCuration(providerId, models = MODELS) {
-  return !models.some((model) => model.provider === providerId);
+  const providers = new Set(curationProviderIds(providerId));
+  return !models.some((model) => providers.has(model.provider));
 }

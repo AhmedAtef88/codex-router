@@ -84,6 +84,7 @@ export function recordUsageEvent({
   cachedInputTokens,
   outputTokens,
   billedOutputTokens,
+  reasoningTokens,
   totalTokens,
   retries,
   // True when the upstream stream died after its 200 head was already
@@ -95,10 +96,11 @@ export function recordUsageEvent({
   // produced output text or a tool call, and the router suppressed the empty
   // completion instead of letting the client record a silent success.
   emptyCompletion,
-  // True when the empty completion above was retried once against the same
-  // request body. `status` describes the retry's own outcome; the token counts
-  // cover both attempts, because both were sent and both were billed. This
-  // marker is what says the reported spend belongs to two attempts at one turn.
+  // True when the guard retried once against the same request body, either
+  // after a proven empty completion or after a pre-content safety limit.
+  // `status` describes the retry's own outcome; the token counts cover both
+  // attempts, because both were sent and both were billed. This marker is what
+  // says the reported spend belongs to two attempts at one turn.
   emptyCompletionRetried,
   // True when the Grok OAuth forwarder retried a progress-only stop. New rows
   // keep the selected attempt in the ordinary token fields and the aggregate
@@ -118,19 +120,29 @@ export function recordUsageEvent({
   // release is the conservative path: the turn is relayed as-is and cannot be
   // proven empty, but it must not read as a guaranteed-healthy turn either.
   emptyCompletionGuardReleased,
+  // The byte or time safety limit ended the pre-content hold while no output
+  // had reached the client. Current routers retry that attempt once and fail
+  // explicitly if the retry also reaches the limit; historical routers used
+  // `emptyCompletionGuardReleased` for the old fail-open behavior above.
+  emptyCompletionPreludeLimit,
   // Present only when the router replaced an upstream `input_tokens: 0` with
   // its own estimate on the way to Codex (#95). The reported counts above stay
   // exactly as the provider sent them, so an estimated turn is never mistaken
   // for the provider having recovered -- and a run of these events is the
   // signal that it has not.
   estimatedInputTokens,
-  // Present only when the routed request compacted old, already-consumed tool
-  // results. Counts and bytes describe the request sent upstream, never the
-  // result contents themselves.
+  // True when the router canceled a request at its separately configured
+  // execution deadline. Activity-record retention never sets this field.
+  requestDeadlineExceeded,
+  // Present only when the routed request compacted old results or pressure-
+  // shaped noisy results. Counts and bytes describe the request sent upstream,
+  // never the result contents themselves.
   toolResultsAged,
+  toolResultsShaped,
   toolResultBytesBefore,
   toolResultBytesAfter,
   toolResultBytesSaved,
+  toolResultShapeBytesSaved,
   // Present whenever the aging pass ran, even when it changed nothing. Every
   // count above is omitted when zero, so without these an operator who enables
   // aging and sees an empty ledger cannot tell whether the pass never ran or
@@ -145,6 +157,12 @@ export function recordUsageEvent({
   // who simply changed models, which is the difference between "your provider
   // is empty" and "you switched".
   failoverFrom,
+  // Codex standalone search normally spends the caller's native ChatGPT
+  // session. These fields distinguish an explicitly configured external
+  // sidecar request and whether it was served from its account-scoped cache.
+  searchSidecar,
+  searchCacheHit,
+  searchResults,
   at = Date.now(),
 }) {
   const event = {
@@ -170,9 +188,21 @@ export function recordUsageEvent({
     ...(emptyCompletionGuardReleased === true
       ? { emptyCompletionGuardReleased: true }
       : {}),
+    ...(requestDeadlineExceeded === true ? { requestDeadlineExceeded: true } : {}),
+    ...(emptyCompletionPreludeLimit === "bytes" ||
+    emptyCompletionPreludeLimit === "time"
+      ? { emptyCompletionPreludeLimit }
+      : {}),
     ...(safeRetryCount(retries) !== undefined ? { retries: safeRetryCount(retries) } : {}),
     ...(typeof failoverFrom === "string" && failoverFrom.trim()
       ? { failoverFrom: safeText(failoverFrom, "unknown") }
+      : {}),
+    ...(searchSidecar === true ? { searchSidecar: true } : {}),
+    ...(searchSidecar === true && typeof searchCacheHit === "boolean"
+      ? { searchCacheHit }
+      : {}),
+    ...(searchSidecar === true && safeTokenCount(searchResults) !== undefined
+      ? { searchResults: safeTokenCount(searchResults) }
       : {}),
     ...(safeTokenCount(inputTokens) !== undefined
       ? { inputTokens: safeTokenCount(inputTokens) }
@@ -189,6 +219,9 @@ export function recordUsageEvent({
     ...(safeTokenCount(billedOutputTokens) !== undefined
       ? { billedOutputTokens: safeTokenCount(billedOutputTokens) }
       : {}),
+    ...(safeTokenCount(reasoningTokens) !== undefined
+      ? { reasoningTokens: safeTokenCount(reasoningTokens) }
+      : {}),
     ...(safeTokenCount(totalTokens) !== undefined
       ? { totalTokens: safeTokenCount(totalTokens) }
       : {}),
@@ -196,6 +229,9 @@ export function recordUsageEvent({
       ? { estimatedInputTokens: safeTokenCount(estimatedInputTokens) }
       : {}),
     ...(safeTokenCount(toolResultsAged) ? { toolResultsAged: safeTokenCount(toolResultsAged) } : {}),
+    ...(safeTokenCount(toolResultsShaped)
+      ? { toolResultsShaped: safeTokenCount(toolResultsShaped) }
+      : {}),
     ...(safeTokenCount(toolResultBytesBefore)
       ? { toolResultBytesBefore: safeTokenCount(toolResultBytesBefore) }
       : {}),
@@ -204,6 +240,9 @@ export function recordUsageEvent({
       : {}),
     ...(safeTokenCount(toolResultBytesSaved)
       ? { toolResultBytesSaved: safeTokenCount(toolResultBytesSaved) }
+      : {}),
+    ...(safeTokenCount(toolResultShapeBytesSaved)
+      ? { toolResultShapeBytesSaved: safeTokenCount(toolResultShapeBytesSaved) }
       : {}),
     // Zero is meaningful here -- it says the pass ran and saw no tool results
     // at all -- so these are written whenever defined rather than when truthy.
@@ -267,6 +306,7 @@ export function toolResultAgingTotals({ now = Date.now() } = {}) {
     evaluatedRequests: 0,
     largestResultBytes: 0,
     resultsAged: 0,
+    resultsShaped: 0,
     bytesSaved: 0,
     estimatedTokensSaved: 0,
     firstAt: undefined,
@@ -282,7 +322,9 @@ export function toolResultAgingTotals({ now = Date.now() } = {}) {
     for (const line of usageEventLines()) {
       // Pre-filter: aging stats and cache telemetry are both rare fields.
       const hasAging =
-        line.includes('"toolResultsAged"') || line.includes('"toolResultsEvaluated"');
+        line.includes('"toolResultsAged"') ||
+        line.includes('"toolResultsShaped"') ||
+        line.includes('"toolResultsEvaluated"');
       const hasCache = line.includes('"cachedInputTokens"');
       if (!hasAging && !hasCache) continue;
       let event;
@@ -299,9 +341,12 @@ export function toolResultAgingTotals({ now = Date.now() } = {}) {
         if (largest > totals.largestResultBytes) totals.largestResultBytes = largest;
       }
       const resultsAged = safeTokenCount(event?.toolResultsAged);
-      if (resultsAged) {
+      const resultsShaped = safeTokenCount(event?.toolResultsShaped);
+      const resultsCompacted = (resultsAged ?? 0) + (resultsShaped ?? 0);
+      if (resultsCompacted) {
         totals.requests += 1;
-        totals.resultsAged += resultsAged;
+        totals.resultsAged += resultsAged ?? 0;
+        totals.resultsShaped += resultsShaped ?? 0;
         const bytesSaved = safeTokenCount(event.toolResultBytesSaved) ?? 0;
         totals.bytesSaved += bytesSaved;
         if (typeof event.at === "string") {
@@ -327,10 +372,10 @@ export function toolResultAgingTotals({ now = Date.now() } = {}) {
       if (hasCache && inputTokens && cachedInputTokens !== undefined && Number.isFinite(at)) {
         AGING_RANGES.forEach((range, index) => {
           if (at < now - range.bucketMs * range.buckets) return;
-          const side = cacheSums[index][resultsAged ? "aged" : "unaged"];
+          const side = cacheSums[index][resultsCompacted ? "aged" : "unaged"];
           side[0] += inputTokens;
           side[1] += Math.min(cachedInputTokens, inputTokens);
-          totals.ranges[range.key].cache[resultsAged ? "agedTurns" : "unagedTurns"] += 1;
+          totals.ranges[range.key].cache[resultsCompacted ? "agedTurns" : "unagedTurns"] += 1;
         });
       }
     }
@@ -411,13 +456,17 @@ export function recentUsageEvents({ sinceMs = 24 * 60 * 60 * 1000, limit = 1_000
         const cachedInputTokens = safeTokenCount(event.cachedInputTokens);
         const outputTokens = safeTokenCount(event.outputTokens);
         const billedOutputTokens = safeTokenCount(event.billedOutputTokens);
+        const reasoningTokens = safeTokenCount(event.reasoningTokens);
         const totalTokens = safeTokenCount(event.totalTokens);
         const retries = safeRetryCount(event.retries);
         const estimatedInputTokens = safeTokenCount(event.estimatedInputTokens);
         const toolResultsAged = safeTokenCount(event.toolResultsAged);
+        const toolResultsShaped = safeTokenCount(event.toolResultsShaped);
         const toolResultBytesBefore = safeTokenCount(event.toolResultBytesBefore);
         const toolResultBytesAfter = safeTokenCount(event.toolResultBytesAfter);
         const toolResultBytesSaved = safeTokenCount(event.toolResultBytesSaved);
+        const toolResultShapeBytesSaved = safeTokenCount(event.toolResultShapeBytesSaved);
+        const searchResults = safeTokenCount(event.searchResults);
         return {
           ...(event.meteringVersion === 1 ? { meteringVersion: 1 } : {}),
           at: event.at,
@@ -448,18 +497,32 @@ export function recentUsageEvents({ sinceMs = 24 * 60 * 60 * 1000, limit = 1_000
           ...(event.emptyCompletionGuardReleased === true
             ? { emptyCompletionGuardReleased: true }
             : {}),
+          ...(event.emptyCompletionPreludeLimit === "bytes" ||
+          event.emptyCompletionPreludeLimit === "time"
+            ? { emptyCompletionPreludeLimit: event.emptyCompletionPreludeLimit }
+            : {}),
           ...(retries !== undefined ? { retries } : {}),
+          ...(event.searchSidecar === true ? { searchSidecar: true } : {}),
+          ...(event.searchSidecar === true && typeof event.searchCacheHit === "boolean"
+            ? { searchCacheHit: event.searchCacheHit }
+            : {}),
+          ...(event.searchSidecar === true && searchResults !== undefined
+            ? { searchResults }
+            : {}),
           ...(inputTokens !== undefined ? { inputTokens } : {}),
           ...(billedInputTokens !== undefined ? { billedInputTokens } : {}),
           ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
           ...(outputTokens !== undefined ? { outputTokens } : {}),
           ...(billedOutputTokens !== undefined ? { billedOutputTokens } : {}),
+          ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
           ...(totalTokens !== undefined ? { totalTokens } : {}),
           ...(estimatedInputTokens !== undefined ? { estimatedInputTokens } : {}),
           ...(toolResultsAged ? { toolResultsAged } : {}),
+          ...(toolResultsShaped ? { toolResultsShaped } : {}),
           ...(toolResultBytesBefore ? { toolResultBytesBefore } : {}),
           ...(toolResultBytesAfter ? { toolResultBytesAfter } : {}),
           ...(toolResultBytesSaved ? { toolResultBytesSaved } : {}),
+          ...(toolResultShapeBytesSaved ? { toolResultShapeBytesSaved } : {}),
         };
       });
     return events;
