@@ -37,7 +37,7 @@ export function refreshCatalogCompletionMessage(status) {
   if (status === "disabled") {
     return "Bundled native and external model catalogs refreshed. Fully quit and reopen Codex.\n";
   }
-  if (status === "failed" || status === "unavailable") {
+  if (status === "failed" || status === "unavailable" || status === "stale-client") {
     return "External models refreshed; native models were rebuilt from available cached and bundled data because the live account catalog could not be refreshed. Fully quit and reopen Codex.\n";
   }
   return "Native account, bundled, and external model catalogs refreshed. Fully quit and reopen Codex.\n";

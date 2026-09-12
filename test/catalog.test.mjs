@@ -1574,6 +1574,7 @@ test(
       const visibility = new Map(
         merged.models.map((model) => [String(model.slug), model.visibility]),
       );
+      assert.equal(visibility.get("deepseek/deepseek-v4.1-flash"), "list");
       assert.equal(visibility.get("deepseek/deepseek-v4-flash"), "list");
       assert.equal(visibility.get("deepseek/deepseek-v4-flash-vision-exp"), "list");
       assert.equal(visibility.get("deepseek/deepseek-v4-pro"), "hide");
@@ -1585,6 +1586,7 @@ test(
       assert.deepEqual(picker.visible, [
         "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-flash-vision-exp",
+        "deepseek/deepseek-v4.1-flash",
       ]);
     } finally {
       rmSync(codexHome, { recursive: true, force: true });
