@@ -1998,11 +1998,17 @@ function goCompatibilityRequestPayload(
       { type: "function_call_output", call_id: "history-discovered", output: "done" },
       {
         type: "custom_tool_call",
+        id: "ctc_history_patch",
         name: "apply_patch",
         call_id: "history-patch",
         input: GO_PATCH,
       },
-      { type: "custom_tool_call_output", call_id: "history-patch", output: "Done!" },
+      {
+        type: "custom_tool_call_output",
+        id: "ctco_history_patch",
+        call_id: "history-patch",
+        output: "Done!",
+      },
       {
         type: "custom_tool_call",
         name: "future_custom",
@@ -2143,6 +2149,14 @@ test("OpenCode Go Responses uses one bounded function-tool contract in both resp
       outgoing.input.find((item) => item.call_id === "history-patch").type,
       "function_call",
     );
+    const patchCall = outgoing.input.find(
+      (item) => item.call_id === "history-patch" && item.type === "function_call",
+    );
+    const patchOutput = outgoing.input.find(
+      (item) => item.call_id === "history-patch" && item.type === "function_call_output",
+    );
+    assert.equal(Object.hasOwn(patchCall, "id"), false);
+    assert.equal(Object.hasOwn(patchOutput, "id"), false);
     const futureCustom = outgoing.input.find(
       (item) => item.call_id === "history-future-custom" && item.type === "function_call",
     );
@@ -2517,7 +2531,7 @@ test("Grok structured patch opt-in crosses the real Router with collision, choic
     assert.deepEqual(outgoing.tool_choice, { type: "function", name: tool.name });
     const old = outgoing.input.find((item) => item.call_id === "call_history");
     assert.equal(old.name, tool.name);
-    assert.equal(old.id, "ctc_history");
+    assert.equal(Object.hasOwn(old, "id"), false);
     assert.equal(JSON.parse(old.arguments).input, grokApplyPatchPayload(stream, outgoing.model).input[1].input);
     assert.deepEqual(outgoing.input.find((item) => item.type === "function_call_output"), { type: "function_call_output", call_id: "call_history", output: "Done!" });
     const items = stream ? responseItemsFromSse(result.clientBody) : JSON.parse(result.clientBody).output;
@@ -2731,4 +2745,162 @@ test("routed native apply_patch relays LiteLLM arguments that are not a leading 
     assert.equal(closed.item.type, "custom_tool_call");
     assert.equal(closed.item.input, call.input, `${call.id} item input`);
   }
+});
+
+test("a routed turn whose tool calls leaked into the reasoning channel still runs them", async () => {
+  // Captured from rollout 01a0924e (opencode-go hy4-preview, 12 September 2026):
+  // the model wrote its calls as text on the reasoning channel, nothing reached
+  // the tool_calls array, and Codex ended the turn on an empty assistant
+  // message -- "Worked for 3m 58s" with no answer under it.
+  const n = "6124c78e";
+  const leaked =
+    "Boot is running. Let me keep reading the behavior code while it comes up." +
+    `<tool_calls:${n}><tool_call:${n}>exec_command` +
+    `<arg_key:${n}>cmd</arg_key:${n}><arg_value:${n}>tail -5 .qa/eo-up.log</arg_value:${n}>` +
+    `<arg_key:${n}>workdir</arg_key:${n}><arg_value:${n}>/tmp/eo</arg_value:${n}>` +
+    `</tool_call:${n}></tool_calls:${n}>`;
+  const emptyMessage = {
+    id: "msg_blank",
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [],
+  };
+  const result = await scenario(true, {
+    // The route the capture came from. Recovery is Hy4-only on purpose: this
+    // markup is Hy4's native tool-call syntax, and scanning every routed
+    // provider's text for it would turn prose that merely quotes it into
+    // executed calls.
+    model: "opencode-go/hy4-preview",
+    sseBody: () => [
+      sseEvent({ type: "response.created", response: { id: "resp_leak" } }),
+      sseEvent({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "reasoning", id: "rs_leak", summary: [] },
+      }),
+      sseEvent({
+        type: "response.reasoning_summary_text.delta",
+        output_index: 0,
+        item_id: "rs_leak",
+        delta: leaked,
+      }),
+      sseEvent({
+        type: "response.reasoning_summary_text.done",
+        output_index: 0,
+        item_id: "rs_leak",
+        text: leaked,
+      }),
+      sseEvent({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: { type: "reasoning", id: "rs_leak", summary: [{ type: "summary_text", text: leaked }] },
+      }),
+      sseEvent({ type: "response.output_item.added", output_index: 1, item: emptyMessage }),
+      sseEvent({ type: "response.output_item.done", output_index: 1, item: emptyMessage }),
+      sseEvent({ type: "response.completed", response: { id: "resp_leak", output: [] } }),
+      "data: [DONE]\n\n",
+    ].join(""),
+  });
+
+  const calls = [...functionCallsFromSse(result.clientBody).values()];
+  assert.equal(calls.length, 1, "the leaked call reaches Codex as a real tool call");
+  assert.equal(calls[0].name, "exec_command");
+  assert.deepEqual(JSON.parse(calls[0].arguments), {
+    cmd: "tail -5 .qa/eo-up.log",
+    workdir: "/tmp/eo",
+  });
+  // The markup itself never reaches the client, and the reasoning it was buried
+  // in still does.
+  assert.ok(!result.clientBody.includes("arg_key"));
+  assert.ok(!result.clientBody.includes("tool_calls:"));
+  assert.ok(result.clientBody.includes("Let me keep reading the behavior code"));
+  // The recovered call lands before the turn closes, so the blank message is
+  // labelled commentary rather than becoming the turn's final answer.
+  const blank = responseItemsFromSse(result.clientBody)
+    .filter((item) => item.type === "message" && item.id === "msg_blank")
+    .at(-1);
+  assert.equal(blank.phase, "commentary");
+});
+
+test("hy4's prior reasoning is replayed as thinking, never as its own visible prose", async () => {
+  // Rollout 01a0928e (opencode-go hy4-preview, 12 September 2026): once the
+  // model's past reasoning was replayed to it as ordinary assistant text, it
+  // stopped using the reasoning channel (174 reasoning tokens -> 0 at one
+  // step) and looped on its last progress note -- 2, 4, 5, 8, then 16 copies.
+  const history = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "why is the NPC life awkward?" }] },
+    {
+      type: "reasoning",
+      id: "rs_prior",
+      summary: [{ type: "summary_text", text: "PRIOR_THINKING: look at the locomotion code first." }],
+    },
+    {
+      type: "message",
+      role: "assistant",
+      id: "msg_prior",
+      content: [{ type: "output_text", text: "Let me read the locomotion code." }],
+    },
+    { type: "function_call", name: "exec_command", call_id: "call_prior", arguments: '{"cmd":"ls src"}' },
+    { type: "function_call_output", call_id: "call_prior", output: "pedestrians.js" },
+  ];
+  const outgoingFor = async (model) => {
+    const result = await scenario(true, {
+      model,
+      requestPayload: (stream, slug) => ({ model: slug, stream, input: history }),
+    });
+    return result.gatewayBodies[0];
+  };
+
+  // Hy4 by profile, and the same rule reached by upstream family on routes
+  // whose profiles say nothing about replay (GLM has no profile here, Kimi K3
+  // carries a sampling profile).
+  for (const slug of ["opencode-go/hy4-preview", "opencode-go/glm-5.3", "opencode-go/kimi-k3"]) {
+    const outgoing = await outgoingFor(slug);
+    const assistant = outgoing.input.find((item) => item.type === "message" && item.role === "assistant");
+    assert.ok(assistant, `${slug}: the assistant turn survives`);
+    const parts = assistant.content.map((part) => `${part.type}:${part.text}`);
+    assert.deepEqual(parts, [
+      "thinking:PRIOR_THINKING: look at the locomotion code first.",
+      "output_text:Let me read the locomotion code.",
+    ], slug);
+    assert.equal(
+      outgoing.input.some((item) => item.type === "reasoning"),
+      false,
+      `${slug}: the carried reasoning item is consumed, so it cannot also become a user message`,
+    );
+  }
+
+  // A chat route outside the contract now DROPS the prior reasoning instead of
+  // merging it as visible text. This assertion is the reverse of what it was,
+  // and the reversal is deliberate (#755).
+  //
+  // The old expectation was written to preserve context that LiteLLM would
+  // otherwise drop, and for a model that does not preserve thinking -- k2.6 is
+  // exactly that, which is why chat-reasoning.mjs leaves K2.x out of the
+  // family table -- the merge was harmless. What changed is upstream of this
+  // file: #708 widened the reasoning-lifecycle repair to every
+  // `openai`-protocol provider, so Codex now stores reasoning items on Chat
+  // resellers whose models DO think and are still outside the contract
+  // (`commandcode/qwen3.8-flash`, measured 14 September 2026). Replayed as
+  // prose those loop, and no field on the route separates them from k2.6 here
+  // -- identical requestProfile, reasoningLevels and defaultEffort -- so the
+  // channel is chosen per contract, not per model.
+  //
+  // The cost is real and was accepted rather than overlooked: a thread that
+  // switched models no longer shows the newer model the older one's thinking.
+  // For a model that does not think, that is the only case this can arise in
+  // at all, since it stores no reasoning of its own to carry.
+  const plain = await outgoingFor("opencode-go/kimi-k2.6");
+  const plainAssistant = plain.input.find((item) => item.type === "message" && item.role === "assistant");
+  assert.deepEqual(
+    plainAssistant.content.map((part) => `${part.type}:${part.text}`),
+    ["output_text:Let me read the locomotion code."],
+    "an off-contract route keeps what the model said and drops what it thought",
+  );
+  assert.equal(
+    plain.input.some((item) => item.type === "reasoning"),
+    false,
+    "the dropped reasoning must not survive as an item either",
+  );
 });

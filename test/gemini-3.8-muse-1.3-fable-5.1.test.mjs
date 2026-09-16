@@ -52,7 +52,10 @@ const FABLE_51_ROUTES = [
 // Additional confirmed routes 2026-09-03.
 const ADDITIONAL_ROUTES = [
   ["commandcode/qwen3.8-max-0902", "Qwen/Qwen3.8-Max-0902", 1_000_000, 900_000],
-  ["commandcode/glm-5.3-flash", "z-ai/glm-5.3-flash", 1_000_000, 900_000],
+  // 400K, not the 900K every other Command Code 1M route carries: the
+  // conservative threshold belongs to GLM-5.3-Flash rather than to a
+  // provider, and this entry shipped with the house default by accident.
+  ["commandcode/glm-5.3-flash", "z-ai/glm-5.3-flash", 1_000_000, 400_000],
   ["opencode-go-messages/qwen3.8-flash", "qwen3.8-flash", 262_144, 235_000],
 ];
 

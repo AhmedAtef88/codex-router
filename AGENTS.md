@@ -17,7 +17,11 @@ These instructions apply when a user asks an agent to install this repository.
   (Gemini CLI), `cursor` (Cursor Agent plus Cursor App), and `claude` (Claude
   Code through the router-owned launcher), and `openclaw` (OpenClaw through a
   router-owned Responses provider) are supported
-  targets. OpenCode remains a provider rather than a client target.
+  targets. OpenCode is not a `MODEL_ROUTER_TARGET`: it is both a provider and
+  one of the five *published-into* clients described under "Five clients,
+  one publisher, one key each" below, which `control client-setup` writes a
+  custom provider into rather than installing a target for. A published-into client never gets its
+  own service, state directory, or credential store.
 - Cursor is asymmetric: Cursor Agent uses the router's authenticated loopback
   Connect adapter, while retail Cursor App sends BYOK traffic through Cursor's
   servers and therefore needs an explicit stable public HTTPS tunnel to the
@@ -72,10 +76,13 @@ user.
    environment API key; it has no router-managed CLI sign-in path. The
    catalog-only providers `groq`, `together`, `fireworks`,
    `cerebras`, `mistral`, `nvidia-nim`, `siliconflow`, `huggingface`,
-   `gemini-api`, `github-copilot`, `chutes`, and `orca` are also selectable, but they ship no
+   `gemini-api`, `github-copilot`, `chutes`, `orca`, and `vertex` are also selectable, but they ship no
    preselected models: after
    the credential is stored, the user must run `bin/curate-models PROVIDER` in an
-   interactive terminal to choose models. If they did not specify and
+   interactive terminal to choose models. Vertex uses Application Default
+   Credentials from `gcloud auth application-default login` plus
+   `./bin/control vertex set PROJECT_ID LOCATION` rather than an API key, and
+   it is never selected by `defaultProviderIds()`. If they did not specify and
    credentials already exist, use
    `configured` rather than showing providers that cannot authenticate.
    `openrouter`, `venice`, and `nousresearch` also ship live-reviewed checked-in
@@ -281,7 +288,15 @@ and keep every turn on the shared canonical Responses path.
    `./install.ps1 -Target claude -Auto -Providers IDS` on Windows.
 3. The launcher supplies a secret-bearing loopback `ANTHROPIC_BASE_URL`,
    `ANTHROPIC_AUTH_TOKEN`, and gateway model discovery only to its child
-   process. It must not persist those values into Claude-owned files.
+   process. It must not persist those values into Claude-owned files. It also
+   pins Claude Code's agent and default-tier model names
+   (`CLAUDE_CODE_SUBAGENT_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, and
+   `ANTHROPIC_DEFAULT_OPUS_MODEL`/`_SONNET_MODEL`/`_HAIKU_MODEL`) to the same
+   routed model the session runs: built-in agents and agents whose frontmatter
+   pins `model: opus` resolve through the tier aliases rather than through
+   `CLAUDE_CODE_SUBAGENT_MODEL`, and an unpinned alias falls back to a literal
+   Anthropic id the router does not serve, which 404s every spawned agent of
+   that type. A caller value that already names a routed id is preserved.
 4. Model discovery publishes every routed slug as
    `codex_router/anthropic/ROUTER_SLUG`. The `anthropic` segment is required:
    Claude Code filters gateway-discovered ids that do not contain `claude` or
@@ -818,6 +833,15 @@ to ship tested support to every installer.
    as a provider-wide default. Never widen it by changing what
    `src/compatibility-test.mjs` sends: the probe must keep sending `required`,
    or it stops proving tool calling works for every other provider.
+   `dashscope-reasoning` is the same kind of model-scoped observation for
+   Alibaba Model Studio's OpenAI-compatible surfaces. It folds Codex's rung
+   onto the family's documented ladder (Qwen3.8 `none`/`low`/`medium`/`xhigh`,
+   GLM-5.3 `low`/`high`/`max`, DeepSeek V4.x `none`/`high`/`max`, with the
+   dated `0731`/`0813` snapshots keeping `low`), writes the nested spelling
+   on `/responses` and the flat one on `/chat/completions`, maps Codex's
+   `minimal` onto DashScope's `none` — Codex has no thinking-off rung of its
+   own — and downgrades the forced tool choice the Qwen3.8 family refuses in
+   thinking mode on both surfaces.
 7. Run `./bin/model-router codex doctor`. A live `bin/test-model` request uses
    provider quota, so run it only with the user's approval. Finally, tell the
    user to fully quit and reopen Codex before checking the picker.
@@ -1381,13 +1405,44 @@ The ladder also collides with the effort clamp in `src/catalog.mjs`. Codex
 gained the `max` variant in 0.143.0, so on anything older the catalog rewrites
 this model's default down to `xhigh` — a rung every route refuses. The
 legacy-named `ox-alpha` request profile in `src/api-forwarder.mjs` closes that
-loop for the OpenCode Go and OpenRouter named routes: it clamps whatever Codex
-sent onto the rungs the registry entry declares, so `xhigh` and `ultra` land on
-`max`, while `medium` and `minimal` land on `low`. An absent effort stays absent
+loop for the OpenCode Go, OpenRouter, and Command Code named routes: it clamps
+whatever Codex sent onto the rungs the registry entry declares, so `xhigh` and
+`ultra` land on `max`, while `medium` and `minimal` land on `low`. An absent effort stays absent
 so the upstream default applies, and undocumented `thinking` is stripped. Z.ai
 Coding uses its own `glm-thinking` profile. These named routes advertise a
 1,000,000-token window, compact at the directly proved conservative 400,000
 threshold, and preserve forced `tool_choice: "required"`.
+
+That 400,000 threshold belongs to the **model**, not to one reseller. Every
+checked-in GLM-5.3-Flash route carries it, including `commandcode/glm-5.3-flash`
+and the Ollama Cloud candidate, because the empty completions came from the
+model's own large multimodal histories rather than from a provider's serving
+stack, and each of these routes advertises the same 1M window over the same
+upstream id. `nousresearch/glm-5.3-flash` was dropped for compacting at 943,000
+against this rule; `commandcode/glm-5.3-flash` shipped at 900,000 for two weeks
+because that is the Command Code house value for a 1M window — the entry was
+written fresh in a bulk catalog pin, took the provider default, and no commit
+message, comment, or research note ever argued for it. A per-provider exception
+here is a claim about that provider's serving stack, so it needs its own
+evidence in the entry or in this file; a provider's boilerplate ratio is not
+that evidence.
+
+`commandcode/glm-5.3-flash` needed that clamp for the same reason and shipped
+without it. The profile chain in `src/api-forwarder.mjs` is keyed entirely on
+`requestProfile`, so a route that declares none forwards `reasoning_effort`
+verbatim — and this entry declares the model's `low`/`high`/`max` ladder, which
+is exactly the ladder whose top rung a pre-0.143 Codex cannot spell. Command
+Code documents no effort vocabulary of its own (which is why
+`commandcode/muse-spark-1.3` ships `high` alone), so the clamp is not a claim
+about that reseller's serving stack: it only guarantees the router sends a rung
+the entry itself advertises. Note that the clamp governs the Provider API path
+only. The `/alpha/generate` plan fallback in `src/commandcode-generate.mjs`
+builds its own schema-strict params and carries no effort at all, so on a
+coding-plan account the three rungs in the picker reach nothing either way.
+Other Command Code entries — `glm-5.3`, `glm-5.2`, the DeepSeek V4 routes, the
+GPT-5.x routes, and the `commandcode-messages` Claude routes — publish `max` or
+`xhigh` rungs with no clamp of their own and are in the same unproven position;
+none of them has a measured Command Code effort vocabulary behind it.
 
 `ollama-cloud/glm-5.3-flash` is checked in as candidate registry metadata with a
 model-scoped request profile that clamps both flat and nested reasoning effort
@@ -1403,6 +1458,33 @@ the router-level exact-route suite before it is called certified. That
 threshold is not a provider-measured boundary. It is text-only: GLM-5.3's
 multimodal variant is GLM-5.3-Flash, so the full-size route declares `text`
 modality instead of inheriting Flash's image path.
+
+Every GLM-5.3-Flash route therefore declares `["text", "image"]`, and the
+exceptions were the mistake. Z.ai files this model under its vision-language
+guides and gives its input modality as `Video / Image / Text / File`, documents
+the `image_url` content block for it, and says it is fully available on the GLM
+Coding Plan; OpenRouter's own catalog publishes `["text","image","video"]` for
+`z-ai/glm-5.3-flash`. Three routes nevertheless shipped text-only — the two
+Z.ai ones and OpenRouter's — because each entry was written fresh when the
+withdrawn Ox Alpha preset was replaced and took the conservative default rather
+than the preset's measured modality set, with no note saying otherwise (#756).
+A text-only declaration is not inert: `bridgeVisionInput` in `src/router.mjs`
+reads exactly this field, so it spent a second model's quota transcribing every
+pasted screenshot for a model that could read it directly, and the catalog told
+Codex the route was text-only. Two things about the Coding Plan endpoint are
+worth keeping straight, because they look like counter-evidence and are not.
+Z.ai's Vision MCP Server is an addition for Coding Plan users, not a substitute
+for a modality the endpoint lacks — its own page says a pasted image bypasses
+it because the client "will by default transcode the image and call the model
+interface directly". And the `Uncheck Support Images` line in the Cline and
+tool-integration guides is written against `glm-5.2`, which is text-only; those
+pages do not mention GLM-5.3-Flash at all. Z.ai publishes no modality table for
+`api/coding/paas/v4` in either direction, so the endpoint's acceptance of an
+image is documented only at the model level. A route that claims a modality it
+cannot serve trades a bridged read for a 400 on the whole turn, and it becomes
+a bridge **engine** for other text-only models as well, so a future Flash route
+on a new reseller is sourced from that reseller's own catalog rather than
+inherited from this paragraph.
 
 ## A provider whose models each name their own endpoint
 
@@ -1643,13 +1725,17 @@ about it.
   `model_catalog_json` block plus its marked `model_providers.codex-router`
   table and, when the user has no concurrency preference, its marked
   `[agents].max_concurrent_threads_per_session` default. It may change the root
-  `model_provider` only when the user explicitly
-  enables the tray's login-free mode. In that mode it may also select an
-  enabled external `model`; snapshot both previous values in protected router
-  state and restore them exactly when the mode is disabled.
+  `model_provider` only when the user explicitly enables either login-free mode
+  or signed routing from a root-OpenAI configuration. Signed routing selects
+  the dedicated, ChatGPT-authenticated `codex-router-signed` provider; ordinary
+  install, update, repair, and catalog refresh must never create or migrate that
+  switch implicitly. Keep its state readable by the previous release and
+  restore the prior provider exactly when it is disabled. Login-free mode may
+  also select an enabled external `model`; snapshot both previous values in
+  protected router state and restore them exactly when the mode is disabled.
 - Preserve reasoning settings, profiles, projects, trust, MCP configuration,
   features, and ChatGPT authentication. Preserve `model` and `model_provider`
-  outside the explicitly enabled login-free mode.
+  outside those explicitly enabled routing modes.
 - A user-initiated macOS tray login-mode change may gracefully restart only the
   registered Codex desktop app. This does not authorize an installation task to
   quit Codex, and the tray must never force-terminate it.
@@ -1937,6 +2023,55 @@ cheap plans means speaking that route.
    and it is why the note stays on the registry entry now that the plan no
    longer blocks access outright.
 
+## LiteLLM's echoed prelude sets the pre-commit frame bounds
+
+LiteLLM 1.96's Chat Completions to Responses bridge copies the request's
+`instructions` and whole `tools` array into both `response.created` and
+`response.in_progress` (`_default_response_created_event_data` in
+`litellm/responses/litellm_completion_transformation/streaming_iterator.py`);
+its `response.completed` does not echo them. Measured against the pinned
+LiteLLM offline, with no provider quota: a 300-tool list and a 16 KiB
+`instructions` string make `response.created` and `response.in_progress`
+409 KiB each, while `response.completed` stays at 716 bytes and carries
+`tools: []`. A stream repair that meets a frame over any of its pre-commit
+budgets releases the bytes raw and switches itself off for the rest of the
+response, so a small budget disables the repair in exactly the sessions with
+the most tools, and no mock gateway with a bare envelope shows it.
+
+1. **The frame bound is 10 MiB**, matching `MAX_SSE_FRAME_BYTES` in
+   `src/namespace-relay.mjs`. `DeepseekToolMessageCompatTransform` and
+   `TranslatedToolMessageCompatTransform` in
+   `src/deepseek-tool-message-compat.mjs` use it, so the blank-message cleanup
+   and direct DeepSeek's reasoning-bridge repair survive a large prelude.
+2. **Every per-frame budget moves with it.** The strict JSON scan also counts
+   object members and key code units per frame, and tool schemas are
+   member-dense: with only the byte bound raised, the 8 KiB member budget still
+   failed the same frame open. Both scan budgets are derived from the frame
+   bound at the density the 256 KiB bound allowed. The 64 KiB candidate hold
+   budget is deliberately unchanged, because the prelude is relayed as soon as
+   it parses and is never held.
+3. **A bound moves where failure happens, never what it does.** An over-budget
+   frame is still released byte-identical, after any capture held ahead of it,
+   and the repair stays off for that response. Never truncate, re-serialize, or
+   skip part of a frame to fit a budget. Accumulator storage grown past an
+   ordinary event is released once its frame is taken, so one large prelude
+   does not pin that capacity for the whole stream.
+4. **The scan costs CPU in proportion to the frame, so keep it bulk.** A
+   pre-commit frame is decoded, uniqueness-scanned, and parsed synchronously on
+   the router's event loop. Measured on the 409 KiB prelude that prompted this:
+   3-6 ms, scaling at roughly 7 ms per MiB to 53 ms at 7.5 MiB. The frame
+   scanner reaches that by jumping between line feeds rather than walking every
+   byte -- the per-byte loop it replaced cost 49 ms on an 8 MiB frame on its
+   own. Raising a bound again, or adding another pre-commit parser to the
+   routed path, needs a measurement at the new bound rather than only a passing
+   test. Measure uncontended: on a loaded machine these numbers inflate by more
+   than an order of magnitude and invite a fix for a cost that is not there.
+5. **Fixtures for this path echo a large, dense tool list.** "router keeps
+   DeepSeek message repairs behind a Desktop-sized prelude" in
+   `test/routing.test.mjs` asserts that its echoed prelude crosses both old
+   budgets before it asserts either repair; the small-limit cases in
+   `test/deepseek-tool-message-compat.test.mjs` hold the fail-open semantics.
+
 ## DeepSeek Responses and Chat reasoning replay
 
 Only direct provider `deepseek` with upstream model `deepseek-flash` uses the
@@ -1965,9 +2100,32 @@ retry rules on the shared path.
   constraints use the existing adapters. Never infer tools from name prefixes or
   create declarations from metadata alone; ambiguous and ordinary-name
   collisions remain unchanged.
-- GLM thinking, legacy DeepSeek thinking and Command Code's DeepSeek Flash Chat
-  route carry reasoning through LiteLLM as assistant `thinking` parts, restored
-  by the forwarder to `reasoning_content`. Remove only successfully carried
+- GLM thinking, legacy DeepSeek thinking, Hy4 Preview (`hy4-reasoning`) and
+  Command Code's DeepSeek Flash Chat route carry reasoning through LiteLLM as
+  assistant `thinking` parts, restored by the forwarder to `reasoning_content`.
+  An interleaved-thinking model that instead sees its past reasoning replayed as
+  visible assistant text moves new thinking into the answer channel and loops
+  on its last progress note (Hy4 on opencode Go, 12 September 2026: 2, 4, 5,
+  8, 16 copies per message). The rule belongs to the upstream model, not to
+  the reseller or its request profile, so `src/chat-reasoning.mjs` also keys
+  it on the upstream family (DeepSeek, GLM-5.x, Kimi K3, MiniMax M3, Tencent
+  Hy3/Hy4) for the Chat Completions resellers it lists. Add a family only with
+  evidence the vendor expects `reasoning_content` back, and a reseller only
+  after a live probe shows the route returns reasoning and accepts the
+  echo-back; Anthropic-protocol variants never enter it. Do not special-case
+  the carry instead. A Chat Completions route **outside** the contract drops the
+  reasoning from the carry rather than replaying it as `output_text`: the
+  visible-text replay is the loop trigger named above, and dropping asserts
+  nothing about a vendor's `reasoning_content` handling, so it needs none of the
+  evidence a family entry does. That path was inert until #708 widened the
+  reasoning-lifecycle repair to every `openai`-protocol provider and Codex began
+  storing reasoning items for these turns (#755). Adding a family is still the
+  better outcome where the evidence exists — dropping keeps the model coherent,
+  but it does lose the thinking. This is a routed-path rule only, and it does
+  not generalise: the native backend faces the opposite constraint, since it
+  rejects a foreign reasoning item outright and never reads a reasoning
+  `summary`, so visible text can be the only replay that survives there. Weigh
+  the two separately rather than making either the house style. Remove only successfully carried
   reasoning runs so plaintext cannot also become a user message. Do not mutate
   source items or change other native Responses routes. Keep this policy shared
   between hops without applying direct DeepSeek sampling parameters to resellers.
@@ -2109,6 +2267,97 @@ label, so `src/message-phase.mjs` assigns one.
    routed case in `test/namespace-relay-routing.test.mjs`, and the generic
    Responses input case in `test/generic-routing.test.mjs`.
 
+## A model that writes its tool calls as text has them recovered, not relayed
+
+Tencent Hy4 Preview carries a tool-call syntax of its own,
+`<tool_calls:NONCE><tool_call:NONCE>name<arg_key:NONCE>k</arg_key:NONCE><arg_value:NONCE>v</arg_value:NONCE>...`.
+Serving stacks disagree about it: the agent-check tool probe recorded
+`commandcode/hy4-preview` failing on exactly this markup while
+`opencode-go/hy4-preview` passed the same probe minutes later, and the
+opencode-go route then leaked it intermittently mid-session. Nothing reaches the
+`tool_calls` array on a leaked turn, so LiteLLM's chat-completions -> Responses
+bridge relays a reasoning item followed by an assistant message with empty
+content and no `function_call`. Codex ends the turn there and writes
+`task_complete` with `last_agent_message: null`: the client shows its
+"Worked for ..." group and no answer at all, with no error anywhere.
+
+`src/leaked-tool-call-recovery.mjs` parses that markup back into real
+`function_call` items.
+
+1. **Only the model's own calls.** The transform relays a call the model wrote;
+   it never authors one. A span that is unterminated, carries a mismatched
+   nonce, names something that is not a tool name, or fails to parse for any
+   other reason is relayed verbatim and recovers nothing. A stream without the
+   markup is passed through byte-for-byte, and invalid UTF-8 disables rewriting
+   for the rest of the stream.
+2. **The nonce is read, never assumed.** `6124c78e` appears in every capture to
+   date, on both routes, but it is taken from the opening tag and the closing
+   tag must repeat it. Do not hardcode it.
+3. **One item contributes its calls once.** The same span arrives on the delta
+   channel, in the `.done` snapshot, and in the stored item; recovery is keyed
+   by output index so the call is emitted a single time. The summary and content
+   channels are two renderings of one item's thinking, so they hold separate
+   span streams and the fuller reading wins -- sharing one stream between them
+   made the second channel look like a genuine extension of the first and
+   recovered, and executed, the call twice.
+4. **A leaked argument value is text.** It is read as JSON only when its text is
+   exactly its own JSON form, so a declared `20000` or `true` survives while a
+   shell command, a path, or `0755` stays the string the model wrote.
+5. **Hy4 routes only, before the namespace transform**, so a recovered
+   flattened `mcp__server__tool` call is restored like any other, the empty-
+   completion guard sees content, and the phase labeller reads the blank
+   message as commentary instead of a final answer. Native streams gain no
+   stage, and neither does any other routed family: this is Hy4's own syntax,
+   and scanning every routed provider's text for it would turn prose that
+   merely *quotes* the markup -- a diff, a web page, this file -- into executed
+   tool calls. `usesHy4NonceMarkup` is the gate (`usesLeakedToolCallRecovery`
+   is its name at this call site); widening it past `hy4-preview` reopens that
+   injection channel. The reasoning-tag stripper reads the same gate for the
+   markup's reasoning delimiter, `</think:NONCE>` (#654): it strips the
+   suffixed spelling and treats an orphan close -- one whose opening tag never
+   arrived -- as the end of leaked reasoning, dropping the text in front of it.
+   That reading is destructive, so it stays behind the gate and behind the
+   suffix; a bare `</think>` keeps its prefix on every route. Coverage lives in
+   `test/leaked-tool-call-recovery.test.mjs`, `test/reasoning-tag-stripper.test.mjs`
+   and the leaked-channel case in `test/namespace-relay-routing.test.mjs`.
+6. **A span is scanned once, not re-scanned per delta.** The capture is held
+   unjoined with a closing-tag overlap because `_transform` is synchronous:
+   re-scanning one growing string re-flattens the rope every delta, and a
+   1.25 MB unterminated span blocked the event loop for 21.5 s against 0.8 s
+   for the same bytes with no span open. The capture bound is 4 MiB.
+## Chat Completions reasoning reaches Codex as one reasoning item
+
+LiteLLM 1.96's Chat Completions to Responses bridge opens the assistant message
+first, then streams `response.reasoning_summary_text.delta` under a fresh
+hashed `rs_…` id per delta (or the message's id), with no reasoning
+`output_item.added` or `reasoning_summary_part.added` and on the message's
+`output_index`. Codex drops deltas that belong to no open item, so reasoning
+never rendered and no reasoning item was saved to the thread. That held for
+every Chat Completions route (measured on `commandcode/hy4-preview` and
+`opencode-go/deepseek-v4.1-flash`), not only Grok.
+
+1. **One repair, scoped by protocol.** `reasoningSummaryCompatTransform` in
+   `src/grok-reasoning-summary-compat.mjs` attaches the lifecycle repair to
+   every provider whose `protocol` is Chat Completions (`openai`, the default).
+   Direct `deepseek` is excluded because `DeepseekToolMessageCompatTransform`
+   already repairs its bridge, and `anthropic` and `openai-responses`
+   providers do not reach this bridge. Widening it to another protocol needs a
+   captured stream from that protocol first.
+2. **Grok's gateway-error wording stays on Grok OAuth.** Only `grok-oauth`
+   replaces an untyped LiteLLM error envelope with the fixed local error. Other
+   routes relay that envelope byte-identical, after closing the reasoning item
+   as `incomplete` and releasing any message the repair was holding.
+3. **The pre-commit frame bound is 10 MiB, like the namespace relay's.**
+   LiteLLM echoes the request's `instructions` and full `tools` array in
+   `response.created`, and a Codex Desktop tool list exceeds 256 KiB. A smaller
+   bound releases that frame raw and disables the repair for the whole stream,
+   which no mock gateway with a tiny prelude reproduces. Any fixture for this
+   path must echo a Desktop-sized tool list.
+4. **Canonical streams pass byte-identical.** Coverage lives in
+   `test/grok-reasoning-summary-compat.test.mjs` and the Grok and Desktop-sized
+   Chat Completions router cases in `test/routing.test.mjs`. The regression
+   oracle is a live Codex turn whose rollout records a `reasoning` item.
+
 ## Routed subagent regression prevention
 
 - A normal `/responses` smoke test does not cover Codex collaboration. Current
@@ -2142,6 +2391,11 @@ label, so `src/message-phase.mjs` assigns one.
   pairs each call with its result, a native-only history is forwarded
   unchanged, and routed requests keep their IDs. The `native replay omits
   incompatible item IDs` case in `test/routing.test.mjs` holds both sides.
+  The custom→function bridge is the other direction: Console Go requires `fc`
+  on function-shaped items, and a rewritten `custom_tool_call_output` still
+  carried `ctco_…` (#780). `bridgeCustomTools` omits a non-`fc` string `id` on
+  the rewritten call and output; `call_id` still pairs them. A native-minted
+  `fc…` id is kept. Do not mint a substitute id.
 - Never log relay response bodies, decrypted task text, or exception messages
   that can echo either. Regressions require fragmented/mislabeled SSE tests and
   real marker-return probes through every installed routed agent plus a
@@ -2237,6 +2491,112 @@ user has to find in the docs, so `src/dsh-install.mjs` owns the other half.
   a provider the same uninstall just deleted. All three cases are covered in
   `test/dsh-config-manager.test.mjs`.
 
+
+## Five clients, one publisher, one key each
+
+opencode, pi, omp, Command Code, and Hermes Agent all offer the same thing: a
+user-owned configuration document with a mapping of custom providers in it.
+That is why they share `src/routed-harness-*.mjs` rather than getting five
+near-identical managers. `routed-harness-catalog.mjs` is the part that
+genuinely differs and it is data; `routed-harness-document.mjs` edits one key
+of somebody else's file; `routed-harness-manager.mjs` is the publisher.
+
+- **The wire is one the router already serves, never a third one.** The caller
+  endpoint answers `/v1/responses` and, behind the `/anthropic` leaf, the
+  Anthropic Messages API. Nothing else — there is no `/chat/completions`. So
+  opencode, pi, and omp declare a Responses provider, while Command Code and
+  Hermes take the Anthropic surface with `claude-model-id.mjs` ids. Command
+  Code's BYOK wire is Chat Completions or Anthropic Messages and Hermes's
+  `codex_responses` is its xAI path, not a generic Responses client; picking
+  the "OpenAI-compatible" option for either would have published a provider
+  that 404s on its first turn. `test/routed-harness.test.mjs` asserts no
+  adapter ever emits `openai-completions`.
+- **The capability is the URL, not the key.** The caller secret is a path
+  segment, so a bearer is redundant. Where a client treats a keyless provider
+  as first-class it is declared keyless (`auth: none` for omp, `apiKey: false`
+  for Command Code, omitted for Hermes); where a client *hides* keyless models
+  from its own picker — pi loads them and leaves them unselectable — the same
+  secret is repeated in the field it reads. That difference is not cosmetic: it
+  decides whether the models show up at all. Every published document is
+  written 0600 either way, because the URL is the capability.
+- **These are not `MODEL_ROUTER_TARGET` values.** Nothing installs *as*
+  opencode. They are published into by `control client-setup <id>` and removed
+  by `control client-disconnect <id>`, and neither touches the service.
+  `installedTargets()` still counts them, so `bin/disable` will not retire the
+  shared plane while one of them is pointed at it.
+- **A `codex-router` provider we did not write is never replaced or removed.**
+  Ownership is decided by the base URL, not by the key name: a second checkout,
+  an older build, or a hand-written proxy can legitimately hold that name.
+  Install and disconnect both refuse rather than guess.
+- **YAML is spliced, JSON is round-tripped, and neither is reformatted.**
+  `omp` and Hermes are edited by line range through `yaml-structure.mjs`, which
+  is what preserves comments and hand-formatting. JSON documents go through
+  `JSON.parse`, which cannot preserve a `//` comment — so a document that is
+  not plain JSON is refused with an explanation, and an `opencode.jsonc` beside
+  `opencode.json` blocks publication rather than being rewritten or ignored.
+- **The default model is the user's.** opencode is the only one of the five
+  whose default key is a plain string in the same document; the others keep
+  theirs in a second file or behind a mapping whose schema changes shape on
+  first use, and guessing wrong there costs a user their configured model for
+  no gain. Even there it is claimed only over a value this router wrote, or
+  when nothing is set, and removed on disconnect only while it is still ours.
+- **A failed marker write rolls the document back.** A client pointed at a
+  route the router has no record of is the one state neither disconnect nor
+  drift detection can reason about.
+- **Rotation covers all five.** The secret is a path segment of every published
+  base URL, so `caller-key.mjs` refreshes each of them and
+  `installedTargetsFromStatus` refuses to rotate across one whose managed state
+  is partial.
+- **Installing the client CLI is still the explicit action it is for the
+  harness.** Only `client-setup` installs, and only from a package registry.
+  Hermes ships a `curl | bash` installer and omp (can1357/oh-my-pi, whose npm
+  package runs on Bun) installs from a script, Homebrew, or Bun; this router
+  does not run remote installers on somebody's behalf, so those rows report the
+  CLI as missing and link to the official instructions. Do not point the omp
+  row at `@oh-labs/oh-omp`: that fork installs `oh-omp` and reads `~/.oh-omp`,
+  not the `~/.omp` the `omp` command reads.
+- **A client too old to read the document is updated, not published past.**
+  Command Code first reads `providers.json` in 1.30.0, so `minimumVersion` on
+  its catalog entry makes setup update an older CLI and makes status and doctor
+  report one. A version the CLI will not report is unknown, not outdated.
+- **Staying current is its own action, and it runs the client's own updater.**
+  `@latest` in `npmPackage` only decides what a *first* install fetches;
+  `installRoutedHarness` deliberately leaves a CLI that is already there alone,
+  because bumping somebody's global coding agent must not be a consequence of
+  republishing a model list. `control client-update <id>|--all`, the Harness
+  row's **Update** button, and `updateRoutedHarness` are the paths that do it.
+  Each prefers the client's own updater (`opencode upgrade`, `pi update
+  --self`, `command-code update`, `hermes update --yes`) over `npm install -g`:
+  a CLI installed by Homebrew or a `curl | sh` script is not an npm package,
+  and reinstalling it as one leaves two copies whose winner is PATH order —
+  which shows up as a row reporting the new version while the shell keeps
+  running the old one. npm is the fallback only for a client that publishes a
+  package and ships no updater. `--all` skips a client that is not installed
+  (update what I have, not install five agents I never asked for) and reports
+  per client rather than stopping at the first failure. A client that reports
+  no version before and after is never called "updated".
+- **Check the package name is still the maintained one.** pi moved publishers:
+  `@mariozechner/pi-coding-agent` stopped at 0.73.1 and the live line is
+  `@earendil-works/pi-coding-agent`. An abandoned package still installs and
+  still answers `pi --version`, so nothing in this repository would have
+  reported it as wrong — only reading the client's own install docs does.
+- **Prove a publication against the real client, not against its docs.** The
+  unit suite passed while opencode 1.18 rejected every published model, because
+  its schema requires `limit.output` whenever `limit` is present. opencode now
+  gets `limit.input` at the router's `autoCompact` and `limit.output` as the
+  headroom above it, or no `limit` when there is no threshold. A change to any
+  adapter needs the same check: publish into a scratch document, then have the
+  installed client list the models from it and take one real turn (a free route
+  costs nothing). Listing alone missed that OpenCode's post-completion `ping`
+  had become a trailing gateway error: Codex ignores bytes after a terminal
+  event, and opencode and pi do not.
+- **Devin CLI and T3 Code are deliberately absent.** Devin CLI's config selects
+  from Cognition-hosted models and has no custom base URL, so routed models
+  cannot be published into it; the `devin-cli` *provider* is the other
+  direction and already exists. T3 Code drives official CLIs rather than
+  talking to models itself, so it inherits whatever routed client it drives —
+  see `docs/COMPATIBLE-APPS.md`. Neither gets a Harness row, because a row that
+  cannot publish is a row that lies.
 
 ## Native GPT for a client with no ChatGPT login of its own
 

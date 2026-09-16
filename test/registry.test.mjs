@@ -34,6 +34,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.deepEqual(
     LISTED_MODELS.map((model) => model.slug),
     [
+      "ainetcafe/kimi-k3",
       "anthropic-api/claude-opus-4.8",
       "antigravity-oauth/gemini-3.1-pro",
       "antigravity-oauth/gemini-3.5-flash",
@@ -186,6 +187,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "opencode-go-messages/qwen3.7-plus",
       "opencode-go-messages/qwen3.8-flash",
       "opencode-go-messages/qwen3.8-max",
+      "opencode-go-messages/union-alpha",
       "opencode-go-responses/gpt-5.6-luna",
       "opencode-go-responses/grok-4.5",
       "opencode-go-responses/grok-4.6",
@@ -568,6 +570,9 @@ test("provider registry exposes configured API and OAuth model families", () => 
     "DASHSCOPE_API_KEY",
   ]);
   assert.equal(PROVIDERS.get("anthropic-api").protocol, "anthropic");
+  assert.deepEqual(PROVIDERS.get("vertex").credential, {
+    resolver: "google-application-default",
+  });
   // Deliberate v1 holdouts. Both are unproven through the native collaboration
   // probe AGENTS.md requires, and a v2 claim is not inherited from a sibling
   // route: kimi-api-cn is the same model on a different platform, which is
@@ -817,6 +822,24 @@ test("GLM-5.3-Flash replaces OpenCode Go's withdrawn Ox Alpha route", () => {
   assert.equal(MODEL_BY_SLUG.get("opencode-go/ox-alpha"), model);
 });
 
+test("Union Alpha ships on OpenCode Go Messages with sourced stealth metadata", () => {
+  const model = MODEL_BY_SLUG.get("opencode-go-messages/union-alpha");
+  assert.equal(model?.upstreamModel, "union-alpha");
+  assert.equal(model?.provider, "opencode-go-messages");
+  assert.equal(PROVIDERS.get(model.provider).protocol, "anthropic");
+  assert.equal(model?.contextWindow, 262_144);
+  assert.equal(model?.autoCompact, 131_072);
+  assert.ok(model.contextWindow - model.autoCompact >= 131_072);
+  assert.deepEqual(model?.inputModalities, ["text", "image"]);
+  assert.deepEqual(model?.reasoningLevels.map((level) => level.effort), ["high"]);
+  assert.equal(model?.defaultEffort, "high");
+  assert.equal(model?.isFree, true);
+  assert.equal(model?.requestProfile, undefined);
+  assert.notEqual(model?.multiAgentVersion, "v2");
+  assert.equal(MODEL_BY_SLUG.has("opencode-go/union-alpha"), false);
+  assert.equal(MODEL_BY_SLUG.has("opencode-go/omen-alpha"), false);
+});
+
 test("OpenCode Go routes retain upstream windows instead of the generic fallback", () => {
   const expected = new Map([
     ["opencode-go/mimo-v2.5", [1_000_000, 850_000, "opencode-go-mimo-v2-5-v2"]],
@@ -1059,6 +1082,7 @@ test("LiteLLM configuration is generated from every registry route", () => {
     "Copilot stays catalog-only until account-visible models are curated",
   );
   assert.match(rendered, /model: "anthropic\/opencode-go-messages-minimax-m3"/);
+  assert.match(rendered, /model: "anthropic\/opencode-go-messages-union-alpha"/);
   const lunaBlock = rendered.slice(
     rendered.indexOf('model_name: "opencode-go-responses-gpt-5-6-luna"'),
     rendered.indexOf('model_name:', rendered.indexOf('model_name: "opencode-go-responses-gpt-5-6-luna"') + 1),

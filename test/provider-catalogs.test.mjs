@@ -11,13 +11,14 @@ import {
 
 test("every selectable provider remains a canonical UI family", () => {
   const canonical = [...PROVIDERS.values()].filter((provider) => !provider.variantOf);
-  assert.equal(canonical.length, 40);
-  assert.equal(PROVIDERS.size, 45);
+  assert.equal(canonical.length, 42);
+  assert.equal(PROVIDERS.size, 47);
 });
 
 test("catalog capability comes from backend provider definitions", () => {
   assert.equal(providerCatalogKind(PROVIDERS.get("anthropic-api")), "models-endpoint");
   assert.equal(providerCatalogKind(PROVIDERS.get("devin-cli")), "devin");
+  assert.equal(providerCatalogKind(PROVIDERS.get("vertex")), "vertex");
   assert.equal(providerCatalogKind(PROVIDERS.get("kimi-oauth")), undefined);
   assert.equal(providerCatalogKind(PROVIDERS.get("grok-oauth")), undefined);
   assert.equal(providerCatalogKind(PROVIDERS.get("local")), undefined);

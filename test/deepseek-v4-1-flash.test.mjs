@@ -67,8 +67,9 @@ test("DeepSeek V4.1 Flash on Command Code uses the Provider API chat route", () 
   assert.deepEqual(model.reasoningLevels.map(({ effort }) => effort), ["low", "high", "max"]);
   assert.equal(model.contextWindow, 1_000_000);
   assert.ok(model.contextWindow - model.autoCompact >= MAX_EFFORT_DEFAULT_OUTPUT);
-  // Image input is claimed only in marketing copy, not at the API.
-  assert.deepEqual(model.inputModalities, ["text"]);
+  // Command Code's model page lists Image input, and the Provider API FAQ
+  // says the schema accepts text and images without per-model pre-gating.
+  assert.deepEqual(model.inputModalities, ["text", "image"]);
   assert.notEqual(model.multiAgentVersion, "v2");
   assert.equal(curatedModelProviderId("commandcode", "deepseek/deepseek-v4.1-flash"), "commandcode");
   assert.equal(curatedModelBlockReason("commandcode", "deepseek/deepseek-v4.1-flash"), undefined);

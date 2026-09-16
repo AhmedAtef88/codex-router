@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { accountBucketsWithRouterFallback } from "../apps/control-center/src/lib.ts";
+import { accountBucketsWithRouterFallback, metricValue } from "../apps/control-center/src/lib.ts";
 import { LANGUAGE_OPTIONS, translate } from "../apps/control-center/src/i18n.ts";
 
 test("account usage fills only absent OpenAI dates from the local router", () => {
@@ -86,6 +86,21 @@ test("fallback provenance is translated in every control-center language", () =>
       if (id === "en") assert.doesNotMatch(singular, /1 dates\b/);
     }
   }
+});
+
+test("a non-ISO balance ledger cannot take down Usage", () => {
+  assert.equal(
+    metricValue({ kind: "balance", label: "DIEM balance", value: 8.25, currency: "DIEM" }),
+    "8.25 DIEM",
+  );
+  assert.equal(
+    metricValue({ kind: "balance", label: "DIEM balance", value: 0, currency: "DIEM" }),
+    "0 DIEM",
+  );
+  assert.equal(
+    metricValue({ kind: "balance", label: "API balance", value: 12.5, currency: "USD" }),
+    "$12.50",
+  );
 });
 
 test("the daily window is walked in UTC days, the day space every bucket key uses", async () => {

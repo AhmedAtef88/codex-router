@@ -483,6 +483,10 @@ test("a curated model can opt into the narrow encrypted-schema profile", () => {
   );
 });
 
+test("a curated model can opt into the DashScope reasoning profile", () => {
+  assert.equal(parseRequestProfile("dashscope-reasoning"), "dashscope-reasoning");
+});
+
 test("an unknown request profile is rejected by name", () => {
   // Nothing validates requestProfile downstream — the forwarder just runs no
   // branch — so a typo would store a model that silently keeps failing.
@@ -1351,6 +1355,59 @@ test("--efforts still overrides a documented ladder", () => {
     assert.equal(stored.contextWindow, 256_000);
     assert.match(stored.description, /256,000/);
     assert.doesNotMatch(stored.description, /low\/medium\/high ladder/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("scripted curation records that a served window and modalities came from the provider's catalog", () => {
+  const providerId = "openrouter";
+  const upstreamModel = "vendor/sized";
+  const dir = mkdtempSync(path.join(os.tmpdir(), "curate-advertised-"));
+  const file = path.join(dir, "user-models.json");
+  const fixture = path.join(dir, "models.json");
+  writeFileSync(fixture, JSON.stringify({ data: [
+    { id: upstreamModel, context_length: 1048576, architecture: { input_modalities: ["text", "image", "file"] } },
+    { id: "vendor/silent" },
+    { id: "vendor/audio-only", architecture: { input_modalities: ["audio"] } },
+  ] }));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        path.join(root, "src", "curate-models.mjs"),
+        providerId,
+        "--models",
+        `${upstreamModel},vendor/silent,vendor/audio-only`,
+        "--fixture",
+        fixture,
+        "--no-apply",
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          CODEX_HOME: path.join(dir, "codex"),
+          MODEL_ROUTER_STATE_DIR: dir,
+          MODEL_ROUTER_USER_MODELS: file,
+          MODEL_ROUTER_MODEL_PICKER_STATE: path.join(dir, "model-picker.json"),
+          OPENROUTER_API_KEY: "",
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const models = JSON.parse(readFileSync(file, "utf8")).models;
+    const sized = models.find((model) => model.upstreamModel === upstreamModel);
+    assert.equal(sized.contextWindow, 1048576);
+    assert.deepEqual(sized.inputModalities, ["text", "image"], "file is advertised but not publishable; text and image survive");
+    assert.match(sized.description, /context window and input modalities as advertised by the provider's catalog/);
+    const audioOnly = models.find((model) => model.upstreamModel === "vendor/audio-only");
+    assert.deepEqual(audioOnly.inputModalities, ["text"], "an unpublishable modality set falls back to the default, never an empty list");
+    assert.match(audioOnly.description, /conservative default metadata/);
+    const silent = models.find((model) => model.upstreamModel === "vendor/silent");
+    assert.equal(silent.contextWindow, 131072);
+    assert.match(silent.description, /conservative default metadata/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

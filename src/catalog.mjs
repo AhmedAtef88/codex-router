@@ -46,6 +46,7 @@ import {
   modelPickerSnapshot,
   readHiddenModels,
   seedModelsHidden,
+  readPickerOrder,
 } from "./model-picker-state.mjs";
 import { buildNativeAliasAssignments } from "./native-alias.mjs";
 import {
@@ -970,7 +971,11 @@ function behaviorTemplateFor(nativeModels, model, fallback) {
   return nativeModels.find((candidate) => candidate.slug === model.behaviorTemplate) || fallback;
 }
 
-export function buildMergedCatalog(native, routedModelsList, { includeNative = true } = {}) {
+export function buildMergedCatalog(
+  native,
+  routedModelsList,
+  { includeNative = true, pickerOrder = "native-first" } = {},
+) {
   const template =
     native.models.find((model) => model.slug === "gpt-5.5") ||
     native.models.find((model) => model.visibility === "list") ||
@@ -978,13 +983,27 @@ export function buildMergedCatalog(native, routedModelsList, { includeNative = t
   if (!template) {
     throw new Error("Native model catalog is empty.");
   }
+  const ordered = routedPickerPriorities(native.models, routedModelsList);
+  const routedFirst = pickerOrder === "routed-first";
+  const published = publishedPickerPriorities(native.models, ordered, { routedFirst });
+  // Under routed-first every routed model was renumbered 1..N, so the natives
+  // move after them by the same count. Only the published priority changes;
+  // the native entry is otherwise the account's own.
+  const nativeShift = routedFirst ? published.size : 0;
   const models = new Map(
     includeNative
-      ? native.models.map((model) => [model.slug, normalizeNativeModel(model)])
+      ? native.models.map((model) => {
+          const normalized = normalizeNativeModel(model);
+          const priority = Number(normalized.priority);
+          return [
+            model.slug,
+            nativeShift && Number.isFinite(priority)
+              ? { ...normalized, priority: priority + nativeShift }
+              : normalized,
+          ];
+        })
       : [],
   );
-  const ordered = routedPickerPriorities(native.models, routedModelsList);
-  const published = publishedPickerPriorities(native.models, ordered);
   for (const model of ordered) {
     const behaviorTemplate = behaviorTemplateFor(native.models, model, template);
     const entry = routedModel(template, model, behaviorTemplate);
@@ -1002,7 +1021,13 @@ export function buildMergedCatalog(native, routedModelsList, { includeNative = t
 // The band starts above the highest *visible* native priority: a hidden
 // native entry can carry an arbitrary number that would otherwise push every
 // routed model far down the picker for no reason a user can see.
-function publishedPickerPriorities(nativeModels, orderedRoutedModels) {
+//
+// With `routedFirst` the band starts at 1 instead and includes the v2 routes:
+// the operator asked for external models ahead of the natives, and leaving a
+// v2 route at its authored value would interleave it with the shifted natives
+// unpredictably. The spawn_agent override window shows a priority-ordered
+// subset, so those routes stay at the top of it either way.
+function publishedPickerPriorities(nativeModels, orderedRoutedModels, { routedFirst = false } = {}) {
   const visible = nativeModels.filter((model) => model.visibility === "list");
   const nativeMax = Math.max(
     0,
@@ -1011,9 +1036,9 @@ function publishedPickerPriorities(nativeModels, orderedRoutedModels) {
       .filter(Number.isFinite),
   );
   const published = new Map();
-  let next = nativeMax + 1;
+  let next = routedFirst ? 1 : nativeMax + 1;
   for (const model of orderedRoutedModels) {
-    if (model.multiAgentVersion === "v2") continue;
+    if (model.multiAgentVersion === "v2" && !routedFirst) continue;
     published.set(model.slug, next);
     next += 1;
   }
@@ -1031,7 +1056,7 @@ function publishedPickerPriorities(nativeModels, orderedRoutedModels) {
 // merged-catalog path filters through `selectedConfiguredListedModels()`; this
 // function keeps the same rule for the login-free path instead of trusting its
 // caller to pre-filter, so no future call site can publish dead slots again.
-export function buildLoginFreeCatalog(native, routedModelsList) {
+export function buildLoginFreeCatalog(native, routedModelsList, { pickerOrder = "native-first" } = {}) {
   const configured = new Set(configuredProviderIds());
   const usableModels = routedModelsList.filter(
     (model) => !model.provider || configured.has(model.provider),
@@ -1051,7 +1076,7 @@ export function buildLoginFreeCatalog(native, routedModelsList) {
       slug: nativeModel.slug,
       priority: nativeModel.priority,
     })),
-    ...buildMergedCatalog(native, usableModels, { includeNative: false }).map(
+    ...buildMergedCatalog(native, usableModels, { includeNative: false, pickerOrder }).map(
       (model) =>
         aliasedSlugs.has(model.slug) ? { ...model, visibility: "hide" } : model,
     ),
@@ -1187,11 +1212,13 @@ export function publishCatalog({ refreshNative = refresh, output = true } = {}) 
     readVisionBridgeSettings(),
   );
   const catalogModels = applyVisionBridge(routedModels, visionEngine);
+  const pickerOrder = readPickerOrder();
   const { models: merged, aliases } = loginFree
-    ? buildLoginFreeCatalog(native, catalogModels)
+    ? buildLoginFreeCatalog(native, catalogModels, { pickerOrder })
     : {
         models: buildMergedCatalog(native, routedCatalog ? catalogModels : [], {
           includeNative: openaiAuthenticated,
+          pickerOrder,
         }),
         aliases: {},
       };

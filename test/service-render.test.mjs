@@ -601,7 +601,12 @@ test(
       // schtasks.exe and powershell.exe are absent off Windows. The launchers
       // are still generated, but the service is not truthfully reported as
       // installed when no Task Scheduler definition exists.
-      assert.equal(run("install").installed, false);
+      const first = run("install");
+      assert.equal(first.installed, false);
+      // The launchers really were written even though no Task Scheduler
+      // answered. The report says so outright instead of leaving `path` to
+      // imply it (issue #760).
+      assert.equal(first.launchers, true);
       assert.equal(existsSync(wrapperPath), true);
       assert.equal(existsSync(launcherPath), true);
       assert.equal(statSync(wrapperPath).mode & 0o777, 0o600);
@@ -962,6 +967,61 @@ test(
         calls.some((line) => line.includes("/Run")),
         false,
         `nothing survived to start, so /Run must not be issued:\n${calls.join("\n")}`,
+      );
+    } finally {
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "an install that wrote no launcher fails instead of reporting a path that is not there",
+  { skip: process.platform === "win32" },
+  () => {
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-win-no-launcher-"));
+    try {
+      // A scheduler that answers every query, so a surviving task name cannot
+      // be what makes this install look successful.
+      const stubs = schedulerStubs(path.join(testRoot, "scheduler"));
+      // A regular file where the state directory's parent belongs makes
+      // writeLaunchers() throw before anything reaches disk. On Windows the
+      // same shape arrives as a blocked ACL hardening (Windows PowerShell in
+      // ConstrainedLanguage cannot construct a FileSecurity), a sharing
+      // violation on the rename, or a denied write into an elevated install's
+      // ACLs -- none of which POSIX can reproduce. What is under test is the
+      // report, not the cause: install used to swallow the exception whole and
+      // still print `path`, so the operator was told a file existed that did
+      // not, and the install went on to fail 300 seconds later inside the
+      // readiness wait with the health probe's bare "fetch failed" (#760).
+      const blocker = path.join(testRoot, "blocked");
+      writeFileSync(blocker, "not a directory\n");
+      const result = runWindowsService(testRoot, "install", {
+        PATH: stubs.path,
+        MODEL_ROUTER_STATE_DIR: path.join(blocker, "state"),
+      });
+      assert.notEqual(
+        result.status,
+        0,
+        `an install with no launcher on disk must fail:\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+      );
+      const report = JSON.parse(result.stdout);
+      assert.equal(report.launchers, false);
+      assert.equal(report.installed, false, "a task with no launcher to run is not installed");
+      assert.equal(
+        existsSync(report.path),
+        false,
+        "the fixture must actually leave the reported path absent",
+      );
+      // The swallowed write error is the entire diagnosis. Without it the
+      // operator has a failed install and no named cause anywhere.
+      assert.match(result.stderr, /Failed to write the service launchers/);
+      assert.match(result.stderr, /ENOTDIR|ENOENT|EEXIST|EACCES|EPERM/);
+      // Registration must not have been attempted: writeLaunchers() throws
+      // ahead of it, and a task whose action does not exist is worse than none.
+      assert.equal(
+        stubs.calls().some((line) => line.includes("/Create") || line.includes("Register-ScheduledTask")),
+        false,
+        `no task may be registered for a launcher that was never written:\n${stubs.calls().join("\n")}`,
       );
     } finally {
       rmSync(testRoot, { recursive: true, force: true });

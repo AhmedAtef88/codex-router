@@ -1316,6 +1316,8 @@ test("preload exposes only the named control operations", async () => {
     "setupHarness",
     "prepareCursorTunnel",
     "connectCursor",
+    "disconnectCursor",
+    "disconnectHarness",
     "openHarnessSession",
     "openExternal",
   ]) {
@@ -1394,6 +1396,8 @@ test("preload constructs exact positional IPC payloads", async () => {
     ["setupHarness", ["cursor", "cursor-router.example.com"], { harnessId: "cursor", hostname: "cursor-router.example.com" }],
     ["prepareCursorTunnel", [], null],
     ["connectCursor", ["cursor-router.example.com"], { hostname: "cursor-router.example.com" }],
+    ["disconnectCursor", [], null],
+    ["disconnectHarness", ["openclaw"], { harnessId: "openclaw" }],
     ["openHarnessSession", ["codex", "session", "terminal", "model"], { harnessId: "codex", sessionId: "session", surface: "terminal", model: "model" }],
     ["openExternal", ["https://example.com"], { url: "https://example.com" }],
   ];
@@ -1873,7 +1877,30 @@ test("control center focus feedback uses state changes without focus rings", asy
 
 test("harness and context IPC remain fixed and session-scoped", async () => {
   const source = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
-  assert.match(source, /const HARNESS_IDS = \["codex", "dsh", "gemini", "cursor", "claude", "openclaw"\]/);
+  assert.match(
+    source,
+    /const HARNESS_IDS = \["codex", "dsh", "gemini", "cursor", "claude", "openclaw", \.\.\.ROUTED_HARNESS_IDS\]/,
+  );
+  // The document-configured rows are a fixed table, not a discovered one: the
+  // app must be able to draw the Harness tab before it can load a module out
+  // of the installed router, so their ids, markers, and executables are pinned
+  // here the same way every other client surface is.
+  assert.match(source, /const ROUTED_HARNESS_IDS = ROUTED_HARNESS_ROWS\.map\(\(row\) => row\.id\)/);
+  for (const [id, marker] of [
+    ["opencode", "opencode-models.json"],
+    ["pi", "pi-models.json"],
+    ["omp", "omp-models.json"],
+    ["commandcode", "commandcode-models.json"],
+    ["hermes", "hermes-models.json"],
+  ]) {
+    assert.match(source, new RegExp(`id: "${id}",`));
+    assert.match(source, new RegExp(`marker: "${marker}"`));
+  }
+  // Hermes installs from a remote shell script. Offering to run that on the
+  // user's behalf is exactly what this router does not do.
+  assert.match(source, /id: "hermes",[\s\S]*?installable: false/);
+  assert.match(source, /existsSync\(path\.join\(stateDirectory, row\.marker\)\)/);
+  assert.match(source, /environmentOverrides\[routedSetup\.binEnv\] = binary/);
   assert.match(source, /const HARNESS_SURFACES = \["app", "terminal"\]/);
   assert.match(source, /const SESSION_UUID = \/\^\[0-9a-f\]/);
   assert.match(source, /const DSH_SESSION_ID = \/\^session-/);
@@ -1969,20 +1996,48 @@ test("Harness page renders fixed client rows backed by the shared session index"
     "utf8",
   );
 
-  assert.match(harness, /const CLIENT_ORDER: HarnessId\[\] = \["openclaw", "cursor", "claude", "gemini", "dsh", "codex"\]/);
+  assert.match(
+    harness,
+    /const CLIENT_ORDER: HarnessId\[\] = \[\s*"openclaw", "cursor", "claude", "gemini", "dsh", "codex",\s*"opencode", "pi", "omp", "commandcode", "hermes",\s*\]/,
+  );
+  // The pre-existing six keep their positions so an upgrade does not move a
+  // user's rows out from under them.
+  assert.ok(
+    harness.indexOf('"openclaw", "cursor", "claude", "gemini", "dsh", "codex",')
+      < harness.indexOf('"opencode", "pi", "omp", "commandcode", "hermes",'),
+  );
+  assert.match(harness, /const TERMINAL_ONLY_CLIENTS = new Set<HarnessId>\(\["opencode", "pi", "omp", "commandcode", "hermes"\]\)/);
   assert.match(harness, /api\.getContextSessions\(\)/);
   assert.match(harness, /api\.getAgentBridges\(\)/);
-  assert.match(harness, /Official-client agent/);
+  assert.match(harness, /Agent · \$\{bridge\.sessions\}|Agent/);
   assert.match(harness, /bridgeForHarness\(harness\.id, agentBridges\)/);
   assert.doesNotMatch(harness, /Subscription agent bridges|Credentials.*Unavailable/);
   assert.match(harness, /api\.connectCursor\(cursorHostname\.trim\(\) \|\| undefined\)/);
+  assert.match(harness, /api\.disconnectCursor\(\)/);
+  assert.match(harness, /api\.disconnectHarness\(harness\.id\)/);
+  assert.match(harness, /Route \$\{harness\.displayName\} through Codex Router/);
+  assert.match(harness, /Custom API keys/);
   assert.match(harness, /Use an existing Cloudflare hostname/);
-  assert.match(harness, /Connect Cursor/);
-  assert.match(harness, /One guided setup/);
+  assert.match(harness, /lhc-harness-toolbar/);
+  assert.match(harness, /lhc-harness-hint-tooltip/);
+  assert.doesNotMatch(harness, /CircleHelp/);
+  assert.match(harness, /Turn Route on to install the connector/);
   assert.match(harness, /Cursor setup progress/);
-  assert.match(harness, /api\.launchHarness\(harness\.id, "app"\)/);
-  assert.match(harness, /<AppWindow[^>]*\/> Open/);
-  assert.doesNotMatch(harness, /BookOpen|SquareTerminal|Open agent/);
+  assert.match(styles, /\.lhc-harness-toolbar/);
+  assert.match(styles, /\.lhc-harness-hint-tooltip/);
+  assert.match(styles, /\.lhc-harness-hint:hover/);
+  assert.match(styles, /\.lhc-harness-launch/);
+  assert.match(styles, /\.lhc-harness-icon-btn/);
+  assert.match(styles, /minmax\(220px, 1\.6fr\) 56px 56px 168px/);
+  assert.match(harness, /lhc-harness-setup-btn/);
+  assert.match(harness, /lhc-harness-launch/);
+  assert.match(harness, /className="lhc-harness-setup-btn"/);
+  assert.doesNotMatch(harness, /openHintId|aria-expanded=\{hintOpen\}|Show routing tip/);
+  assert.doesNotMatch(styles, /\.lhc-harness-hint-panel/);
+  assert.match(harness, /api\.launchHarness\(harness\.id, surface\)/);
+  assert.match(harness, /<AppWindow aria-hidden size=\{14\} strokeWidth=\{1\.7\} \/>/);
+  assert.match(harness, /<SquareTerminal aria-hidden size=\{14\} strokeWidth=\{1\.7\} \/>/);
+  assert.doesNotMatch(harness, /BookOpen|Open agent|TERMINAL_ONLY_CLIENTS\.has\(harness\.id\) && harness\.cliInstalled/);
   assert.doesNotMatch(harness, /Stable public HTTPS origin|127\.0\.0\.1:4214/);
   assert.match(harness, /assets\/clients\/cursor\.svg/);
   assert.match(harness, /assets\/clients\/deepseek-harness\.svg/);

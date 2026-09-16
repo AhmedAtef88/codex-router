@@ -5360,6 +5360,7 @@ struct ProviderSetupState: Decodable, Identifiable, Equatable {
   let credentialLabel: String?
   let disconnectable: Bool?
   let blockedNote: String?
+  let configurationNote: String?
   // Set when connecting successfully still leaves the account unable to use
   // the API, because its plan does not include one. Shown before the buttons
   // rather than after a 403 lands in Codex.
@@ -6619,9 +6620,11 @@ private struct TrayView: View {
     .padding(.vertical, 2)
     settingRow(
       title: routerLocalized("Use Router with ChatGPT"),
-      detail: store.signedRoutingEnabled(authoritative: store.signedRouting)
-        ? routerLocalized("Native GPT + external models · task history preserved")
-        : routerLocalized("Keep ChatGPT login and the current task history"),
+      detail: store.loginFreeEnabled(authoritative: store.loginFree)
+        ? routerLocalized("Turn off 'Use without OpenAI login' first")
+        : (store.signedRoutingEnabled(authoritative: store.signedRouting)
+          ? routerLocalized("Native GPT + external models · task history preserved")
+          : routerLocalized("Keep ChatGPT login and the current task history")),
       isOn: Binding(
         get: { store.signedRoutingEnabled(authoritative: store.signedRouting) },
         set: { enabled in store.setSignedRouting(enabled) }
@@ -6676,9 +6679,11 @@ private struct TrayView: View {
     }
     settingRow(
       title: routerLocalized("Use without OpenAI login"),
-      detail: store.loginFreeEnabled(authoritative: store.loginFree)
-        ? routerLocalized("External providers · Codex restarts automatically")
-        : routerLocalized("Use connected models and restart Codex"),
+      detail: store.signedRoutingEnabled(authoritative: store.signedRouting)
+        ? routerLocalized("Turn off 'Use Router with ChatGPT' first")
+        : (store.loginFreeEnabled(authoritative: store.loginFree)
+          ? routerLocalized("External providers · Codex restarts automatically")
+          : routerLocalized("Use connected models and restart Codex")),
       isOn: Binding(
         get: { store.loginFreeEnabled(authoritative: store.loginFree) },
         set: { enabled in store.setLoginFree(enabled) }
@@ -9457,6 +9462,9 @@ private struct ProviderSetupRow: View {
         : routerLocalized("Sign in with the official CLI")
     case "add-key":
       return "\(credentialLabel) \(routerLocalized("required"))"
+    case "configure":
+      return setup.configurationNote
+        ?? routerLocalized("Run the provider's local configuration command, then refresh")
     case "probe": return routerLocalized("Live test required · sends a small prompt and uses quota")
     case "blocked":
       return setup.blockedNote
@@ -9555,7 +9563,7 @@ private struct ProviderSetupRow: View {
       }
     } else {
       HStack(spacing: 10) {
-        if setup?.action != "blocked" {
+        if setup?.action != "blocked" && setup?.action != "configure" {
           Button(actionTitle) { performAction() }
             .buttonStyle(.plain)
             .font(.system(size: 10, weight: .medium))
