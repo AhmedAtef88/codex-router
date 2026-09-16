@@ -2232,6 +2232,31 @@ test("OpenCode Go Muse removes recursive tool refs in both response modes", asyn
   }
 });
 
+test("OpenCode Go converts Codex handoffs before Muse Responses", async () => {
+  const result = await scenario(false, {
+    model: "opencode-go-responses/muse-spark-1.3-contributor",
+    requestPayload: (_stream, model) => ({
+      model,
+      stream: false,
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "parent context" }] },
+        {
+          type: "agent_message",
+          author: "/root",
+          recipient: "/root/child",
+          content: [{ type: "input_text", text: "Message Type: NEW_TASK\nPayload:\nInspect the backend." }],
+        },
+      ],
+      tools: [],
+    }),
+    jsonBody: () => ({ id: "muse-handoff", output: [] }),
+  });
+  const outgoing = result.gatewayBodies[0];
+  assert.equal(outgoing.input[1].type, "message");
+  assert.equal(outgoing.input[1].role, "user");
+  assert.equal(outgoing.input[1].content[0].text, "Message Type: NEW_TASK\nPayload:\nInspect the backend.");
+});
+
 test("OpenCode Go compaction removes native tool history before the strict endpoint", async () => {
   const result = await scenario(false, {
     endpoint: "/responses/compact",

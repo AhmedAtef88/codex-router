@@ -1068,9 +1068,15 @@ function needsMoonshotSchemaCompatibility(route) {
   );
 }
 
-function zenFreeCompatibleInput(input, route) {
-  if (!needsZenFreeToolCompatibility(route)) return input;
-  return downgradeOriginalImageDetail(agentMessagesAsUserMessages(input));
+function openCodeCompatibleInput(input, route) {
+  // OpenCode Responses endpoints do not accept Codex's collaboration wrapper.
+  // Present recovered handoffs as ordinary user messages before the request
+  // reaches either the paid Console Go or the documented Zen Free route.
+  if (!needsStrictOpenCodeToolCompatibility(route)) return input;
+  const normalized = agentMessagesAsUserMessages(input);
+  return needsZenFreeToolCompatibility(route)
+    ? downgradeOriginalImageDetail(normalized)
+    : normalized;
 }
 
 function nativeTarget(pathname, search = "") {
@@ -2658,7 +2664,7 @@ async function summarizeWith(
   signal,
   { searchContract } = {},
 ) {
-  const compatibleInput = zenFreeCompatibleInput(
+  const compatibleInput = openCodeCompatibleInput(
     normalizeProviderAppToolOutputs(aged.input),
     route,
   );
@@ -3160,7 +3166,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   const clientTools = chatCompletionsProvider || deepSeekResponses || consoleGoResponsesCompatibility
     ? restorePreflattenedToolNamespaces(payload.tools, payload.client_metadata)
     : payload.tools;
-  const compatibleInput = zenFreeCompatibleInput(
+  const compatibleInput = openCodeCompatibleInput(
     normalizeProviderAppToolOutputs(agedInput),
     route,
   );
