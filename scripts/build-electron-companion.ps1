@@ -57,14 +57,26 @@ foreach ($CommandName in @("node", "npm")) {
 
 Push-Location $App
 try {
-  & npm ci
-  if ($LASTEXITCODE -ne 0) { throw "Control Center npm dependency installation failed." }
-  & npm run check
-  if ($LASTEXITCODE -ne 0) { throw "Control Center checks failed." }
-  & npm test
-  if ($LASTEXITCODE -ne 0) { throw "Control Center tests failed." }
-  & npm run build
-  if ($LASTEXITCODE -ne 0) { throw "Control Center renderer build failed." }
+  # PowerShell 5.1 turns a native command's stderr into an ErrorRecord, and the
+  # Stop preference at the top of this file makes the first one terminating:
+  # one npm deprecation warning or Vite's chunk-size advisory killed the whole
+  # companion build. npm resolves through its npm.ps1 shim, which inherits that
+  # preference, so drop to Continue around these calls and merge stderr into the
+  # host stream. $LASTEXITCODE still reports the real result.
+  $NpmErrorAction = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    & npm ci 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Control Center npm dependency installation failed." }
+    & npm run check 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Control Center checks failed." }
+    & npm test 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Control Center tests failed." }
+    & npm run build 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Control Center renderer build failed." }
+  } finally {
+    $ErrorActionPreference = $NpmErrorAction
+  }
 } finally {
   Pop-Location
 }
@@ -80,7 +92,7 @@ try {
     # Control Center directory explicitly before packaging.
     Push-Location -LiteralPath $App
     try {
-      & (Join-Path $App "node_modules\.bin\electron-builder.cmd") --win dir --publish never "--config.directories.output=$StagingRoot"
+      & (Join-Path $App "node_modules\.bin\electron-builder.cmd") --win dir --publish never "--config.directories.output=$StagingRoot" 2>&1 | Out-Host
       if ($LASTEXITCODE -ne 0) { throw "Control Center packaging failed." }
     } finally {
       Pop-Location
