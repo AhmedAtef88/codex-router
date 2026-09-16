@@ -2187,6 +2187,73 @@ test("OpenCode Go Responses uses one bounded function-tool contract in both resp
   }
 });
 
+test("OpenCode Go Messages keeps the Console Go function-tool contract", async () => {
+  const completedOutput = [
+    {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "ok" }],
+    },
+  ];
+  const completedSse = () =>
+    [
+      sseEvent({
+        type: "response.completed",
+        response: { id: "resp-messages", status: "completed", output: completedOutput },
+      }),
+      "data: [DONE]\n\n",
+    ].join("");
+  for (const stream of [true, false]) {
+    const result = await scenario(stream, {
+      model: "opencode-go-messages/union-alpha",
+      requestPayload: goCompatibilityRequestPayload,
+      sseBody: completedSse,
+      jsonBody: () => ({ id: "resp-messages", status: "completed", output: completedOutput }),
+    });
+    const outgoing = result.gatewayBodies[0];
+    const invalid = outgoing.tools.filter(
+      (tool) =>
+        tool?.type !== "function" ||
+        typeof tool.name !== "string" ||
+        !tool.name.trim() ||
+        !tool.parameters ||
+        typeof tool.parameters !== "object" ||
+        Array.isArray(tool.parameters),
+    );
+    assert.deepEqual(
+      invalid.map((tool) => ({
+        type: tool?.type,
+        name: tool?.name,
+        parameters: typeof tool?.parameters,
+      })),
+      [],
+      "every Messages-wire tool must be a function with a string name and an object parameters schema",
+    );
+    assert.ok(
+      outgoing.tools.some(
+        (tool) => tool.type === "function" && tool.parameters?.properties?.input,
+      ),
+      "the custom patch tool is bridged instead of reaching the Messages wire raw",
+    );
+    assert.ok(
+      outgoing.tools
+        .filter((tool) => tool.type === "function")
+        .every((tool) => tool.name.length <= 64),
+      "every provider-visible function name stays within Console Go's cap",
+    );
+    assert.equal(
+      outgoing.tools.some((tool) => tool.type === "web_search"),
+      false,
+      "a hosted search entry has no Messages representation",
+    );
+    assert.equal(
+      outgoing.tools.some((tool) => tool.name === "codex_app__create_thread"),
+      false,
+      "the chat-only deferred app snapshot is not injected on Console Go Messages",
+    );
+  }
+});
+
 test("OpenCode Go Muse removes recursive tool refs in both response modes", async () => {
   for (const stream of [true, false]) {
     const result = await scenario(stream, {

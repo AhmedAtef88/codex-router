@@ -1037,6 +1037,41 @@ function needsConsoleGoResponsesToolCompatibility(route) {
   return providerForModel(route)?.id === "opencode-go-responses";
 }
 
+// Console Go's Messages variant is the same Go backend behind Anthropic frames,
+// so it inherits the bounded function-tool contract: the deferred codex_app
+// snapshot is not injected, custom/grammar tools are bridged to functions, and
+// hosted-search entries (which have no Messages shape) are dropped. It is
+// stricter in one measured way: LiteLLM renders every Messages tool as
+// `{name, input_schema}` and Console Go rejects a function declared without an
+// object schema, while the Responses endpoint tolerates the bare declaration.
+function needsConsoleGoMessagesToolCompatibility(route) {
+  return providerForModel(route)?.id === "opencode-go-messages";
+}
+
+// The last boundary before the Messages wire: every tool must be a function
+// with a non-empty name and an object parameters schema, because that is the
+// only shape LiteLLM can render as an Anthropic tool. A tool that still cannot
+// be represented is dropped rather than allowed to 400 the whole turn with
+// "tools[N] must have a string \"name\" and an object \"input_schema\"".
+export function messagesWireToolContract(tools) {
+  if (!Array.isArray(tools)) return { tools, dropped: [] };
+  const dropped = [];
+  const kept = [];
+  for (const tool of tools) {
+    if (tool?.type !== "function" || typeof tool.name !== "string" || !tool.name.trim()) {
+      dropped.push(String(tool?.name ?? tool?.type ?? "unknown"));
+      continue;
+    }
+    const parameters = tool.parameters;
+    kept.push(
+      parameters && typeof parameters === "object" && !Array.isArray(parameters)
+        ? tool
+        : { ...tool, parameters: { type: "object", properties: {} } },
+    );
+  }
+  return { tools: kept, dropped };
+}
+
 function rejectsWebSearchOptions(route) {
   return ["fireworks", "opencode-go"].includes(providerForModel(route)?.id);
 }
@@ -3242,6 +3277,8 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   const chatCompletionsProvider = provider?.protocol !== "openai-responses";
   const deepSeekResponses = usesDeepSeekResponses(route);
   const consoleGoResponsesCompatibility = needsConsoleGoResponsesToolCompatibility(route);
+  const consoleGoMessagesCompatibility = needsConsoleGoMessagesToolCompatibility(route);
+  const consoleGoCompatibility = consoleGoResponsesCompatibility || consoleGoMessagesCompatibility;
   // Restore declarations only where the existing adapter flattens tools again.
   // Native Responses routes retain the client's original declaration shape and
   // restore only their response lookup below.
@@ -3338,7 +3375,11 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   // flattened into ordinary functions; DeepSeek's native Responses endpoint
   // requires the same tool subset. The response transform maps calls back to
   // the client's native namespace shape.
-  if (chatCompletionsProvider || deepSeekResponses) {
+  // Console Go Messages is a chat-wire provider, but its tool boundary follows
+  // the Console Go family: the deferred codex_app snapshot is not injected (its
+  // children ship without schemas, which the Messages validator refuses), and
+  // names take the bounded alias form the endpoint enforces.
+  if ((chatCompletionsProvider && !consoleGoMessagesCompatibility) || deepSeekResponses) {
     // Relay the app's full native toolset (threads, automations, app
     // navigation) to the provider. The client registers these tools with
     // deferLoading and executes the calls natively, but only sends a reduced
@@ -3357,10 +3398,12 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     if (namespacesFlattened) {
       tools = flattened.tools;
     }
-  } else if (consoleGoResponsesCompatibility) {
+  } else if (consoleGoCompatibility) {
     // Console Go exposes a Responses endpoint but rejects the native tool
     // discriminators Codex sends. Translate only its tool boundary; unlike the
     // chat-completions branch, do not inject the deferred codex_app snapshot.
+    // The Messages variant shares the boundary and adds the schema guarantee
+    // below.
     const flattened = flattenNamespaceTools(tools, { maxNameLength: 64 });
     namespacesFlattened = flattened.flattened;
     flattenedNamespaces = flattened.namespaces;
@@ -3406,7 +3449,13 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     Array.isArray(tools) && tools.some(
       (tool) => tool?.type === "custom" && tool.name === "apply_patch",
     );
-  if (needsStrictOpenCodeToolCompatibility(route) || deepSeekResponses || structuredPatch || patchHook) {
+  if (
+    needsStrictOpenCodeToolCompatibility(route) ||
+    consoleGoMessagesCompatibility ||
+    deepSeekResponses ||
+    structuredPatch ||
+    patchHook
+  ) {
     const customTools = bridgeCustomTools(
       tools,
       routedInput,
@@ -3417,7 +3466,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
         ? { codecs: new Map([["apply_patch", GROK_PATCH_HOOK_CODEC]]) }
         : structuredPatch
         ? { codecs: new Map([["apply_patch", GROK_STRUCTURED_PATCH_CODEC]]) }
-        : consoleGoResponsesCompatibility
+        : consoleGoCompatibility
         ? { maxNameLength: 64, bridgeAll: true }
         : undefined,
     );
@@ -3478,6 +3527,23 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
       tools = repairToolSchemaRoots(tools, { nonRecursive: true });
     }
   }
+  if (consoleGoMessagesCompatibility) {
+    // Last, because the search-history expansion above is the only pass that
+    // can still add a tool (a discovered definition may ship without a schema).
+    // LiteLLM renders each Messages tool as `{name, input_schema}`; anything
+    // else is refused by Console Go before the model sees the turn. Drop a
+    // hosted-search entry first -- it has no Messages shape and the turn keeps
+    // working without search -- then guarantee the function contract.
+    const hostedStripped = stripUnsupportedHostedSearch({ tools }, { model: route.slug }).tools;
+    const contract = messagesWireToolContract(hostedStripped);
+    if (contract.dropped.length) {
+      console.error(
+        `[codex-router] messages-wire-tool-drop model=${route.slug} ` +
+          `tools=${contract.dropped.join(",")}`,
+      );
+    }
+    tools = contract.tools;
+  }
   // Stored call history and forced choices must use the same tool names as the
   // provider-facing list, or the model/request validator sees two identities.
   if (namespacesFlattened) {
@@ -3493,7 +3559,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
       );
     }
   }
-  if (consoleGoResponsesCompatibility || deepSeekResponses) {
+  if (consoleGoCompatibility || deepSeekResponses) {
     routedToolChoice = flattenToolChoice(routedToolChoice, flattenedNamespaces);
   }
   // Last, so the marker text is built from the history every other rewrite has
