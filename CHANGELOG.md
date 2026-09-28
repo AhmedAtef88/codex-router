@@ -1,12 +1,261 @@
 # Changelog
 
 ## Unreleased
+- **Your own OpenAI-compatible endpoints can be added from Control Center.**
+  A generic provider already carried everything an operator needs — an address,
+  a protected key file, `/models` discovery, curation into the picker, and
+  `<provider>/<model>` slugs that cannot collide — but it existed only on the
+  command line, and `providerOnboardingSnapshot()` walked the checked-in
+  registry alone, so nothing in the desktop app could see one. **Models →
+  Custom → Add endpoint** now takes a name, a base URL, a Chat Completions or
+  Responses choice, and a key, and the endpoint's own chip owns the rest: add
+  models from its catalog, add one **By name** for a private or preview id that
+  catalog never lists, remove a model, edit the address or key, or remove the
+  endpoint with its key and models. The key crosses from the renderer on
+  standard input (`providers generic credential ID set --stdin`), because the
+  existing hidden prompt opens `/dev/tty` and an Electron child has none.
+  Endpoints ride in their own `customEndpoints` array rather than among
+  `providers`, so the tray and guided setup cannot mistake one for a
+  checked-in provider they may select.
+- **Adding a custom endpoint no longer fails on the deadline check.**
+  `generic-providers` republishes the overlay and restarts the router, exactly
+  as `credential` does, but it was missing from control.mjs's restart-bearing
+  set. It therefore ran under the 850-second budget while
+  `assertRestartingPublicationAllowance` demands room for a full
+  publication-plus-readiness epoch, and every add refused with "The
+  model-overlay deadline cannot preserve publication and the full router
+  readiness allowance" before writing anything.
+- **A crashing router child no longer reports itself as a stack trace.**
+  `safeFailure()` forwarded Node's whole uncaught-exception report, so a
+  desktop error read `file:///…/model-overlay-publication.mjs:94 const error =
+  new Error( ^ Error: …` with the sentence buried in the middle. It now keeps
+  the message and drops the file, the source excerpt, the caret, and the
+  frames; a child that failed without throwing is still shown whole, and
+  redaction is unchanged.
+- **A saved endpoint says at once whether it answers.** Adding or editing one
+  runs a single `GET /models` against it, so an unreachable host, a typo, or a
+  rejected key is named while the operator is still in the dialog, with the
+  option to register a model by name anyway, instead of silently opening an
+  empty model picker.
+- **Publishing into a DeepSeek Harness settings file no longer nests the route
+  inside somebody else's provider, and removing it no longer empties the
+  file.** `dsh-config-manager.mjs` read "does this mapping hold anything but
+  ours?" off `children`, which is only the keys the YAML lexer could register.
+  A block sequence, a merge key, or a provider id the key grammar declines
+  (`openrouter/free:`) lives inside the node while being invisible there. So
+  publishing copied its indentation off a hoisted grandchild and wrote
+  `codex-router:` two columns too deep -- inside the user's provider, where the
+  harness never looks, while every status read agreed the publish had worked --
+  and removal, seeing `children.size === 1`, spliced the whole `providers:`
+  section away: a 143-byte settings file with somebody else's route in it came
+  back empty. One comment line above our key was enough to do the same. The
+  credentials document had the matching failure: `refs:` holding an entry the
+  grammar declines left the indent falling back to `refs.indent + 2` while the
+  entries on disk sat at four, and that mixed-indent block costs every
+  adapter's key, not just ours. `routed-harness-document.mjs` already refused
+  all of this; its `unaccountedLines` helper moves to `yaml-structure.mjs` and
+  both managers now share it. Anything this reader cannot account for is
+  refused with the file untouched and the offending line named.
+- **An apostrophe in a harness config no longer moves the router's route into
+  somebody else's value.** `yaml-structure.mjs` treated every `'` and `"` as a
+  quoting indicator, but YAML only gives a quote that meaning where a node can
+  begin: `note: don't edit` is a plain scalar, not an unterminated quoted one.
+  A single apostrophe therefore swallowed the rest of the document. When
+  nothing later matched it, the scan refused a perfectly ordinary file and the
+  router could not publish at all; when a later line happened to carry a
+  matching quote, the scan finished quietly having hidden every key in between,
+  and the splice wrote `codex-router:` inside a block scalar or a list item.
+  The harness then saw no route and the user's value grew four lines of YAML.
+  A quote now opens a scalar only at the start of a value, after a flow
+  collection's `[`, `{`, `,` or `:`, and after a block sequence's `- `. Across
+  27,045 generated documents that PyYAML accepts, 6,956 refusals, 184
+  unparseable outputs and 178 misplaced routes all go to zero. Affects
+  DeepSeek Harness `settings.yaml` and `.credentials.yaml`, omp `models.yml`,
+  Hermes Agent `config.yaml`, and caller-capability refreshes into all three.
+- **The Devin CLI model list asks for the method Devin 3000.x actually serves.**
+  `devin-cli` called `GetCascadeModelConfigs`, which is the IDE's method; the
+  CLI moved to `GetCliModelConfigs`, so a CLI-credentialed account was answered
+  Connect `invalid_argument` on every `bin/devin-probe` and `bin/curate-models
+  devin-cli` run (#770). Both methods are still declared on the service, which
+  is why the refusal did not arrive as `unimplemented`. Re-reading every field
+  the router writes against Devin 3000.10.31 found the request shape unchanged,
+  so the method name was the whole drift. The probe now says so when an
+  `invalid_argument` lands behind a clean request-shape check, and the unused
+  `MODEL_INFO` table -- whose field numbers had also gone stale -- is gone. The
+  provider remains unverified: no maintainer has run a live turn.
+- **`start` and `restart` say the scheduled task is missing instead of relaying
+  schtasks.** On Windows both verbs went straight to
+  `schtasks /Change /TN "Codex Router" /ENABLE`, so with no task registered the
+  operator got schtasks.exe's own error, naming neither the task nor anything
+  to do about it (#760). `stop` had guarded on the task's existence since it
+  shipped; these two now do too, and name `service.mjs install` and
+  `doctor --fix`. Nothing is mutated on the way out, and a `start` that cannot
+  start no longer prints `{"state":"running"}`.
+- **OpenCode Go Messages no longer 400s a generated ImageGen PNG.** Console
+  Go rejects a single `messages[N].content` over 2,500,000 characters. A
+  live Union Alpha follow-up after `image_gen` carried a 2.03 MiB
+  1536×1024 PNG as a 2,707,238-character data URL and died before
+  `final_answer`. The hop now replaces that oversized image with a labeled
+  stub; Codex still has the file. Compact stays 180,000 and the completion
+  cap stays 32,768.
+
+- **Union Alpha publishes the measured 32,768 completion reserve.** OpenCode
+  and Console Go treat an omitted `max_tokens` as the advertised 131,072
+  output. A Desktop-sized first turn (~140k rendered) plus that reserve
+  exceeds the 262,144 window and comes back as
+  `context_length_exceeded` / "tokenizer/template mismatch, not high demand"
+  even though the hop would have fitted the same prompt at 32,768. The
+  Messages route now always sends 32,768 and the catalog / OpenCode
+  `limit.output` advertise that cap. Compact stays 180,000. Rebuild the
+  catalog; a thread already past OpenCode's tokenizer still needs a new
+  task.
+
+- **An unfinished Union Alpha prefix closed as `output_text` is still truncated.**
+  The 14:12 ImageGen retry stored `I'll use the image generation` as
+  `final_answer` after empty-completion already withheld the first attempt.
+  LiteLLM had closed that fragment as a real `output_text` part, so the
+  thinking-match withhold never fired. A held done snapshot that is still a
+  mid-clause cut is withheld; punctuated answers stay answers.
+- **Automatic approval reviews can fall back to a routed model when ChatGPT
+  quota runs out.** Codex runs `Approve for me` on its own hidden native model,
+  so with `Use Router with ChatGPT` on, an exhausted plan left a routed session
+  proposing commands it could not execute (#787).
+  `./bin/control auto-review-fallback set <provider/model>` names a reviewer for
+  exactly those turns. It engages only after the native reviewer has itself
+  refused for quota, and only for the window that refusal named -- a denial, a
+  policy rejection, a 5xx, and anything ambiguous all stay native, and a `deny`
+  is never retried through another model. The first native answer afterwards
+  ends the window. The main agent's model is unaffected either way.
+- **`subagents explain <model>` says why a route cannot be delegated to.** The
+  answer lived in three places that never met -- selection in `subagents
+  status`, promotion in the published catalog, and the agent definition on disk
+  -- so the only way to find out was to spawn one and read `codex exited 1`
+  (#804). The new command names the first blocker and the command that fixes
+  it, distinguishes a typo from an uncurated model from a native slug, and says
+  whether a route's v2 claim comes from the registry, a local five-check run, or
+  the operator's own selection. Read-only and quota-free.
+
+- **A configured subagent effort no longer reads as a drifted agent
+  definition.** `syncRoutedCodexAgents` wrote `model_reasoning_effort` into the
+  definition and `routedCodexAgentStatus` computed the expected contents without
+  it, so every model with a subagent effort set was reported `stale` forever:
+  doctor flagged drift, `--fix` republished identical bytes, and the next check
+  flagged it again.
+
+- **Playwright is 1.63.0 in both the router tests and the Control Center.**
+  Dependabot #758 only bumped the root pin. The Control Center lock stays in
+  step so renderer tests and docs screenshots use the same browser.
+- **LiteLLM's finish sequence no longer stores a leaked Union Alpha prefix.**
+  Holding until `output_text.done` assumed that event arrived after the
+  `reasoning_text` close. LiteLLM 1.96 emits the done snapshot first, then
+  closes the part as thinking, which stored
+  `The skill is loaded. This is a single concept-sheet generation: a
+  GTA-style AAA` as `final_answer`. The done snapshot is held until that
+  close; the same text (or a prefix of the thinking) is withheld so
+  empty-completion can retry. A distinct answer still completes.
+
+- **A truncated `exec_command` JSON call is retried instead of a 502.** Union
+  Alpha can finish a tool call with an unterminated string. The router still
+  refuses to store that item, but if Codex has not seen a byte yet it retries
+  once like an empty completion instead of answering `unexpected status 502`.
+
+- **A leaked Union Alpha prefix is still truncated when LiteLLM also sends
+  `output_text.done`.** Holding until that event was not enough: the live
+  ImageGen turnaround closed as `reasoning_text` and then `output_text.done`
+  for the same 29-token sentence ending `(no reference`. The snapshot is
+  withheld so empty-completion can retry instead of storing it as
+  `final_answer`.
+
+- **Union Alpha no longer compact-loops on a Codex Desktop tool list.** Compact
+  at 80,000 sat below ~88–108k of cached tool-schema tokens, so every ImageGen
+  skill read compacted, the checkpoint kept a 1k excerpt, and the model
+  re-read the file. Compact is 180,000, above that floor. The 32,768
+  `max_tokens` cap and compact overflow hop stay. Rebuild the catalog and
+  start a new Codex task; a thread already in the compact loop will keep
+  looping.
+
+- **Union Alpha no longer stores a 21-token mid-sentence `final_answer` after a
+  premature `reasoning_text` close.** The earlier drop only fired when a
+  reasoning-summary delta had already opened the repair. Live ImageGen turns
+  streamed `I'll use the ImageGen skill… so` with no summary first, so the
+  close still ended the message and Codex marked the turn complete. The repair
+  now holds that prefix until `output_text.done`; if the stream completes
+  without it, empty-completion retries or fails instead of succeeding with 21
+  tokens.
+
+- **Compact overflow on Union Alpha can retry a larger-window model.** OpenCode
+  estimated about 434,983 tokens against Union Alpha's 262,144 card, so
+  compacting the same 262k route cannot save that thread. Compact failures
+  are translated to `context_length_exceeded` instead of LiteLLM's model-group
+  wrapper. Compact may retry a larger-window model, including a same-family
+  OpenCode Go 1M route, without recording a cooldown. Ordinary turns still
+  never swap on HTTP 400. If every configured window is still too small, start
+  a new Codex task.
+
+- **Union Alpha on OpenCode Go Messages caps the Messages completion budget.**
+  Console Go 400s a prompt-plus-completion that does not fit every available
+  backend. The Go Messages route keeps the advertised 262,144 window, caps
+  Messages `max_tokens` at 32,768, and translates that 400 as a context-window
+  error rather than a generic rejection. The shipped slug is
+  `opencode-go-messages/union-alpha`.
+
+- **Union Alpha is now a checked-in OpenRouter route.** OpenRouter publishes
+  this stealth preview as `stealth/union-alpha` (262,144 context, 131,072
+  output, text and image input, currently free). The shipped slug is
+  `openrouter/union-alpha`. OpenRouter does not advertise a reasoning-effort
+  ladder, so the stored rung is the conservative single `high`. Its endpoint
+  record accepts `tool_choice` auto only (`required` and `none` are false), so
+  the route uses `auto-tool-choice`. Cline the IDE can already pick this id
+  through OpenRouter; ClinePass and Command Code do not list it. Rebuild the
+  catalog and fully quit and reopen Codex.
+
+- **A completed function_call with invalid JSON arguments is no longer stored.**
+  Relaying that item left Codex unable to execute it and poisoned every later
+  turn on the thread (#797). The router now withholds the completing snapshot
+  and fails the turn instead of inventing a closing quote. Empty arguments,
+  custom tools, and native-hook raw patches are unchanged.
+
+- **A local tool-argument conversion failure is no longer a provider rejection.**
+  LiteLLM raises that parse while building Anthropic `tool_use.input` from
+  stored history, before any provider request. The error now names the stored
+  call and does not fail over, even when the argument body matches a quota
+  phrase (#796).
+
+- **OpenCode Go Messages no longer 400s Codex hosted/custom leftovers or 502s
+  thinking-only streams.** Anthropic Messages (Union Alpha and every other
+  `protocol: "anthropic"` route) now keeps only named functions with object
+  schemas, and LiteLLM's Chat Completions reasoning-summary repair attaches to
+  those routes because they still set `use_chat_completions_api: true`. A
+  `reasoning_text` close is thinking, not an answer, so the empty-completion
+  guard can still retry; a `reasoning_text` close that arrives before
+  `output_text.done` also no longer ends the visible message, which had
+  truncated Union Alpha replies mid-sentence (`Union Alpha (`). Qwen on this
+  route additionally omits `tool_choice` entirely (`omit-tool-choice`); MiniMax
+  still accepts the field. Rebuild the catalog and fully quit and reopen Codex.
+  Union Alpha is `opencode-go-messages/union-alpha`.
+
+- **OpenCode Zen now has Messages and Responses protocol variants.** Claude
+  curated under `opencode-zen` lands on `opencode-zen-messages`; GPT, Grok, and
+  Muse land on `opencode-zen-responses`; Gemini is refused. The variants share
+  Go's key and selection toggle but keep Zen's separately billed cooldown
+  scope. Re-curate with `bin/curate-models opencode-zen` to move existing Chat
+  entries onto the matching wire.
+
 - **Google Cloud Vertex AI is a catalog-only provider.** It authenticates with
   Application Default Credentials from `gcloud auth application-default login`
   (never a stored API key or a silent `gcloud auth login` user token), honors
   `--no-discovery`, and lists Model Garden models for `bin/curate-models vertex`.
   A discovered id is not routable until it is curated onto a reviewed adapter.
 
+- **Direct Meta Muse Spark 1.3 Contributor no longer fails on recursive Codex tool
+  schemas.** Meta's direct Responses endpoint answers a self-referencing tool
+  schema with HTTP 400 `Recursive JSON schemas are not currently supported`
+  before inference, losing the whole turn downstream of the gateway. The
+  verified `meta/muse-spark-1.3-contributor` route now breaks only the
+  cycle-closing reference edge through the existing `toolSchemaRecursion:
+  "flatten"` repair, preserving definitions, acyclic references, and sibling
+  constraints. Sibling Meta routes keep their payloads until their own endpoint
+  proves the same restriction (#792).
 - **Union Alpha is now a checked-in OpenCode Go route.** OpenCode's live Go
   catalog and docs publish this stealth model as `union-alpha` on the Messages
   API (`https://opencode.ai/zen/go/v1/messages`), currently free for a limited
@@ -19,6 +268,16 @@
   that same record and is not checked in. Rebuild the catalog and fully quit
   and reopen Codex to see the new picker row.
 
+- **A `.env` that mixes CRLF and LF keeps both.** The Gemini integration owns a
+  marker-delimited block in `$GEMINI_HOME/.env` and treats every other byte as
+  the user's, but it detected one line ending for the whole document and
+  rejoined every line on it. A file touched by two editors came back with the
+  router's ending on lines the router never wrote -- and came back that way
+  again after the block was removed, so the rewrite outlived the integration.
+  Each line now keeps the terminator it arrived with, and the block is rendered
+  with the document's prevailing one. A file that ends without a newline still
+  gains exactly one, because the block has to start on its own line; that is the
+  only difference a publish and removal now leaves behind.
 - **Command Code's DeepSeek V4.1 Flash route advertises image input.** The
   checked-in entry was text-only until Command Code documented the capability
   at the Provider API: the model page lists Image input, and the Provider FAQ
@@ -265,6 +524,14 @@
   `missing type in anyOf properties` error. The route behind #726 has not been
   established, so that issue is not claimed resolved by this change.
 
+- **A resold image cannot be charged as prose in the prompt-token estimate.**
+  `maxImageTokensForRoute` bounded only the three documented direct DeepSeek
+  Flash models, so a route such as `openrouter/deepseek-v4.1-flash` had no bound
+  at all and the estimator added the image's base64 to the prompt tokens — 819k
+  tokens for one 2.7 MB screenshot, which is most of a 1M window and enough to
+  trigger client auto-compaction on its own. Routes without a documented bound
+  now take a conservative 4096-token default; the three DeepSeek Flash models
+  keep their documented 1024.
 - **Routed coding clients can be kept current from the Harness page.**
   `control client-update <id>` and `control client-update --all`, plus an
   **Update** button on each row and **Update all** in the header, move

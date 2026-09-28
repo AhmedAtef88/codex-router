@@ -1123,6 +1123,16 @@ test("electron boundary does not enable node integration or shell argv", async (
   assert.match(main, /setApplicationMenu\(null\)/);
   assert.match(main, /icon:\s*appIconPath\(\)/);
   assert.match(main, /app\.dock\?\.setIcon\(appIconPath\(\)\)/);
+  // The macOS status item is a monochrome template glyph, not the app tile (#829).
+  assert.match(main, /function trayIconImage\(\)[\s\S]{0,200}process\.platform !== "darwin"[\s\S]{0,400}"trayTemplate\.png"[\s\S]{0,300}setTemplateImage\(true\)/);
+  assert.match(main, /function createTray\(\)[\s\S]{0,200}const image = trayIconImage\(\)/);
+  assert.doesNotMatch(main, /new Tray\(nativeImage\.createFromPath\(appIconPath\(\)\)\)/);
+  for (const [asset, size] of [["trayTemplate.png", 18], ["trayTemplate@2x.png", 36]]) {
+    const png = await readFile(new URL(`../apps/control-center/assets/${asset}`, import.meta.url));
+    assert.equal(png.readUInt32BE(16), size, `${asset} width`);
+    assert.equal(png.readUInt32BE(20), size, `${asset} height`);
+    assert.equal(png[25], 6, `${asset} keeps its alpha channel`);
+  }
   assert.match(main, /function showDockForVisibleWindow\(\)[\s\S]*app\.dock\.setIcon\(appIconPath\(\)\)[\s\S]*app\.dock\.show\(\)/);
   assert.match(main, /function hideDockForHiddenWindow\(\)[\s\S]*app\.dock\.hide\(\)/);
   assert.match(main, /function revealWindow\(\)[\s\S]{0,700}showDockForVisibleWindow\(\)[\s\S]{0,120}mainWindow\.show\(\)/);
@@ -1182,6 +1192,8 @@ test("electron boundary does not enable node integration or shell argv", async (
   assert.doesNotMatch(main, /script-src[^;]*'unsafe-inline'/);
   const builder = await readFile(new URL("../apps/control-center/electron-builder.yml", import.meta.url), "utf8");
   assert.match(builder, /extraResources:[\s\S]*icon\.png/);
+  assert.match(builder, /from: assets\/trayTemplate\.png\s+to: trayTemplate\.png/);
+  assert.match(builder, /from: assets\/trayTemplate@2x\.png\s+to: trayTemplate@2x\.png/);
   assert.match(builder, /from:\s*\.\.\/\.\.\/src\/spawnable-command\.mjs[\s\S]*to:\s*src\/spawnable-command\.mjs/);
   assert.match(builder, /from:\s*\.\.\/\.\.\/src\/chatgpt-login-lease\.mjs[\s\S]*to:\s*src\/chatgpt-login-lease\.mjs/);
   assert.match(builder, /from:\s*\.\.\/\.\.\/src\/path-security\.mjs[\s\S]*to:\s*src\/path-security\.mjs/);
@@ -1615,7 +1627,10 @@ test("the model directory combines provider setup with de-duplicated model-famil
   assert.match(models, /className="panel-section pm-connections"/);
   assert.match(models, /className="pm-chip"/);
   assert.match(models, /className="pm-connection-menu"/);
-  assert.match(models, /\{connected\.length\} of \{directory\.length\} connected/);
+  // Custom endpoints are reached through the Custom chip rather than sitting
+  // beside it, so the summary counts the chips on the strip, not every
+  // provider in the directory.
+  assert.match(models, /\{connected\.length\} of \{chips\.length\} connected/);
   assert.match(models, /Connect provider/);
   assert.doesNotMatch(models, /className="pm-provider-row"|className="pm-provider-summary"/);
   assert.doesNotMatch(models, /<StatStrip/);
@@ -2571,4 +2586,134 @@ test("router children inherit the proxy opt-in this install recorded", async () 
   assert.doesNotMatch(runner, /childEnvironment\.HTTPS?_PROXY = /);
   // It applies only to the install that recorded it.
   assert.match(runner, /recordedInstall\?\.sourceRoot === sourceRoot\s*&&\s*recordedInstall\.proxyOptIn/);
+});
+
+test("a custom endpoint URL is validated before it can reach the router CLI", async () => {
+  const { customEndpointBaseUrl } = await import("../apps/control-center/electron/ipc.mjs");
+  assert.equal(customEndpointBaseUrl("https://api.example.com/v1"), "https://api.example.com/v1");
+  // A trailing slash would make the router's own `${baseUrl}/models` a double slash.
+  assert.equal(customEndpointBaseUrl("https://api.example.com/v1/"), "https://api.example.com/v1");
+  assert.equal(customEndpointBaseUrl("http://127.0.0.1:1234/v1"), "http://127.0.0.1:1234/v1");
+  // A key belongs in the credential field, where it crosses on standard input.
+  // In a URL it would land in the descriptor, the catalog cache, and every log.
+  assert.throws(() => customEndpointBaseUrl("https://user:secret@api.example.com/v1"), /key in the key field/);
+  assert.throws(() => customEndpointBaseUrl("https://api.example.com/v1?key=abc"), /query or fragment/);
+  assert.throws(() => customEndpointBaseUrl("https://api.example.com/v1#frag"), /query or fragment/);
+  assert.throws(() => customEndpointBaseUrl("ftp://api.example.com/v1"), /http or https/);
+  assert.throws(() => customEndpointBaseUrl("file:///etc/passwd"), /http or https/);
+  assert.throws(() => customEndpointBaseUrl("not a url"), /invalid/i);
+  assert.throws(() => customEndpointBaseUrl(""), /required|invalid/i);
+});
+
+test("private and loopback endpoint addresses are recognised before --allow-private is passed", async () => {
+  const { loopbackOrPrivateHost } = await import("../apps/control-center/electron/ipc.mjs");
+  for (const host of [
+    "localhost", "app.localhost", "printer.local", "127.0.0.1", "127.4.5.6", "::1",
+    "10.1.2.3", "192.168.1.10", "172.16.0.1", "172.31.255.254",
+    "169.254.169.254", "100.64.0.1", "fd00::1", "fe80::1", "0.0.0.0",
+  ]) {
+    assert.equal(loopbackOrPrivateHost(host), true, `${host} should be private`);
+  }
+  for (const host of [
+    "api.example.com", "8.8.8.8", "172.32.0.1", "172.15.0.1", "100.128.0.1",
+    "11.0.0.1", "193.168.1.10", "2606:4700::1111",
+  ]) {
+    assert.equal(loopbackOrPrivateHost(host), false, `${host} should be public`);
+  }
+});
+
+test("a custom endpoint id is derived from the name and never reuses a taken one", async () => {
+  const { customEndpointId } = await import("../apps/control-center/electron/ipc.mjs");
+  // The id prefixes every model slug this endpoint publishes, so a collision
+  // would silently attach one endpoint's models to another's namespace.
+  assert.equal(customEndpointId("My Provider", new Set()), "my-provider");
+  assert.equal(customEndpointId("My Provider", new Set(["my-provider"])), "my-provider-2");
+  assert.equal(
+    customEndpointId("My Provider", new Set(["my-provider", "my-provider-2"])),
+    "my-provider-3",
+  );
+  assert.equal(customEndpointId("  Spaced   Out  ", new Set()), "spaced-out");
+  // Accented letters keep their base letter; one like "ø", which is its own
+  // letter rather than a decomposable accent, reads as a separator instead.
+  assert.equal(customEndpointId("Ünïcodé Ltd.", new Set()), "unicode-ltd");
+  assert.equal(customEndpointId("Ø Corp", new Set()), "corp");
+  // An id has to start with a letter or digit for the registry's own id rule.
+  assert.equal(customEndpointId("...", new Set()), "custom-endpoint");
+  assert.equal(customEndpointId("!!!weird!!!", new Set()), "weird");
+  assert.match(customEndpointId("x".repeat(200), new Set()), /^x{1,40}$/);
+});
+
+test("custom endpoint mutations refuse renderer input before spawning a router command", async () => {
+  const handlers = new Map();
+  const { registerIpcHandlers } = await import("../apps/control-center/electron/ipc.mjs");
+  registerIpcHandlers({
+    ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
+    BrowserWindow: { getAllWindows: () => [] },
+    shell: {},
+    senderGuard: () => true,
+  });
+  const add = handlers.get("router-control:addCustomEndpoint");
+  assert.equal(typeof add, "function");
+  // Every one of these must be refused by the validation above, before the
+  // handler reaches providerEntries() and spawns the router CLI.
+  await assert.rejects(add({}, { displayName: "", baseUrl: "https://api.example.com/v1" }), /Name/);
+  await assert.rejects(
+    add({}, { displayName: "x".repeat(121), baseUrl: "https://api.example.com/v1" }),
+    /at most 120/,
+  );
+  await assert.rejects(add({}, { displayName: "Ok", baseUrl: "ftp://example.com" }), /http or https/);
+  await assert.rejects(
+    add({}, { displayName: "Ok", baseUrl: "https://user:pass@example.com/v1" }),
+    /key in the key field/,
+  );
+  await assert.rejects(
+    add({}, { displayName: "Ok", baseUrl: "https://api.example.com/v1", adapter: "anthropic" }),
+    /API format is invalid/,
+  );
+  await assert.rejects(
+    add({}, { displayName: "Ok", baseUrl: "https://api.example.com/v1", credential: "k".repeat(16 * 1024 + 1) }),
+    /Credential is invalid/,
+  );
+  await assert.rejects(
+    add({}, { displayName: "Ok", baseUrl: "https://api.example.com/v1", credential: 42 }),
+    /Credential is invalid/,
+  );
+});
+
+test("a crashing router child is reported as its message, not as a stack trace", () => {
+  const crash = [
+    "file:///Users/someone/codex-router/src/model-overlay-publication.mjs:94",
+    "    const error = new Error(",
+    "          ^",
+    "",
+    "Error: The model-overlay deadline cannot preserve publication and the full router readiness allowance.",
+    "    at assertRestartingPublicationAllowance (file:///Users/someone/src/model-overlay-publication.mjs:94:19)",
+    "    at transaction (file:///Users/someone/src/model-overlay-publication.mjs:331:5)",
+    "",
+    "Node.js v24.16.0",
+  ].join("\n");
+  assert.equal(
+    safeFailure(crash),
+    "The model-overlay deadline cannot preserve publication and the full router readiness allowance.",
+  );
+  // A message that wraps keeps its later lines, stopping at the stack.
+  const wrapped = [
+    "TypeError: The endpoint answered with an empty body",
+    "and declares no environment fallback.",
+    "    at resolve (file:///x.mjs:1:1)",
+  ].join("\n");
+  assert.equal(
+    safeFailure(wrapped),
+    "The endpoint answered with an empty body and declares no environment fallback.",
+  );
+  // Redaction runs first and drops a whole line that names a credential, so
+  // such a line can never become the reported sentence.
+  assert.doesNotMatch(safeFailure("Error: the api key is unavailable\n    at x"), /api key/);
+  // A child that failed without throwing has no report to trim.
+  assert.equal(
+    safeFailure("Usage: providers generic add-model PROVIDER MODEL_ID"),
+    "Usage: providers generic add-model PROVIDER MODEL_ID",
+  );
+  // Redaction still runs before any trimming.
+  assert.doesNotMatch(safeFailure("Error: rejected sk-abcdefghijklmnop123456"), /abcdefghijklmnop/);
 });

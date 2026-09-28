@@ -362,7 +362,8 @@ function loadRegistry() {
       }
       if (
         provider.protocol !== undefined &&
-        !["openai", "anthropic", "openai-responses", "vertex"].includes(provider.protocol)
+        !["openai", "anthropic", "openai-responses", "openai-decisions", "vertex"]
+          .includes(provider.protocol)
       ) {
         fail(`provider ${provider.id} has an unsupported API protocol`);
       }
@@ -866,6 +867,14 @@ function modelProblem(model, providers, slugs, gatewayModels) {
       model.autoCompact > model.contextWindow
     ) {
       return `listed model ${model.slug} requires a valid autoCompact limit`;
+    }
+    if (
+      model.maxOutputTokens !== undefined &&
+      (!Number.isInteger(model.maxOutputTokens) ||
+        model.maxOutputTokens < 1 ||
+        model.maxOutputTokens > model.contextWindow)
+    ) {
+      return `listed model ${model.slug} has an invalid maxOutputTokens`;
     }
     if (
       !Array.isArray(model.inputModalities) ||

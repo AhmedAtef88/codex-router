@@ -330,7 +330,49 @@ test("Groq refuses when client plus referenced app definitions exceed the cap", 
   );
 });
 
-test("non-Groq providers preserve the normally expanded tool surface", () => {
+test("tool-search capable chat providers keep the client-deferred app surface", () => {
+  const client = largeClientSurface({ plainTools: 2, toolSearch: true });
+  const clientFlattened = flattenNamespaceTools(client);
+  const routed = chatProviderToolSurface(client, "zai-coding");
+
+  assert.equal(toolSearchRelayAvailable(routed.namespaces), true);
+  assert.deepEqual(routed.tools, clientFlattened.tools);
+  assert.equal(
+    routed.tools.some((tool) => tool.name === "codex_app__create_thread"),
+    false,
+  );
+  assert.equal(
+    routed.tools.some((tool) => tool.name === "plugin_management__uninstall_plugin"),
+    false,
+  );
+});
+
+test("tool-search capable chat providers add back only referenced deferred app tools", () => {
+  const client = largeClientSurface({ plainTools: 2, toolSearch: true });
+  const routed = chatProviderToolSurface(client, "zai-coding", {
+    input: [{
+      type: "function_call",
+      namespace: "codex_app",
+      name: "create_thread",
+      call_id: "history-thread",
+      arguments: "{}",
+    }],
+    toolChoice: {
+      type: "function",
+      namespace: "codex_app",
+      name: "send_message_to_thread",
+    },
+  });
+  const names = new Set(routed.tools.map((tool) => tool.name));
+
+  assert.equal(toolSearchRelayAvailable(routed.namespaces), true);
+  assert.equal(names.has("codex_app__create_thread"), true);
+  assert.equal(names.has("codex_app__send_message_to_thread"), true);
+  assert.equal(names.has("codex_app__automation_update"), false);
+  assert.equal(names.has("plugin_management__uninstall_plugin"), false);
+});
+
+test("non-Groq providers without tool search preserve the normally expanded tool surface", () => {
   const client = largeClientSurface();
   const expected = flattenNamespaceTools(mergeCodexAppTools(client).tools);
   const routed = chatProviderToolSurface(client, "openrouter");

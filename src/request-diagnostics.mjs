@@ -1,7 +1,8 @@
 // Bounded request diagnostics for usage events. Counts, billing, routes, and
-// retries stay in usage-events.mjs; this module only names a request and the
-// Grok OAuth 4.6 ingress byte split. It never stores headers, bodies, thread
-// titles, or paths.
+// retries stay in usage-events.mjs; this module names a request and records
+// small routing-shape facts such as reasoning effort, routed tool count/schema
+// bytes, and the Grok OAuth 4.6 ingress byte split. It never stores headers,
+// bodies, tool definitions, thread titles, or paths.
 //
 // The request ID is created by the /activity observer and includes its process
 // instance ID, so a service restart cannot accidentally join unrelated requests.
@@ -10,6 +11,7 @@ export const ROUTER_INGRESS_OBSERVATION_POINT = "router_ingress";
 export const GROK_OAUTH_46_SLUG = "grok-oauth/grok-4.6";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9:_-]{1,160}$/;
+const REASONING_EFFORT_PATTERN = /^(?:minimal|low|medium|high|xhigh|max|ultra|none)$/;
 const MAX_CONTEXT_FIELD_BYTES = 1024 * 1024 * 1024;
 
 export function safeDiagnosticRequestId(value) {
@@ -28,6 +30,12 @@ function safeByteCount(value) {
   const number = Number(value);
   if (!Number.isFinite(number) || number < 0) return undefined;
   return Math.min(MAX_CONTEXT_FIELD_BYTES, Math.round(number));
+}
+
+function safeReasoningEffort(value) {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim().toLowerCase();
+  return REASONING_EFFORT_PATTERN.test(text) ? text : undefined;
 }
 
 export function utf8JsonBytes(value) {
@@ -116,14 +124,28 @@ export function serviceTierMetadata({
   };
 }
 
-export function usageDiagnosticMetadata({ requestId, contextBytes, grokStructuredPatch, requestedServiceTier } = {}) {
+export function usageDiagnosticMetadata({
+  requestId,
+  contextBytes,
+  grokStructuredPatch,
+  requestedServiceTier,
+  reasoningEffort,
+  providerToolCount,
+  providerToolSchemaBytes,
+} = {}) {
   const safeRequestId = safeDiagnosticRequestId(requestId);
   const safeContextBytes = sanitizeContextBytes(contextBytes);
   const safeStructuredPatch = sanitizeGrokStructuredPatch(grokStructuredPatch);
+  const safeEffort = safeReasoningEffort(reasoningEffort);
+  const safeToolCount = safeByteCount(providerToolCount);
+  const safeToolSchemaBytes = safeByteCount(providerToolSchemaBytes);
   return {
     ...serviceTierMetadata({ requestedServiceTier }),
     ...(safeRequestId ? { requestId: safeRequestId } : {}),
     ...(safeContextBytes ? { contextBytes: safeContextBytes } : {}),
     ...(safeStructuredPatch ? { grokStructuredPatch: safeStructuredPatch } : {}),
+    ...(safeEffort ? { reasoningEffort: safeEffort } : {}),
+    ...(safeToolCount !== undefined ? { providerToolCount: safeToolCount } : {}),
+    ...(safeToolSchemaBytes !== undefined ? { providerToolSchemaBytes: safeToolSchemaBytes } : {}),
   };
 }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { Check, ChevronDown, Filter, KeyRound, Link2, LogIn, MoreHorizontal, Plus, SearchX, ShieldCheck, Trash2 } from "lucide-react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Filter, KeyRound, Link2, LogIn, MoreHorizontal, Pencil, Plus, SearchX, ShieldCheck, Trash2 } from "lucide-react";
 import { Badge, Button, CatalogSkeleton, Dialog, EmptyState, PageHeader, PanelSkeleton, SearchField, SkeletonBlock, Toggle } from "../components";
 import { BrandLogo, ProviderLogo, brandForModel } from "../provider-branding";
 import { formatContext, formatDateTime } from "../lib";
@@ -18,6 +18,7 @@ import {
 import { groupModelFamilies, preferredFamilyRoute } from "../model-families.mjs";
 import { useOptimisticValues, type RunAction } from "../useOptimisticValues";
 import type {
+  CustomEndpointResult,
   ModelViewFocusRequest,
   ProviderCatalog,
   ProviderSetup,
@@ -161,6 +162,17 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
   const [credentialProvider, setCredentialProvider] = useState<ProviderSetup | null>(null);
   const [configurationProvider, setConfigurationProvider] = useState<ProviderSetup | null>(null);
   const [removeProvider, setRemoveProvider] = useState<ProviderSetup | null>(null);
+  const [customEndpointOpen, setCustomEndpointOpen] = useState(false);
+  const [editingEndpoint, setEditingEndpoint] = useState<ProviderSetup | null>(null);
+  const [addModelsQuery, setAddModelsQuery] = useState("");
+  const [namedModelEndpoint, setNamedModelEndpoint] = useState<ProviderSetup | null>(null);
+  // A saved endpoint whose first live check failed. The endpoint is kept --
+  // an unreachable host is usually a network or key problem the operator fixes
+  // next -- so this says what happened and offers the two ways forward.
+  const [endpointNotice, setEndpointNotice] = useState<{ id: string; displayName: string; reason: string } | null>(null);
+  // Set once a new endpoint is saved; the model picker opens as soon as the
+  // refreshed snapshot shows that endpoint with a catalog to browse.
+  const [awaitingEndpointId, setAwaitingEndpointId] = useState<string | null>(null);
   const [catalogStates, setCatalogStates] = useState<Record<string, CatalogViewState>>({});
   const catalogRequestGenerations = useRef<Record<string, number>>({});
   // Slugs committed to the picker but not yet published, per provider. Adding
@@ -212,7 +224,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
   );
   const directory = useMemo<ProviderDirectoryEntry[]>(() => {
     const entries = new Map<string, ProviderDirectoryEntry>();
-    for (const provider of setup?.providers ?? []) {
+    for (const provider of [...(setup?.providers ?? []), ...(setup?.customEndpoints ?? [])]) {
       entries.set(provider.id, { id: provider.id, displayName: provider.displayName, setup: provider, models: [], knownModels: [] });
     }
     for (const provider of target?.providers ?? []) {
@@ -250,7 +262,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
       const rightConnected = providerConnected(right, enabledProviders);
       return Number(rightConnected) - Number(leftConnected) || left.displayName.localeCompare(right.displayName);
     });
-  }, [catalog?.knownModels, enabledProviders, models, setup?.providers, target?.providers]);
+  }, [catalog?.knownModels, enabledProviders, models, setup?.customEndpoints, setup?.providers, target?.providers]);
   const directoryById = useMemo(() => new Map(directory.map((entry) => [entry.id, entry])), [directory]);
   const providerStates = useMemo(() => new Map(directory.map((entry) => [
     entry.id,
@@ -423,10 +435,26 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
     }
   };
 
-  const openAddModels = () => {
+  const openAddModels = (query = "") => {
+    setAddModelsQuery(query);
     setAddModelsOpen(true);
     void loadConnectedCatalogs();
   };
+
+  const removeEndpointModel = (entry: ProviderDirectoryEntry, model: RouterModel) => {
+    if (!api) return;
+    void runAction(`Remove ${model.displayName}`, () => api.removeCustomEndpointModels(entry.id, [model.slug]));
+  };
+
+  useEffect(() => {
+    if (!awaitingEndpointId) return;
+    const entry = directoryById.get(awaitingEndpointId);
+    if (!entry || !catalogEligible(entry)) return;
+    setAwaitingEndpointId(null);
+    openAddModels(entry.displayName);
+    // openAddModels reads the directory this render just produced.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [awaitingEndpointId, directoryById]);
 
   const openProviderMenu = (providerId: string) => {
     setManagedProviderId((current) => (current === providerId ? null : providerId));
@@ -450,7 +478,14 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
       onCloseProvider={() => setManagedProviderId(null)}
       connectMenuOpen={connectMenuOpen}
       onConnectMenuOpen={setConnectMenuOpen}
-      isEnabled={(entry) => optimisticProviders.value(entry.id, enabledProviders.has(entry.id) || entry.models.some((model) => model.native))}
+      isEnabled={(entry) => optimisticProviders.value(entry.id, entry.setup?.generic
+        ? entry.setup.enabled !== false
+        : enabledProviders.has(entry.id) || entry.models.some((model) => model.native))}
+      onAddEndpoint={() => { setManagedProviderId(null); setEditingEndpoint(null); setCustomEndpointOpen(true); }}
+      onEditEndpoint={(entry) => { if (!entry.setup) return; setManagedProviderId(null); setEditingEndpoint(entry.setup); setCustomEndpointOpen(true); }}
+      onAddEndpointModels={(entry) => { setManagedProviderId(null); openAddModels(entry.displayName); }}
+      onAddNamedModel={(entry) => { if (!entry.setup) return; setManagedProviderId(null); setNamedModelEndpoint(entry.setup); }}
+      onRemoveEndpointModel={removeEndpointModel}
       onEnabledChange={(entry, checked) => {
         if (!api) return;
         void optimisticProviders.mutate(entry.id, checked, `${checked ? "Enable" : "Disable"} ${entry.displayName}`, () => api.setProviderEnabled(entry.id, checked));
@@ -469,6 +504,76 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
   );
   const renderConnectionDialogs = () => (
     <>
+      <Dialog
+        open={Boolean(endpointNotice)}
+        title={`${endpointNotice?.displayName || "Endpoint"} saved, but it did not answer`}
+        description="The endpoint and its key are stored. Its model list cannot be read until it responds, so there is nothing to choose from yet."
+        onClose={() => setEndpointNotice(null)}
+      >
+        <div className="pm-credential-warning">
+          <ShieldCheck aria-hidden size={17} strokeWidth={1.7} />
+          <p>{endpointNotice?.reason} Check the base URL, the API key, and whether a VPN or firewall is blocking this address. You can still add a model by name and use it once the endpoint responds.</p>
+        </div>
+        <div className="dialog-actions">
+          <Button variant="secondary" onClick={() => setEndpointNotice(null)}>Close</Button>
+          <Button
+            variant="primary"
+            onClick={() => {
+              const target = endpointNotice;
+              setEndpointNotice(null);
+              const entry = target ? directoryById.get(target.id) : undefined;
+              if (entry?.setup) setNamedModelEndpoint(entry.setup);
+            }}
+          >
+            <Plus aria-hidden size={14} strokeWidth={1.7} /> Add a model by name
+          </Button>
+        </div>
+      </Dialog>
+      <NamedModelDialog
+        provider={namedModelEndpoint}
+        onClose={() => setNamedModelEndpoint(null)}
+        onSave={async (provider, modelId) => {
+          if (!api) return;
+          await runAction(`Add ${provider.id}/${modelId}`, () => api.addCustomEndpointModel(provider.id, modelId));
+        }}
+      />
+      <CustomEndpointDialog
+        open={customEndpointOpen}
+        editing={editingEndpoint}
+        onClose={() => { setCustomEndpointOpen(false); setEditingEndpoint(null); }}
+        onSave={async (endpoint, editing) => {
+          if (!api) return;
+          if (editing) {
+            let editCheck: CustomEndpointResult["check"];
+            await runProviderCredentialAction(editing, `Update ${endpoint.displayName}`, async () => {
+              const { credential, ...fields } = endpoint;
+              const result = await api.editCustomEndpoint(editing.id, fields);
+              if (credential) await api.saveProviderCredential(editing.id, credential);
+              editCheck = result.check;
+            });
+            if (editCheck && !editCheck.ok) {
+              setEndpointNotice({ id: editing.id, displayName: endpoint.displayName, reason: editCheck.reason || "The endpoint did not respond." });
+            }
+            return;
+          }
+          let saved: CustomEndpointResult | undefined;
+          await runAction(`Add ${endpoint.displayName}`, async () => {
+            saved = await api.addCustomEndpoint(endpoint);
+          });
+          if (!saved) return;
+          onRefresh();
+          // Only browse a catalog the endpoint just proved it can serve.
+          if (saved.check && !saved.check.ok) {
+            setEndpointNotice({
+              id: saved.providerId,
+              displayName: endpoint.displayName,
+              reason: saved.check.reason || "The endpoint did not respond.",
+            });
+            return;
+          }
+          setAwaitingEndpointId(saved.providerId);
+        }}
+      />
       <CredentialDialog
         provider={credentialProvider}
         onSave={(provider, secret) => api
@@ -491,7 +596,9 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
         </div>
       </Dialog>
       <Dialog open={Boolean(removeProvider)} title="Disconnect provider" description="The provider is withdrawn from installed clients before its managed credential is deleted." onClose={() => setRemoveProvider(null)}>
-        <div className="pm-credential-warning"><ShieldCheck aria-hidden size={17} strokeWidth={1.7} /><p>{removeProvider?.id === "antigravity-oauth"
+        <div className="pm-credential-warning"><ShieldCheck aria-hidden size={17} strokeWidth={1.7} /><p>{removeProvider?.generic
+          ? "This removes the endpoint, its saved API key, and every model you added from it."
+          : removeProvider?.id === "antigravity-oauth"
           ? "This removes only the router-owned OAuth client, session, and live proof. Official Antigravity or agy credentials are never read or changed."
           : "If a credential also exists in the environment or Keychain, the router will still report it as connected."}</p></div>
         <div className="dialog-actions">
@@ -770,7 +877,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
                 </div>
               ) : null}
             </div>
-            <Button variant="primary" disabled={!api || !connectedProviderCount} onClick={openAddModels}>
+            <Button variant="primary" disabled={!api || !connectedProviderCount} onClick={() => openAddModels()}>
               <Plus aria-hidden size={14} strokeWidth={1.9} /> Add models
             </Button>
           </div>
@@ -820,6 +927,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
         disabled={!api}
         pendingModels={pendingModels}
         onReload={() => void loadConnectedCatalogs({ refresh: true })}
+        initialQuery={addModelsQuery}
         onAdd={(selection) => void addCatalogModels(selection)}
         onClose={() => setAddModelsOpen(false)}
       />
@@ -845,6 +953,11 @@ function ConnectionsBar({
   onConfigure,
   onKey,
   onRemove,
+  onAddEndpoint,
+  onEditEndpoint,
+  onAddEndpointModels,
+  onAddNamedModel,
+  onRemoveEndpointModel,
 }: {
   directory: ProviderDirectoryEntry[];
   enabledProviders: Set<string>;
@@ -862,11 +975,23 @@ function ConnectionsBar({
   onConfigure: (entry: ProviderDirectoryEntry) => void;
   onKey: (entry: ProviderDirectoryEntry) => void;
   onRemove: (entry: ProviderDirectoryEntry) => void;
+  onAddEndpoint: () => void;
+  onEditEndpoint: (entry: ProviderDirectoryEntry) => void;
+  onAddEndpointModels: (entry: ProviderDirectoryEntry) => void;
+  onAddNamedModel: (entry: ProviderDirectoryEntry) => void;
+  onRemoveEndpointModel: (entry: ProviderDirectoryEntry, model: RouterModel) => void;
 }) {
   const barRef = useRef<HTMLElement | null>(null);
   const setConnectMenuOpen = onConnectMenuOpen;
-  const connected = directory.filter((entry) => providerConnected(entry, enabledProviders));
-  const available = directory.filter((entry) => !providerConnected(entry, enabledProviders));
+  // Every operator-added endpoint lives under the Custom container: one chip
+  // for the lot, with the endpoints listed inside it, instead of a chip each.
+  const container = directory.find((entry) => entry.setup?.kind === "per-model");
+  const endpoints = container ? directory.filter((entry) => entry.setup?.generic) : [];
+  const chips = directory.filter((entry) => !endpoints.includes(entry));
+  const isConnected = (entry: ProviderDirectoryEntry) => providerConnected(entry, enabledProviders) || (entry === container && endpoints.length > 0);
+  const connected = chips.filter(isConnected);
+  const available = chips.filter((entry) => !isConnected(entry));
+  const openEndpoint = endpoints.find((entry) => entry.id === openProviderId);
 
   useEffect(() => {
     if (!openProviderId && !connectMenuOpen) return;
@@ -892,7 +1017,7 @@ function ConnectionsBar({
     <section className="panel-section pm-connections" id="model-provider-directory" ref={barRef} aria-label="Provider connections">
       <div className="pm-connections-label">
         <strong>Connections</strong>
-        <small>{connected.length} of {directory.length} connected</small>
+        <small>{connected.length} of {chips.length} connected</small>
       </div>
       <div className="pm-connections-chips">
         {connected.map((entry) => (
@@ -902,26 +1027,37 @@ function ConnectionsBar({
               className="pm-chip"
               data-state="connected"
               aria-haspopup="dialog"
-              aria-expanded={openProviderId === entry.id}
+              aria-expanded={openProviderId === entry.id || (entry === container && Boolean(openEndpoint))}
               onClick={() => { setConnectMenuOpen(false); onOpenProvider(entry.id); }}
             >
               <ProviderLogo providerId={entry.id} displayName={entry.displayName} size="small" />
               <span>{entry.displayName}</span>
-              <i className="pm-chip-dot" data-enabled={isEnabled(entry)} aria-hidden />
+              <i className="pm-chip-dot" data-enabled={entry === container && endpoints.length ? endpoints.some(isEnabled) || (entry.models.length > 0 && isEnabled(entry)) : isEnabled(entry)} aria-hidden />
             </button>
-            {openProviderId === entry.id ? (
+            {[openProviderId === entry.id ? entry : entry === container ? openEndpoint : undefined].map((shown) => shown ? (
               <ProviderMenu
-                entry={entry}
-                usage={usageById.get(entry.id)}
+                key={shown.id}
+                entry={shown}
+                usage={usageById.get(shown.id)}
                 apiAvailable={apiAvailable}
                 platform={platform}
-                enabled={isEnabled(entry)}
-                onEnabledChange={(checked) => onEnabledChange(entry, checked)}
-                onSignIn={() => onSignIn(entry)}
-                onKey={() => onKey(entry)}
-                onRemove={() => onRemove(entry)}
+                enabled={isEnabled(shown)}
+                endpoints={shown === container ? endpoints : undefined}
+                isEndpointEnabled={isEnabled}
+                onOpenEndpoint={onOpenProvider}
+                onBack={shown === openEndpoint ? () => onOpenProvider(entry.id) : undefined}
+                backLabel={entry.displayName}
+                onEnabledChange={(checked) => onEnabledChange(shown, checked)}
+                onSignIn={() => onSignIn(shown)}
+                onKey={() => onKey(shown)}
+                onRemove={() => onRemove(shown)}
+                onAddEndpoint={onAddEndpoint}
+                onEditEndpoint={() => onEditEndpoint(shown)}
+                onAddModels={() => onAddEndpointModels(shown)}
+                onAddNamedModel={() => onAddNamedModel(shown)}
+                onRemoveModel={(model) => onRemoveEndpointModel(shown, model)}
               />
-            ) : null}
+            ) : null)}
           </div>
         ))}
         {available.length ? (
@@ -950,6 +1086,7 @@ function ConnectionsBar({
                       if (entry.setup.kind === "oauth" || entry.setup.signIn) onSignIn(entry);
                       else if (entry.setup.kind === "configuration") onConfigure(entry);
                       else if (entry.setup.kind === "anonymous") onEnabledChange(entry, true);
+                      else if (entry.setup.kind === "per-model") onAddEndpoint();
                       else onKey(entry);
                     }}
                   >
@@ -973,12 +1110,27 @@ function ProviderMenu({
   apiAvailable,
   platform,
   enabled,
+  endpoints,
+  isEndpointEnabled,
+  onOpenEndpoint,
+  onBack,
+  backLabel,
   onEnabledChange,
   onSignIn,
   onKey,
   onRemove,
+  onAddEndpoint,
+  onEditEndpoint,
+  onAddModels,
+  onAddNamedModel,
+  onRemoveModel,
 }: {
   entry: ProviderDirectoryEntry;
+  endpoints?: ProviderDirectoryEntry[];
+  isEndpointEnabled: (entry: ProviderDirectoryEntry) => boolean;
+  onOpenEndpoint: (providerId: string) => void;
+  onBack?: () => void;
+  backLabel?: string;
   usage?: NonNullable<ProviderUsageSnapshot["providers"]>[number];
   apiAvailable: boolean;
   platform?: string;
@@ -987,33 +1139,116 @@ function ProviderMenu({
   onSignIn: () => void;
   onKey: () => void;
   onRemove: () => void;
+  onAddEndpoint: () => void;
+  onEditEndpoint: () => void;
+  onAddModels: () => void;
+  onAddNamedModel: () => void;
+  onRemoveModel: (model: RouterModel) => void;
 }) {
   const setup = entry.setup;
+  // The Custom container is a launcher, not an account: until it holds models
+  // of its own there is nothing to switch off and no traffic to report.
+  const launcher = setup?.kind === "per-model";
+  const emptyLauncher = launcher && entry.models.length === 0;
   return (
     <div className="pm-connection-menu" role="dialog" aria-label={`${entry.displayName} connection`}>
+      {onBack ? (
+        <button type="button" className="pm-connection-menu-back" onClick={onBack}>
+          <ChevronLeft aria-hidden size={12} strokeWidth={1.8} /> {backLabel}
+        </button>
+      ) : null}
       <div className="pm-connection-menu-head">
         <ProviderLogo providerId={entry.id} displayName={entry.displayName} size="large" />
         <div>
           <strong>{entry.displayName}</strong>
-          <small>{connectionMethod(entry)}</small>
+          <small>{launcher ? launcherSummary(entry, endpoints?.length ?? 0) : connectionMethod(entry)}</small>
         </div>
       </div>
       <p className="pm-connection-menu-copy">
-        {setup?.planNote || connectionDetail(entry, usage?.account?.status, usage?.account?.message, platform === "darwin")}
+        {setup?.generic
+          ? `${setup.baseUrl} · ${setup.adapter === "openai-responses" ? "Responses API" : "Chat Completions"}${setup.hasKey ? "" : " · no API key"}`
+          : setup?.kind === "per-model"
+            ? "Add any OpenAI-compatible endpoint with its base URL and API key, then choose which of its models appear in the picker."
+            : setup?.planNote || connectionDetail(entry, usage?.account?.status, usage?.account?.message, platform === "darwin")}
       </p>
-      {usage?.requests ? <small className="pm-connection-menu-usage">{usage.requests} {usage.requests === 1 ? "request" : "requests"} so far</small> : null}
+      {usage?.requests && !emptyLauncher ? <small className="pm-connection-menu-usage">{usage.requests} {usage.requests === 1 ? "request" : "requests"} so far</small> : null}
       {setup ? (
         <>
-          <label className="pm-connection-menu-enable">
-            <span>Available to installed clients</span>
-            <Toggle
-              checked={enabled}
-              disabled={!apiAvailable || !setup.configured}
-              label={`Make ${entry.displayName} available to installed clients`}
-              onChange={onEnabledChange}
-            />
-          </label>
-          <div className="pm-connection-menu-actions">
+          {emptyLauncher ? null : (
+            <label className="pm-connection-menu-enable">
+              <span>Available to installed clients</span>
+              <Toggle
+                checked={enabled}
+                disabled={!apiAvailable || !setup.configured}
+                label={`Make ${entry.displayName} available to installed clients`}
+                onChange={onEnabledChange}
+              />
+            </label>
+          )}
+          {setup.generic ? (
+            <div className="pm-endpoint-models" aria-label={`${entry.displayName} models`}>
+              <div className="pm-endpoint-models-head">
+                <strong>Models</strong>
+                <span className="pm-endpoint-models-buttons">
+                  <Button variant="ghost" disabled={!apiAvailable || !setup.configured || setup.enabled === false} onClick={onAddModels}>
+                    <Plus aria-hidden size={13} strokeWidth={1.8} /> Add models
+                  </Button>
+                  <Button variant="ghost" disabled={!apiAvailable || setup.enabled === false} onClick={onAddNamedModel}>
+                    <Pencil aria-hidden size={13} strokeWidth={1.8} /> By name
+                  </Button>
+                </span>
+              </div>
+              {entry.models.length ? (
+                <ul>
+                  {entry.models.map((model) => (
+                    <li key={model.slug}>
+                      <div>
+                        <span>{model.displayName}</span>
+                        <small>{model.slug}</small>
+                      </div>
+                      <button
+                        type="button"
+                        className="pm-endpoint-model-remove"
+                        disabled={!apiAvailable}
+                        aria-label={`Remove ${model.displayName}`}
+                        title="Remove this model"
+                        onClick={() => onRemoveModel(model)}
+                      >
+                        <Trash2 aria-hidden size={13} strokeWidth={1.7} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <small>No models added yet.</small>
+              )}
+            </div>
+          ) : null}
+          {launcher && endpoints?.length ? (
+            <div className="pm-endpoint-models pm-endpoint-list" aria-label="Custom endpoints">
+              <div className="pm-endpoint-models-head"><strong>Endpoints</strong></div>
+              <ul>
+                {endpoints.map((endpoint) => (
+                  <li key={endpoint.id}>
+                    <button type="button" onClick={() => onOpenEndpoint(endpoint.id)}>
+                      <i className="pm-chip-dot" data-enabled={isEndpointEnabled(endpoint)} aria-hidden />
+                      <div>
+                        <span>{endpoint.displayName}</span>
+                        <small>{endpoint.setup?.baseUrl} · {endpoint.models.length} {endpoint.models.length === 1 ? "model" : "models"}</small>
+                      </div>
+                      <ChevronRight aria-hidden size={12} strokeWidth={1.8} />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          <div className="pm-connection-menu-actions" data-solo={launcher}>
+            {setup.generic ? (
+              <Button variant="ghost" disabled={!apiAvailable} onClick={onEditEndpoint}>
+                <Pencil aria-hidden size={14} strokeWidth={1.7} /> Edit endpoint
+              </Button>
+            ) : null}
             {setup.kind === "oauth" || setup.signIn ? (
               <Button
                 variant="ghost"
@@ -1025,6 +1260,11 @@ function ProviderMenu({
                 {setup.action === "probe" ? "Run live test" : setup.configured ? "Sign in again" : "Open sign-in"}
               </Button>
             ) : null}
+            {setup.kind === "per-model" ? (
+              <Button variant="secondary" disabled={!apiAvailable} onClick={onAddEndpoint}>
+                <Plus aria-hidden size={14} strokeWidth={1.7} /> Add endpoint
+              </Button>
+            ) : null}
             {setup.kind === "api" && entry.id !== "local" ? (
               <Button variant="ghost" disabled={!apiAvailable} onClick={onKey}>
                 <KeyRound aria-hidden size={14} strokeWidth={1.7} /> {setup.configured ? "Replace key" : "Add key"}
@@ -1032,7 +1272,7 @@ function ProviderMenu({
             ) : null}
             {((setup.kind === "api" && setup.configured) || setup.disconnectable) && entry.id !== "local" ? (
               <Button variant="ghost" disabled={!apiAvailable} onClick={onRemove}>
-                <Trash2 aria-hidden size={14} strokeWidth={1.7} /> Disconnect
+                <Trash2 aria-hidden size={14} strokeWidth={1.7} /> {setup.generic ? "Remove endpoint" : "Disconnect"}
               </Button>
             ) : null}
           </div>
@@ -1518,8 +1758,10 @@ function AddModelsDialog({
   onReload,
   onAdd,
   onClose,
+  initialQuery = "",
 }: {
   open: boolean;
+  initialQuery?: string;
   directory: ProviderDirectoryEntry[];
   catalogStates: Record<string, CatalogViewState>;
   loading: boolean;
@@ -1534,7 +1776,7 @@ function AddModelsDialog({
   const [shownLimit, setShownLimit] = useState(120);
 
   useEffect(() => {
-    if (open) return;
+    if (open) { setQuery(initialQuery); return; }
     setQuery("");
     setSelected([]);
     setShownLimit(120);
@@ -1697,6 +1939,97 @@ function CredentialDialog({ provider, onSave, onClose }: { provider: ProviderSet
   );
 }
 
+function NamedModelDialog({ provider, onSave, onClose }: { provider: ProviderSetup | null; onSave: (provider: ProviderSetup, modelId: string) => Promise<void>; onClose: () => void }) {
+  const [modelId, setModelId] = useState("");
+  const trimmed = modelId.trim();
+  function close() { setModelId(""); onClose(); }
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!provider || !trimmed) return;
+    const target = provider;
+    setModelId("");
+    onClose();
+    await onSave(target, trimmed);
+  }
+  return (
+    <Dialog
+      open={Boolean(provider)}
+      title="Add a model by name"
+      description="For a model the endpoint does not list, such as a private or preview one. Type the id exactly as the provider gave it to you; nothing checks it against their catalog."
+      onClose={close}
+    >
+      <form className="pm-credential-form" onSubmit={(event) => void submit(event)}>
+        <label htmlFor="named-model-id">Model id</label>
+        <input id="named-model-id" value={modelId} onChange={(event) => setModelId(event.target.value)} autoComplete="off" spellCheck={false} placeholder="provider-model-id" autoFocus />
+        <p><Link2 aria-hidden size={13} strokeWidth={1.7} /> It joins the picker as {provider ? `${provider.id}/` : ""}{trimmed || "<model id>"}. A wrong id fails on its first request, and you can remove it here.</p>
+        <div className="dialog-actions"><Button type="button" variant="secondary" onClick={close}>Cancel</Button><Button type="submit" variant="primary" disabled={!trimmed}>Add model</Button></div>
+      </form>
+    </Dialog>
+  );
+}
+
+type CustomEndpointInput = { displayName: string; baseUrl: string; adapter: "openai-chat" | "openai-responses"; credential?: string };
+
+function CustomEndpointDialog({ open, editing, onSave, onClose }: { open: boolean; editing: ProviderSetup | null; onSave: (endpoint: CustomEndpointInput, editing: ProviderSetup | null) => Promise<void>; onClose: () => void }) {
+  const [displayName, setDisplayName] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [adapter, setAdapter] = useState<CustomEndpointInput["adapter"]>("openai-chat");
+  const [credential, setCredential] = useState("");
+  useEffect(() => {
+    if (!open || !editing) return;
+    setDisplayName(editing.displayName);
+    setBaseUrl(editing.baseUrl || "");
+    setAdapter(editing.adapter === "openai-responses" ? "openai-responses" : "openai-chat");
+    setCredential("");
+  }, [editing, open]);
+  const urlValid = (() => {
+    try { return ["http:", "https:"].includes(new URL(baseUrl.trim()).protocol); } catch { return false; }
+  })();
+  const ready = Boolean(displayName.trim()) && urlValid;
+  function reset() { setDisplayName(""); setBaseUrl(""); setAdapter("openai-chat"); setCredential(""); }
+  function close() { reset(); onClose(); }
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!ready) return;
+    const endpoint: CustomEndpointInput = {
+      displayName: displayName.trim(),
+      baseUrl: baseUrl.trim(),
+      adapter,
+      ...(credential.trim() ? { credential } : {}),
+    };
+    const target = editing;
+    reset();
+    onClose();
+    await onSave(endpoint, target);
+  }
+  return (
+    <Dialog
+      open={open}
+      title={editing ? `Edit ${editing.displayName}` : "Add custom endpoint"}
+      description={editing
+        ? `Model names keep their ${editing.id}/ prefix, so models you already added stay where they are.`
+        : "Any OpenAI-compatible API. After saving, choose which of its models appear in the picker; each is named after this endpoint so it never clashes with another provider's."}
+      onClose={close}
+    >
+      <form className="pm-credential-form" onSubmit={(event) => void submit(event)}>
+        <label htmlFor="custom-endpoint-name">Name</label>
+        <input id="custom-endpoint-name" value={displayName} onChange={(event) => setDisplayName(event.target.value)} autoComplete="off" spellCheck={false} placeholder="My provider" maxLength={120} autoFocus />
+        <label htmlFor="custom-endpoint-url">Base URL</label>
+        <input id="custom-endpoint-url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} autoComplete="off" spellCheck={false} placeholder="https://api.example.com/v1" />
+        <label htmlFor="custom-endpoint-adapter">API format</label>
+        <select id="custom-endpoint-adapter" value={adapter} onChange={(event) => setAdapter(event.target.value as CustomEndpointInput["adapter"])}>
+          <option value="openai-chat">Chat Completions (/chat/completions)</option>
+          <option value="openai-responses">Responses (/responses)</option>
+        </select>
+        <label htmlFor="custom-endpoint-key">API key</label>
+        <input id="custom-endpoint-key" type="password" value={credential} onChange={(event) => setCredential(event.target.value)} autoComplete="off" spellCheck={false} placeholder={editing ? (editing.hasKey ? "Leave empty to keep the current key" : "Leave empty to stay keyless") : "Leave empty for a keyless local server"} />
+        <p><Link2 aria-hidden size={13} strokeWidth={1.7} /> The key is sent once to the router over standard input and stored in its protected local credential file. It is never placed in logs or command arguments.</p>
+        <div className="dialog-actions"><Button type="button" variant="secondary" onClick={close}>Cancel</Button><Button type="submit" variant="primary" disabled={!ready}>{editing ? "Save changes" : "Save and choose models"}</Button></div>
+      </form>
+    </Dialog>
+  );
+}
+
 function providerConnected(entry: ProviderDirectoryEntry, enabledProviders: Set<string>): boolean {
   // An anonymous endpoint has no stored account or credential that can make it
   // connected on its own. Treating `configured: true` as a connection here
@@ -1704,12 +2037,24 @@ function providerConnected(entry: ProviderDirectoryEntry, enabledProviders: Set<
   // the bulk "connected" request. Its explicit provider selection is the
   // connection boundary instead.
   if (entry.setup?.kind === "anonymous") return enabledProviders.has(entry.id);
+  // The Custom container is always "configured" because it needs no key. It is
+  // only a connection once it holds models; empty, it belongs in the connect
+  // menu as the way to add an endpoint.
+  if (entry.setup?.kind === "per-model") return entry.models.length > 0;
   if (entry.setup) return entry.setup.configured || entry.setup.signedIn === true;
   return entry.models.some((model) => model.native) || enabledProviders.has(entry.id);
 }
 
 function providerDisplayName(providerId: string): string {
   return providerId === "openai" ? "OpenAI native" : providerId;
+}
+
+function launcherSummary(entry: ProviderDirectoryEntry, endpointCount: number): string {
+  const parts = [
+    endpointCount ? `${endpointCount} ${endpointCount === 1 ? "endpoint" : "endpoints"}` : "",
+    entry.models.length ? `${entry.models.length} ${entry.models.length === 1 ? "model" : "models"}` : "",
+  ].filter(Boolean);
+  return parts.join(" · ") || "Bring your own endpoint";
 }
 
 function connectionMethod(entry: ProviderDirectoryEntry): string {
@@ -1721,6 +2066,8 @@ function connectionMethod(entry: ProviderDirectoryEntry): string {
   if (entry.setup.kind === "oauth") return "Sign-in";
   if (entry.setup.kind === "configuration") return "Local configuration";
   if (entry.setup.kind === "anonymous") return "No key needed";
+  if (entry.setup.generic) return "Custom endpoint";
+  if (entry.setup.kind === "per-model") return "Add an endpoint";
   if (entry.setup.signIn) return "Key or sign-in";
   return entry.setup.credentialLabel || "API key";
 }
