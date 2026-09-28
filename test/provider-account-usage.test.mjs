@@ -15,6 +15,7 @@ import {
   openRouterCreditsMetrics,
   openRouterKeyMetrics,
   providerAccountUsageSnapshot,
+  stepFunBalanceMetrics,
   veniceBalanceMetrics,
 } from "../src/provider-account-usage.mjs";
 
@@ -379,6 +380,88 @@ test("normalizes Moonshot Kimi API account balance", () => {
     detail: "Cash 10.00 · Voucher 2.50",
     available: true,
   }]);
+});
+
+test("normalizes a StepFun account balance and names the account type", () => {
+  assert.deepEqual(stepFunBalanceMetrics({
+    object: "account",
+    type: "prepaid",
+    balance: 42.5,
+    total_cash_balance: 40,
+    total_voucher_balance: 2.5,
+  }), [{
+    kind: "balance",
+    label: "API balance",
+    value: 42.5,
+    currency: "USD",
+    detail: "Prepaid · Cash 40.00 · Voucher 2.50",
+    available: true,
+  }]);
+  // A postpaid account still reports what is left, and a response with no
+  // balance at all yields no metric rather than a zero the tray would render
+  // as an exhausted account.
+  assert.equal(stepFunBalanceMetrics({ type: "postpaid", balance: 0 })[0].detail, "Postpaid");
+  assert.deepEqual(stepFunBalanceMetrics({ object: "account" }), []);
+});
+
+test("StepFun usage reads each platform's own account endpoint", async () => {
+  const savedGlobal = process.env.STEPFUN_API_KEY;
+  const savedChina = process.env.STEPFUN_API_CN_KEY;
+  process.env.STEPFUN_API_KEY = "TEST_STEPFUN_USAGE_KEY";
+  process.env.STEPFUN_API_CN_KEY = "TEST_STEPFUN_CN_USAGE_KEY";
+  try {
+    const seen = [];
+    const snapshot = await providerAccountUsageSnapshot({
+      providerIds: ["stepfun-api", "stepfun-api-cn"],
+      fetchImpl: async (url, options) => {
+        seen.push([url, options.headers.Authorization]);
+        return new Response(JSON.stringify({
+          object: "account",
+          type: "prepaid",
+          balance: 7.25,
+          total_cash_balance: 7.25,
+          total_voucher_balance: 0,
+        }));
+      },
+    });
+    assert.deepEqual(seen, [
+      ["https://api.stepfun.ai/v1/accounts", "Bearer TEST_STEPFUN_USAGE_KEY"],
+      ["https://api.stepfun.com/v1/accounts", "Bearer TEST_STEPFUN_CN_USAGE_KEY"],
+    ]);
+    assert.equal(snapshot["stepfun-api"].status, "available");
+    assert.equal(snapshot["stepfun-api"].metrics[0].currency, "USD");
+    // The mainland console bills in CNY, so the same payload is a different
+    // amount of money and must never be labeled as dollars.
+    assert.equal(snapshot["stepfun-api-cn"].metrics[0].currency, "CNY");
+    assert.doesNotMatch(JSON.stringify(snapshot), /TEST_STEPFUN/);
+  } finally {
+    if (savedGlobal === undefined) delete process.env.STEPFUN_API_KEY;
+    else process.env.STEPFUN_API_KEY = savedGlobal;
+    if (savedChina === undefined) delete process.env.STEPFUN_API_CN_KEY;
+    else process.env.STEPFUN_API_CN_KEY = savedChina;
+  }
+});
+
+test("StepFun usage never sends the account request to a custom endpoint", async () => {
+  const savedKey = process.env.STEPFUN_API_KEY;
+  const savedBase = process.env.STEPFUN_API_BASE_URL;
+  process.env.STEPFUN_API_KEY = "TEST_STEPFUN_CUSTOM_KEY";
+  process.env.STEPFUN_API_BASE_URL = "https://example.test/v1";
+  try {
+    const snapshot = await providerAccountUsageSnapshot({
+      providerIds: ["stepfun-api"],
+      fetchImpl: async () => {
+        throw new Error("the account endpoint must not be called for a custom base URL");
+      },
+    });
+    assert.notEqual(snapshot["stepfun-api"].status, "available");
+    assert.match(snapshot["stepfun-api"].message, /custom StepFun endpoint/);
+  } finally {
+    if (savedKey === undefined) delete process.env.STEPFUN_API_KEY;
+    else process.env.STEPFUN_API_KEY = savedKey;
+    if (savedBase === undefined) delete process.env.STEPFUN_API_BASE_URL;
+    else process.env.STEPFUN_API_BASE_URL = savedBase;
+  }
 });
 
 test("does not poll account endpoints for disabled providers", async () => {

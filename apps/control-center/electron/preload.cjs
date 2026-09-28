@@ -4,6 +4,7 @@ const call = (name, input) => ipcRenderer.invoke(`router-control:${name}`, input
 
 const routerControl = Object.freeze({
   platform: process.platform,
+  setInterfaceLanguage: (language) => ipcRenderer.send("router-control:interface-language", language),
   minimizeWindow: () => call("minimizeWindow"),
   toggleMaximizeWindow: () => call("toggleMaximizeWindow"),
   closeWindow: () => call("closeWindow"),
@@ -33,6 +34,7 @@ const routerControl = Object.freeze({
   addCustomEndpoint: (endpoint) => call("addCustomEndpoint", endpoint),
   editCustomEndpoint: (providerId, endpoint) => call("editCustomEndpoint", { ...endpoint, providerId }),
   removeCustomEndpointModels: (providerId, slugs) => call("removeCustomEndpointModels", { providerId, slugs }),
+  removeLocalModels: (slugs) => call("removeLocalModels", { slugs }),
   addCustomEndpointModel: (providerId, modelId) => call("addCustomEndpointModel", { providerId, modelId }),
   removeProviderCredential: (providerId) => call("removeProviderCredential", { providerId }),
   setSubagentMode: (mode) => call("setSubagentMode", { mode }),

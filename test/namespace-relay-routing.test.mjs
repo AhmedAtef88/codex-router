@@ -1656,6 +1656,71 @@ test("bounded routes preserve one alias for pre-flattened MCP definitions and hi
   }
 });
 
+test("OpenRouter Muse preserves bounded aliases through MCP history and streamed or JSON responses", async () => {
+  const namespace = "mcp__neon__apm__production__snapshot__read_only";
+  const name = "get_monitor_snapshot_with_complete_context";
+  const wireName = `${namespace}__${name}`;
+  for (const stream of [true, false]) {
+    const result = await scenario(stream, {
+      model: "openrouter/muse-spark-1.3-contributor",
+      requestPayload: preflattenedBoundedMcpPayload,
+      sseBody: (outgoing) => {
+        const providerName = outgoing.tools.find(
+          (tool) => tool.description === "Long preflattened MCP fixture.",
+        ).name;
+        return [
+          sseEvent({
+            type: "response.output_item.done",
+            item: {
+              type: "function_call",
+              name: providerName,
+              call_id: "call_snapshot",
+              arguments: "{}",
+            },
+          }),
+          sseEvent({ type: "response.completed" }),
+          "data: [DONE]\n\n",
+        ].join("");
+      },
+      jsonBody: (outgoing) => {
+        const providerName = outgoing.tools.find(
+          (tool) => tool.description === "Long preflattened MCP fixture.",
+        ).name;
+        return {
+          id: "resp_preflattened_bounded",
+          output: [{
+            type: "function_call",
+            name: providerName,
+            call_id: "call_snapshot",
+            arguments: "{}",
+          }],
+        };
+      },
+    });
+    assert.equal(result.gatewayBodies.length, 1);
+    const outgoing = result.gatewayBodies[0];
+    assert.equal(outgoing.client_metadata, undefined);
+    const providerTool = outgoing.tools.find(
+      (tool) => tool.description === "Long preflattened MCP fixture.",
+    );
+    assert.notEqual(providerTool.name, wireName);
+    assert.ok(providerTool.name.length <= 64);
+    const historyCall = outgoing.input.find(
+      (item) => item.call_id === "call_previous_snapshot",
+    );
+    assert.equal(historyCall.name, providerTool.name);
+    assert.equal(historyCall.namespace, undefined);
+
+    const call = stream
+      ? functionCallsFromSse(result.clientBody).get("call_snapshot")
+      : JSON.parse(result.clientBody).output[0];
+    assert.deepEqual(
+      { namespace: call.namespace, name: call.name },
+      { namespace, name },
+    );
+  }
+});
+
 test("non-streaming routed responses restore namespace calls before client dispatch", async () => {
   const result = await scenario(false, {
     requestPayload: (stream, model) => {
@@ -2227,7 +2292,7 @@ test("OpenCode Go Messages keeps the Console Go function-tool contract", async (
     ].join("");
   for (const stream of [true, false]) {
     const result = await scenario(stream, {
-      model: "opencode-go-messages/union-alpha",
+      model: "opencode-go-messages/minimax-m3",
       requestPayload: goCompatibilityRequestPayload,
       sseBody: completedSse,
       jsonBody: () => ({ id: "resp-messages", status: "completed", output: completedOutput }),
@@ -2358,6 +2423,107 @@ test("OpenCode Go converts Codex handoffs before Muse Responses", async () => {
   assert.equal(outgoing.input[1].type, "message");
   assert.equal(outgoing.input[1].role, "user");
   assert.equal(outgoing.input[1].content[0].text, "Message Type: NEW_TASK\nPayload:\nInspect the backend.");
+});
+
+// Issue #792 added the cycle-closing repair for the direct Meta Muse Spark 1.3
+// Contributor route, but it ran only in the api-forwarder, which understands
+// top-level `type: "function"` tools. A Responses-native endpoint keeps Codex's
+// `type: "namespace"` entries, so the app and MCP toolset -- where the
+// recursive `$defs` actually lives -- reached Meta unchanged and a tool-bearing
+// turn still came back as HTTP 400 `Recursive JSON schemas are not currently
+// supported`. The route's own `toolSchemaRecursion` flag now opts it into the
+// router-side repair too; the sibling Meta route without that measured proof
+// keeps its payload byte-identical, which is the control below.
+test("direct Meta Muse Spark 1.3 Contributor breaks recursive refs inside namespace tools", async () => {
+  const recursiveNamespaceChild = () => ({
+    type: "function",
+    name: "automation_update",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { $ref: "#/$defs/__schema0" },
+        branch: { type: "string" },
+      },
+      $defs: {
+        __schema0: {
+          anyOf: [
+            { type: "string" },
+            { type: "array", items: { $ref: "#/$defs/__schema0" } },
+            {
+              type: "object",
+              additionalProperties: { $ref: "#/$defs/__schema0" },
+            },
+          ],
+        },
+      },
+    },
+  });
+  const requestPayload = (stream, model) => ({
+    model,
+    stream,
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "hi" }],
+      },
+    ],
+    tools: [
+      { type: "namespace", name: "codex_app", tools: [recursiveNamespaceChild()] },
+      {
+        type: "function",
+        name: "inspect",
+        parameters: {
+          type: "object",
+          properties: { child: { $ref: "#/$defs/Row" } },
+          $defs: {
+            Row: {
+              type: "object",
+              properties: { child: { $ref: "#/$defs/Row" } },
+            },
+          },
+        },
+      },
+    ],
+  });
+  const namespaceChildOf = (body) =>
+    body.tools
+      .find((tool) => tool.type === "namespace")
+      .tools.find((tool) => tool.name === "automation_update");
+
+  const verified = await scenario(true, {
+    model: "meta/muse-spark-1.3-contributor",
+    requestPayload,
+  });
+  const outgoing = verified.gatewayBodies[0];
+  const repairedChild = namespaceChildOf(outgoing);
+  // Definitions and acyclic references survive; only the edge that closes the
+  // cycle is blanked.
+  assert.equal(repairedChild.inputSchema.properties.id.$ref, "#/$defs/__schema0");
+  assert.deepEqual(
+    repairedChild.inputSchema.$defs.__schema0.anyOf[1].items,
+    {},
+  );
+  assert.deepEqual(
+    repairedChild.inputSchema.$defs.__schema0.anyOf[2].additionalProperties,
+    {},
+  );
+  const repairedFlatTool = outgoing.tools.find((tool) => tool.name === "inspect");
+  assert.deepEqual(repairedFlatTool.parameters.$defs.Row.properties.child, {});
+
+  const control = await scenario(true, {
+    model: "meta/muse-spark-1.3",
+    requestPayload,
+  });
+  const controlChild = namespaceChildOf(control.gatewayBodies[0]);
+  assert.deepEqual(controlChild.inputSchema.$defs.__schema0.anyOf[1].items, {
+    $ref: "#/$defs/__schema0",
+  });
+  assert.deepEqual(
+    control.gatewayBodies[0].tools.find((tool) => tool.name === "inspect")
+      .parameters.$defs.Row.properties.child,
+    { $ref: "#/$defs/Row" },
+  );
 });
 
 test("OpenCode Go compaction removes native tool history before the strict endpoint", async () => {

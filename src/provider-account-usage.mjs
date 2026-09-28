@@ -108,6 +108,32 @@ export function kimiApiBalanceMetrics(payload, currency = "USD") {
   }];
 }
 
+// StepFun's GET /v1/accounts answers a prepaid or postpaid account with the
+// usable `balance` plus its cash/voucher split. A postpaid account's balance is
+// what is left of the billing arrangement rather than a wallet, so the account
+// type rides in the detail line instead of being flattened away.
+export function stepFunBalanceMetrics(payload, currency = "USD") {
+  const value = numberValue(payload?.balance);
+  if (!Number.isFinite(value)) return [];
+  const cash = numberValue(payload.total_cash_balance);
+  const voucher = numberValue(payload.total_voucher_balance);
+  const type = typeof payload.type === "string" && payload.type.trim()
+    ? payload.type.trim()
+    : undefined;
+  return [{
+    kind: "balance",
+    label: "API balance",
+    value,
+    currency,
+    detail: [
+      type === "prepaid" ? "Prepaid" : type === "postpaid" ? "Postpaid" : undefined,
+      Number.isFinite(cash) ? `Cash ${cash.toFixed(2)}` : undefined,
+      Number.isFinite(voucher) ? `Voucher ${voucher.toFixed(2)}` : undefined,
+    ].filter(Boolean).join(" · "),
+    available: true,
+  }];
+}
+
 export function chutesBalanceMetrics(payload) {
   const account = payload?.data && typeof payload.data === "object" ? payload.data : payload;
   const value = numberValue(account?.balance);
@@ -553,6 +579,27 @@ async function kimiApiAccount(fetchImpl, providerId = "kimi-api") {
   return { status: "available", source: "official-api", metrics };
 }
 
+// Both StepFun platforms publish the same account endpoint on their own host.
+// The China console bills in CNY, the global one in USD, and a custom base URL
+// is never queried: an operator-pointed endpoint is not StepFun's billing API.
+async function stepFunAccount(fetchImpl, providerId) {
+  const provider = PROVIDERS.get(providerId);
+  const credential = resolveProviderCredential(provider);
+  if (!credential) return { status: "not-configured", source: "official-api", metrics: [] };
+  const baseURL = (process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
+  const host = new URL(baseURL).hostname;
+  if (!new Set(["api.stepfun.ai", "api.stepfun.com"]).has(host)) {
+    return withHeaderQuota(
+      providerId,
+      localOnly("Account balance is unavailable for a custom StepFun endpoint"),
+    );
+  }
+  const payload = await requestJson(`${baseURL}/accounts`, credential.value, {}, fetchImpl);
+  const metrics = stepFunBalanceMetrics(payload, host === "api.stepfun.com" ? "CNY" : "USD");
+  if (!metrics.length) throw new Error("StepFun account response did not include a balance");
+  return { status: "available", source: "official-api", metrics };
+}
+
 async function chutesAccount(fetchImpl) {
   const provider = PROVIDERS.get("chutes");
   const credential = resolveProviderCredential(provider);
@@ -962,6 +1009,9 @@ async function accountUsageFor(providerId, fetchImpl) {
     if (providerId === "deepseek") return await deepSeekAccount(fetchImpl);
     if (providerId === "kimi-api" || providerId === "kimi-api-cn") {
       return await kimiApiAccount(fetchImpl, providerId);
+    }
+    if (providerId === "stepfun-api" || providerId === "stepfun-api-cn") {
+      return await stepFunAccount(fetchImpl, providerId);
     }
     if (providerId === "kimi-oauth") return await kimiOAuthAccount(fetchImpl);
     if (providerId === "grok-oauth") return await grokOAuthAccount(fetchImpl);

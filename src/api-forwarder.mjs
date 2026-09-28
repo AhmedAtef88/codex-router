@@ -1,8 +1,16 @@
+import { normalizeAzureOpenAIResponsesRequest } from "./azure-openai-compat.mjs";
 import http from "node:http";
 import {
   requiresReasoningContentOnToolCalls,
   usesNativeChatReasoning,
 } from "./chat-reasoning.mjs";
+import {
+  createReasoningReplayJsonTap,
+  createReasoningReplayTap,
+  reasoningForToolCalls,
+  toolCallIdsOf,
+} from "./chat-reasoning-replay.mjs";
+import { EFFORT_LADDER, declaredEffort } from "./effort-ladder.mjs";
 import {
   deepSeekResponsesEffort,
   deepSeekResponsesInput,
@@ -70,10 +78,7 @@ import {
 } from "./openai-adapters.mjs";
 import { threadIdFromHeaders } from "./codex-session-names.mjs";
 import { applyOpenCodeSessionHeaders, isOpenCodeProvider } from "./opencode-session.mjs";
-import {
-  clampOpenCodeMessageContent,
-  clampUnionAlphaCompletion,
-} from "./union-alpha-compat.mjs";
+import { clampOpenCodeMessageContent } from "./opencode-message-compat.mjs";
 import {
   effectiveProviderCredentialStatus,
   providerApiKeyAuthoritySnapshot,
@@ -199,19 +204,8 @@ function hy4Effort(value, levels) {
 // request under the model's floor lands on that floor. An absent or unknown
 // value is treated as "high", which is what the two-tier map sent before this
 // generalization.
-const EFFORT_LADDER = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
-
-function declaredEffort(value, levels) {
-  const declared = levels
-    .filter((effort) => EFFORT_LADDER.includes(effort))
-    .sort((left, right) => EFFORT_LADDER.indexOf(left) - EFFORT_LADDER.indexOf(right));
-  if (!declared.length) return undefined;
-  if (["xhigh", "max", "ultra"].includes(value)) return declared.at(-1);
-  const requested = EFFORT_LADDER.indexOf(value);
-  const ceiling = requested === -1 ? EFFORT_LADDER.indexOf("high") : requested;
-  const atOrBelow = declared.filter((effort) => EFFORT_LADDER.indexOf(effort) <= ceiling);
-  return atOrBelow.at(-1) || declared[0];
-}
+// The effort clamp lives in `effort-ladder.mjs`: this module starts a server at
+// import time, so a pure helper has to live somewhere a unit test can reach it.
 
 // DashScope's OpenAI-compatible surfaces take the flat `reasoning_effort` on
 // /chat/completions and the nested `reasoning.effort` on /responses, and the
@@ -388,12 +382,24 @@ function ensureToolCallReasoningContent(messages) {
     if (
       message?.role !== "assistant" ||
       !Array.isArray(message.tool_calls) ||
-      message.tool_calls.length === 0 ||
-      typeof message.reasoning_content === "string"
+      message.tool_calls.length === 0
     ) {
       return message;
     }
-    return { ...message, reasoning_content: "" };
+    // Real reasoning already present: never rewrite it, so upstream prefixes
+    // (and their cache hits) stay byte-identical.
+    if (typeof message.reasoning_content === "string" && message.reasoning_content) {
+      return message;
+    }
+    // The contract needs the model's own reasoning, not merely the field:
+    // replay the text remembered from the turn that produced these calls, which
+    // history preserves by call id even across compaction.
+    const remembered = reasoningForToolCalls(toolCallIdsOf(message));
+    if (remembered) return { ...message, reasoning_content: remembered };
+    // Nothing remembered: keep the field present, exactly as before.
+    return typeof message.reasoning_content === "string"
+      ? message
+      : { ...message, reasoning_content: "" };
   });
 }
 
@@ -557,6 +563,45 @@ function flattenRecursiveToolSchemas(payload, protocol, options) {
   // shape, and an unattended service is exactly where that must not be silent.
   console.error(
     "[api-forwarder] broke recursive $ref cycles in tool schema(s) for this request",
+  );
+}
+
+// Meta validates a replayed function call's `arguments` as JSON and answers the
+// whole request with HTTP 400 "`arguments` must be valid JSON" before
+// inference, so the turn is lost -- and, because the call stays in the
+// transcript, so is every later turn in that thread.
+//
+// Measured on a Muse Spark 1.3 Contributor thread that called an MCP tool
+// without arguments: the model emitted the call with `arguments: ""`, Codex
+// recorded the call and the server's "pattern is required" output, and the next
+// request died on replay. The call already ran, so its argument text is
+// transcript filler: an absent, empty, or whitespace-only string becomes `{}`,
+// which is what the model meant and what the endpoint accepts. Anything else is
+// left alone -- an unparseable non-empty string is a different failure and must
+// not be silently rewritten.
+const STRICT_FUNCTION_CALL_ARGUMENT_PROVIDER_IDS = new Set(["meta"]);
+
+function repairEmptyFunctionCallArguments(payload) {
+  if (!Array.isArray(payload.input)) return;
+  let repaired = 0;
+  const input = payload.input.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+    if (item.type !== "function_call") return item;
+    const raw = item.arguments;
+    const missing =
+      raw === undefined ||
+      raw === null ||
+      (typeof raw === "string" && raw.trim() === "");
+    if (!missing) return item;
+    repaired += 1;
+    return { ...item, arguments: "{}" };
+  });
+  if (!repaired) return;
+  payload.input = input;
+  // Never quieted: a call in the caller's transcript changed shape, and an
+  // unattended service is exactly where that must not happen in silence.
+  console.error(
+    `[api-forwarder] replaced ${repaired} empty function-call argument string(s) with "{}"`,
   );
 }
 
@@ -1050,6 +1095,38 @@ function normalizeBody(buffer, contentType, route) {
       delete payload.thinking;
     }
     payload = normalizeOpenAIRequest(payload);
+    payload = normalizeAzureOpenAIResponsesRequest(payload, { providerId: model.provider, route });
+    if (usesDeepSeekResponses(model) && payload.reasoning.effort !== "none" &&
+      (payload.tool_choice === "required" || (payload.tool_choice?.type === "function" &&
+        typeof payload.tool_choice.name === "string" && payload.tool_choice.name) ||
+        (payload.tool_choice?.type === "allowed_tools" && payload.tool_choice.mode === "required"))) {
+      // Native DeepSeek Responses rejects forced tools while thinking. Omitting
+      // the choice leaves tools available under the upstream default. For a
+      // named or required allowed-tools choice, offer only those tools. Leave
+      // unknown or malformed restrictions invalid rather than widening access.
+      if (payload.tool_choice === "required") {
+        delete payload.tool_choice;
+      } else if (payload.tool_choice.type === "function") {
+        const matches = payload.tools?.filter((tool) => tool.name === payload.tool_choice.name);
+        if (matches?.length === 1) {
+          payload.tools = matches;
+          delete payload.tool_choice;
+        }
+      } else {
+        const allowed = payload.tool_choice.tools;
+        if (Array.isArray(allowed) && allowed.length > 0 &&
+          allowed.every((tool) => ["function", "custom"].includes(tool?.type) &&
+            typeof tool.name === "string" && tool.name)) {
+          const keys = new Set(allowed.map((tool) => `${tool.type}\0${tool.name}`));
+          const matches = allowed.map((choice) => payload.tools?.filter((tool) =>
+            tool.type === choice.type && tool.name === choice.name));
+          if (keys.size === allowed.length && matches.every((group) => group?.length === 1)) {
+            payload.tools = matches.map((group) => group[0]);
+            delete payload.tool_choice;
+          }
+        }
+      }
+    }
     // The router labels routed assistant messages with Codex's `phase`, and
     // Codex replays it on every later turn. An operator-configured Responses
     // endpoint is an unknown validator, so it gets the pre-label history
@@ -1184,6 +1261,9 @@ function normalizeBody(buffer, contentType, route) {
   if (provider.id === "gemini-api") {
     inlineGeminiToolSchemaRefs(payload);
   }
+  if (STRICT_FUNCTION_CALL_ARGUMENT_PROVIDER_IDS.has(provider.id)) {
+    repairEmptyFunctionCallArguments(payload);
+  }
   // Deliberately its own statement rather than a branch of the profile chain
   // below: this is an upstream limitation, and every route that has it also
   // needs a request profile of its own, which the single-valued field cannot
@@ -1314,7 +1394,11 @@ function normalizeBody(buffer, contentType, route) {
     delete payload.temperature;
     delete payload.top_p;
   } else if (model.requestProfile === "xai-reasoning") {
-    if (!["low", "medium", "high"].includes(payload.reasoning_effort)) {
+    // The accepted rungs belong to the model: grok-4.5 stops at high, while
+    // grok-4.7 documents xhigh and publishes it, so it must not be clamped.
+    const accepted = ["low", "medium", "high"];
+    if (model.reasoningLevels?.some((level) => level?.effort === "xhigh")) accepted.push("xhigh");
+    if (!accepted.includes(payload.reasoning_effort)) {
       payload.reasoning_effort = "high";
     }
     delete payload.presence_penalty;
@@ -1462,7 +1546,6 @@ function normalizeBody(buffer, contentType, route) {
     }
   }
   if (adapter) payload = adapter.normalizeBody(payload, model);
-  clampUnionAlphaCompletion(payload, model);
   const targetPath = adapter?.targetPath
     ? adapter.targetPath({ model, body: payload })
     : undefined;
@@ -1545,6 +1628,8 @@ async function relayUpstreamResponse(
     upstream.ok && upstreamContentType.toLowerCase().includes("text/event-stream");
   const responsesJson = normalized.responseAdapter === "responses" &&
     upstream.ok && upstreamContentType.toLowerCase().includes("application/json");
+  const replayJson = requiresReasoningContentOnToolCalls(normalized.model) && upstream.ok &&
+    upstreamContentType.toLowerCase().includes("application/json");
   
   // Direct DeepSeek calls arrive with an outer, authoritative namespace/custom
   // map. Preserve their wire names here; guessing a namespace from a flattened
@@ -1555,6 +1640,14 @@ async function relayUpstreamResponse(
     : new Map();
   
   const transform = [
+    // Contract models: remember the reasoning this turn streams so a later
+    // replay can hand the model its own thinking back (required by the
+    // provider; an empty field is a 400). Read-only: it re-emits every byte.
+    requiresReasoningContentOnToolCalls(normalized.model) &&
+    upstreamContentType.toLowerCase().includes("text/event-stream")
+      ? createReasoningReplayTap()
+      : undefined,
+    replayJson ? createReasoningReplayJsonTap() : undefined,
     responsesStream
       ? createResponsesStreamTransform(flatToNative, {
           pinResponseId: normalized.provider.authProfile === "github-copilot",
@@ -1568,6 +1661,7 @@ async function relayUpstreamResponse(
     : undefined;
   if (responsesStream) response.setHeader("Content-Type", "text/event-stream; charset=utf-8");
   if (responsesJson) response.setHeader("Content-Type", "application/json; charset=utf-8");
+  if (replayJson && !responsesJson) response.setHeader("Content-Type", upstreamContentType);
   await pipeResponse(upstream, response, denylist, transform);
   recordUpstreamLimits(normalized, telemetryUpstream);
   if (!QUIET) {

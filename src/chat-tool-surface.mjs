@@ -224,14 +224,20 @@ function withRequiredAppTools(tools, required) {
 // variants front the same validator. They opt into the router's existing
 // bounded alias route, which is deterministic and reversible, so
 // `rewriteNamespaceResponsePayload()` still restores the client's own identity.
-// Every other non-Groq provider keeps the unbounded surface byte for byte.
+// Meta returned the same 80-character rejection through OpenRouter for Muse
+// Spark 1.3 Contributor. Keep that opt-in exact to the observed model route.
 const BOUNDED_TOOL_NAME_PROVIDERS = new Set(["commandcode", "commandcode-messages"]);
 const BOUNDED_TOOL_NAME_LENGTH = 64;
+
+function needsBoundedChatToolNames(providerId, upstreamModel) {
+  return BOUNDED_TOOL_NAME_PROVIDERS.has(providerId) ||
+    (providerId === "openrouter" && upstreamModel === "meta/muse-spark-1.3-contributor");
+}
 
 export function chatProviderToolSurface(
   tools,
   providerId,
-  { input, toolChoice } = {},
+  { input, toolChoice, upstreamModel } = {},
 ) {
   if (providerId !== "groq") {
     const clientToolSearch = Array.isArray(tools) && tools.some(
@@ -248,19 +254,25 @@ export function chatProviderToolSurface(
     } else {
       providerTools = mergeCodexAppTools(tools).tools;
     }
-    return flattenNamespaceTools(
-      providerTools,
-      BOUNDED_TOOL_NAME_PROVIDERS.has(providerId)
+    // Collision safety is not the length bound. A provider with no name-length
+    // limit still cannot be sent two tools under one name: the second
+    // declaration wins on the wire, and every call to that name comes back
+    // under one identity, so the other tool is unreachable for the whole turn.
+    // The bounded branch already aliases both apart because any duplicate
+    // forces an alias there; the unbounded branch has to ask for it.
+    return flattenNamespaceTools(providerTools, {
+      aliasCollisions: true,
+      ...(needsBoundedChatToolNames(providerId, upstreamModel)
         ? { maxNameLength: BOUNDED_TOOL_NAME_LENGTH }
-        : {},
-    );
+        : {}),
+    });
   }
 
   const merged = mergeCodexAppTools(tools);
 
   // Groq has no OpenCode-style length bound, but it still needs deterministic
   // aliases when two distinct native identities have the same flattened wire
-  // spelling. Keep that collision safety independent from the 64-byte route.
+  // spelling -- the same reason the branch above asks for them.
   const expanded = flattenNamespaceTools(merged.tools, { aliasCollisions: true });
   if (!Array.isArray(expanded.tools) || expanded.tools.length <= GROQ_MAX_TOOLS) return expanded;
 

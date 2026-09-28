@@ -422,7 +422,7 @@ test("rankFailoverCandidates orders a tier by the registry's own preference", ()
 });
 
 test("rankFailoverCandidates admits a same-family 1M sibling only when asked", () => {
-  const from = model("opencode-go-messages/union-alpha", "opencode-go-messages", {
+  const from = model("opencode-go-messages/minimax-m3", "opencode-go-messages", {
     contextWindow: 262_144,
   });
   const largeSibling = model("opencode-go/glm-5.3-flash", "opencode-go", {
@@ -472,7 +472,7 @@ test("classifyRoutedFailure does not swap a Console Go context-length 400", () =
   const bodyText = JSON.stringify({
     error: {
       message:
-        `litellm.BadRequestError: AnthropicException - ${inner}. Received Model Group=opencode-go-messages-union-alpha\nAvailable Model Group Fallbacks=None`,
+        `litellm.BadRequestError: AnthropicException - ${inner}. Received Model Group=opencode-go-messages-minimax-m3\nAvailable Model Group Fallbacks=None`,
     },
   });
   assert.equal(classifyRoutedFailure({ status: 400, bodyText, now: NOW }).swap, false);
@@ -761,4 +761,37 @@ test("setFailoverChain accepts comma-separated slugs and auto clears it", () => 
     "c/three",
   ]);
   assert.deepEqual(setFailoverChain([]).chain, []);
+});
+
+test("rankFailoverCandidates never offers a model marked failoverCandidate: false", () => {
+  const ranked = rankFailoverCandidates(
+    [
+      model("kimi/k3", "kimi", { priority: 10 }),
+      model("browser/web-high", "browser", { priority: 1, failoverCandidate: false }),
+    ],
+    { from: FROM },
+  );
+  assert.deepEqual(ranked.map((entry) => entry.model.slug), ["kimi/k3"]);
+});
+
+test("a named failover chain cannot bring back a model marked failoverCandidate: false", () => {
+  const ranked = rankFailoverCandidates(
+    [
+      model("kimi/k3", "kimi", { priority: 10 }),
+      model("browser/web-high", "browser", { priority: 1, failoverCandidate: false }),
+    ],
+    { from: FROM, chain: ["browser/web-high", "kimi/k3"] },
+  );
+  assert.deepEqual(ranked.map((entry) => entry.model.slug), ["kimi/k3"]);
+});
+
+test("failoverCandidate absent or true ranks exactly as before", () => {
+  const plain = [model("kimi/k3", "kimi", { priority: 60 }), model("deepseek/v4", "deepseek", { priority: 20 })];
+  const flagged = [
+    model("kimi/k3", "kimi", { priority: 60, failoverCandidate: true }),
+    model("deepseek/v4", "deepseek", { priority: 20 }),
+  ];
+  const slugs = (models) => rankFailoverCandidates(models, { from: FROM }).map((entry) => entry.model.slug);
+  assert.deepEqual(slugs(flagged), slugs(plain));
+  assert.deepEqual(slugs(plain), ["deepseek/v4", "kimi/k3"]);
 });

@@ -277,6 +277,12 @@ Linux installations support the Codex CLI.
 | MiniMax M3 | `minimax-token-plan/minimax-m3` | MiniMax Token Plan API key |
 | MiMo-V2.5 (Xiaomi API) | `xiaomi-mimo/mimo-v2.5` | Xiaomi MiMo API key |
 | MiMo-V2.5-Pro (Xiaomi API) | `xiaomi-mimo/mimo-v2.5-pro` | Xiaomi MiMo API key |
+| Step 5 Preview (StepFun) | `stepfun-api/step-5-preview` | StepFun API key (`STEPFUN_API_KEY`) |
+| Step 3.7 Flash (StepFun) | `stepfun-api/step-3.7-flash` | StepFun API key (`STEPFUN_API_KEY`) |
+| Step 3.5 Flash 2603 (StepFun) | `stepfun-api/step-3.5-flash-2603` | StepFun API key (`STEPFUN_API_KEY`) |
+| Step 5 Preview (StepFun China) | `stepfun-api-cn/step-5-preview` | StepFun **China** platform key (`STEPFUN_API_CN_KEY`) |
+| Step 3.7 Flash (StepFun China) | `stepfun-api-cn/step-3.7-flash` | StepFun **China** platform key (`STEPFUN_API_CN_KEY`) |
+| Step 3.5 Flash 2603 (StepFun China) | `stepfun-api-cn/step-3.5-flash-2603` | StepFun **China** platform key (`STEPFUN_API_CN_KEY`) |
 | Qwen3.8 Max (Plan) | `qwen-plan/qwen3.8-max` | Alibaba Model Studio plan API key |
 | Qwen3.8 Max Preview (Plan) | `qwen-plan/qwen3.8-max-preview` | Alibaba Model Studio plan API key |
 | Qwen3.7 Max (Plan) | `qwen-plan/qwen3.7-max` | Alibaba Model Studio plan API key |
@@ -301,8 +307,6 @@ Linux installations support the Codex CLI.
 | Hy4 Preview (NanoGPT) | `nano-gpt/tencent/hy4-preview` | NanoGPT API key |
 | Hy4 Preview (Nous Research) | `nousresearch/tencent/hy4-preview` | Nous Portal API key |
 | Hy4 Preview (opencode Go) | `opencode-go/hy4-preview` | opencode Go/Zen API key |
-| Union Alpha (opencode Go) | `opencode-go-messages/union-alpha` | opencode Go/Zen API key |
-| Union Alpha (OpenRouter) | `openrouter/union-alpha` | OpenRouter API key |
 | Hy4 Preview (OpenRouter) | `openrouter/tencent/hy4-preview` | OpenRouter API key |
 | GLM-5.2 (ClinePass) | `clinepass/glm-5.2` | ClinePass API key |
 | Kimi K3 (ClinePass) | `clinepass/kimi-k3` | ClinePass API key |
@@ -331,6 +335,15 @@ with `kimi login --region global` (guided setup asks which site to use). The
 router reads the region the official CLI recorded in `~/.kimi-code/config.toml`
 and refreshes tokens, forwards requests, and reads quota from the matching
 `auth.`/`api.` hosts, so no router-side configuration is needed for either.
+
+StepFun is split the same way. `stepfun-api` is the global Open Platform at
+platform.stepfun.ai (`https://api.stepfun.ai/v1`); `stepfun-api-cn` is the
+mainland console at platform.stepfun.com (`https://api.stepfun.com/v1`). Each
+console issues its own key, so the two providers are enabled and credentialed
+separately and can both be active at once — pick the one matching where your
+key was created. The model ids are identical on both hosts, so the only
+difference between a `stepfun-api/` and a `stepfun-api-cn/` route is which
+platform serves and bills it.
 
 The Codex catalog is credential-aware. It includes models only from enabled
 external providers with a stored credential or valid OAuth session. Native GPT
@@ -654,6 +667,21 @@ The Jev route is intentionally unlisted, so it cannot appear in Codex's
 conversational model picker. It is for an explicit local integration such as
 jev-pruner, never a substitute for Codex native compaction.
 
+Connecting OpenRouter makes this Decisions route available to a client that
+calls `/v1/decisions`. Do not add a Jev model in **Models** to turn on output
+pruning. In particular, OpenRouter's `typesafe/jev-router` is a conversational
+model route: selecting it changes the assistant used by Codex. It does not
+activate the hidden `openrouter-decisions/jev-latest` route or install a tool
+output hook. A Decisions client must be configured separately to call the
+endpoint; automatic Codex tool output pruning needs its own hook.
+
+If the Router goes offline during setup, use **Status → Service health → Fix**
+in Control Center, then check Router health and return to a known working chat
+model. Fix repairs and restarts the installed Router, so routed chats may be
+interrupted. It does not enable a Decisions client. See the
+[provider and model guide](docs-site/src/content/docs/reference/providers-and-models.md)
+for the general boundary between chat models and tool APIs.
+
 ### opencode (Go subscription and Zen)
 
 The opencode provider family covers both of opencode's endpoints with one
@@ -736,7 +764,6 @@ the operator explicitly selects them.
 | MiMo-V2.5-Pro (opencode Go) | `opencode-go/mimo-v2.5-pro` |
 | Hy3 (opencode Go) | `opencode-go/hy3` |
 | Hy4 Preview (opencode Go) | `opencode-go/hy4-preview` |
-| Union Alpha (opencode Go) | `opencode-go-messages/union-alpha` |
 | MiniMax M3 (opencode Go) | `opencode-go-messages/minimax-m3` |
 | MiniMax M2.7 (opencode Go) | `opencode-go-messages/minimax-m2.7` |
 | MiniMax M2.5 (opencode Go) | `opencode-go-messages/minimax-m2.5` |
@@ -932,6 +959,7 @@ preserves Command Code's reported cached-token usage.
 
 | Picker label | Model ID |
 | --- | --- |
+| Space Bunny Alpha (Command Code) | `commandcode/stealth/space-bunny-alpha` |
 | DeepSeek V4 Flash (Command Code) | `commandcode/deepseek-v4-flash` |
 | DeepSeek V4 Pro (Command Code) | `commandcode/deepseek-v4-pro` |
 | DeepSeek V4.1 Flash (Command Code) | `commandcode/deepseek-v4.1-flash` |
@@ -1036,23 +1064,13 @@ accepted `v2_agent` proof artifact. OpenCode Go's content moderation still
 applies to the compaction request itself, so a sensitive transcript may be
 rejected even when the ordinary task turn worked.
 
-OpenCode Go's current stealth preview is **Union Alpha** (`union-alpha` on
-the Messages API). It is a separate model from Ox Alpha / GLM-5.3-Flash:
-OpenCode does not name the maker, documents a 262,144-token window with
-131,072 tokens of advertised output, text and image input, and currently
-lists it as free for a limited time. The Messages hop and the published
-catalog reserve the measured 32,768 completion cap. A single message whose
-content exceeds Console Go's 2,500,000-character limit (a generated ImageGen
-PNG data URL) is replaced with a labeled stub so the follow-up turn can
-finish. The shipped slug is
-`opencode-go-messages/union-alpha`. OpenRouter publishes the same preview as
-`stealth/union-alpha` (text and image input, 262,144 context, 131,072 output,
-currently free); the shipped slug is `openrouter/union-alpha`. OpenRouter's
-endpoint record accepts `tool_choice` auto only, so that route downgrades
-Codex's forced choice. It does not advertise a reasoning-effort ladder.
-ClinePass and Command Code do not list this id. Omen Alpha remains in the
-live Go catalog but is deprecated in OpenCode's models.dev record and is not
-checked in.
+OpenCode Go withdrew its Union Alpha stealth preview and OpenRouter withdrew
+`stealth/union-alpha`; neither id is listed upstream any more and no route is
+checked in. Console Go still rejects a single message whose content exceeds
+2,500,000 characters, so an oversized ImageGen data URL is replaced with a
+labeled stub on every OpenCode Messages hop. Omen Alpha remains in the live Go
+catalog but is deprecated in OpenCode's models.dev record and is not checked
+in.
 
 Command Code and Venice still expose their live catalogs to explicit curation.
 An operator with an entitled account can inspect and select whatever those
@@ -1955,6 +1973,14 @@ failure. Choose the order yourself, or hand the choice back:
 ./bin/control failover chain opencode-free/big-pickle,kimi-api/kimi-k3
 ./bin/control failover auto
 ```
+
+**A route you only ever want to pick yourself can opt out.** Set
+`"failoverCandidate": false` on its entry in `user-models.json` and it stays in
+the picker and answers when you select it, but it is never chosen
+automatically -- not by quota failover, not by compaction, and not through a
+named chain. Use it for a slow, best-effort or subscription-bound route that
+must not absorb other models' traffic. Curation keeps the field on an existing
+entry; a model without it behaves exactly as before.
 
 **When a provider tells you when it will be back, that is believed.** The next
 turn skips it outright instead of paying for the same rejection again, and it

@@ -1,14 +1,15 @@
 // Bounded request diagnostics for usage events. Counts, billing, routes, and
 // retries stay in usage-events.mjs; this module names a request and records
 // small routing-shape facts such as reasoning effort, routed tool count/schema
-// bytes, and the Grok OAuth 4.6 ingress byte split. It never stores headers,
+// bytes, and the Grok OAuth ingress byte split. It never stores headers,
 // bodies, tool definitions, thread titles, or paths.
 //
 // The request ID is created by the /activity observer and includes its process
 // instance ID, so a service restart cannot accidentally join unrelated requests.
 
+import { isGrokOauthAgenticRoute } from "./grok-oauth-routes.mjs";
+
 export const ROUTER_INGRESS_OBSERVATION_POINT = "router_ingress";
-export const GROK_OAUTH_46_SLUG = "grok-oauth/grok-4.6";
 
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9:_-]{1,160}$/;
 const REASONING_EFFORT_PATTERN = /^(?:minimal|low|medium|high|xhigh|max|ultra|none)$/;
@@ -61,8 +62,8 @@ export function measureIngressContextBytes(payload) {
   };
 }
 
-export function grokOauth46IngressContextBytes(payload, route) {
-  if (route?.slug !== GROK_OAUTH_46_SLUG) return undefined;
+export function grokOauthIngressContextBytes(payload, route) {
+  if (!isGrokOauthAgenticRoute(route)) return undefined;
   return measureIngressContextBytes(payload);
 }
 

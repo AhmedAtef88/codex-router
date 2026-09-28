@@ -1,8 +1,9 @@
+import { backendText } from "../backend-text";
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { Check, ChevronDown, ChevronLeft, ChevronRight, Filter, KeyRound, Link2, LogIn, MoreHorizontal, Pencil, Plus, SearchX, ShieldCheck, Trash2 } from "lucide-react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Filter, KeyRound, Link2, LoaderCircle, LogIn, MoreHorizontal, Pencil, Plus, SearchX, ShieldCheck, Trash2 } from "lucide-react";
 import { Badge, Button, CatalogSkeleton, Dialog, EmptyState, PageHeader, PanelSkeleton, SearchField, SkeletonBlock, Toggle } from "../components";
 import { BrandLogo, ProviderLogo, brandForModel } from "../provider-branding";
-import { formatContext, formatDateTime } from "../lib";
+import { effortLabel, formatContext, formatDateTime } from "../lib";
 import {
   addPendingCatalogModels,
   beginCatalogRequest,
@@ -17,6 +18,8 @@ import {
 } from "../model-catalog-search.mjs";
 import { groupModelFamilies, preferredFamilyRoute } from "../model-families.mjs";
 import { useOptimisticValues, type RunAction } from "../useOptimisticValues";
+import { useI18n } from "../i18n-react";
+import type { Translate } from "../i18n";
 import type {
   CustomEndpointResult,
   ModelViewFocusRequest,
@@ -35,6 +38,13 @@ import "./providers-models.css";
 
 type StatusFilter = "all" | "on" | "off" | "blocked";
 const CATALOG_ADD_BATCH_LIMIT = 200;
+
+// A credential command -- saving a key, signing in, disconnecting -- is one
+// router transaction that also enables the provider and republishes every
+// installed client catalog. Which one is running decides what the chip and the
+// routes waiting on that provider say for the seconds it takes.
+type ProviderMutation = "connecting" | "disconnecting";
+type ProviderMutations = Record<string, ProviderMutation>;
 
 /** One model, and every provider route that can serve it. */
 interface ModelFamily {
@@ -59,14 +69,18 @@ interface CatalogModel {
   isFree: boolean;
 }
 
-const STATUS_LABELS: Record<StatusFilter, string> = {
-  all: "All models",
-  on: "On",
-  off: "Off",
-  blocked: "Needs a provider",
-};
+function statusLabels(t: Translate): Record<StatusFilter, string> {
+  return {
+    all: t("models.status.all"),
+    on: t("models.status.on"),
+    off: t("models.status.off"),
+    blocked: t("models.status.blocked"),
+  };
+}
 
-const ALL_PROVIDERS_LABEL = "All providers";
+function allProvidersLabel(t: Translate): string {
+  return t("models.allProviders");
+}
 
 /** Below this, a list is short enough to read whole; filters and bulk switches
  *  would be more chrome than the list they act on. */
@@ -143,6 +157,7 @@ function routeUsable(model: RouterModel): boolean {
 }
 
 export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dataReady, onRefresh, runAction, focusRequest }: ModelsPageProps) {
+  const t = useI18n();
   const [modelSearch, setModelSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
@@ -162,6 +177,10 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
   const [credentialProvider, setCredentialProvider] = useState<ProviderSetup | null>(null);
   const [configurationProvider, setConfigurationProvider] = useState<ProviderSetup | null>(null);
   const [removeProvider, setRemoveProvider] = useState<ProviderSetup | null>(null);
+  // Deleting a locally curated model is not undoable from here -- the overlay
+  // entry and its metadata go, and re-adding it means curating the model
+  // again -- so it is confirmed the way disconnecting a provider is.
+  const [removeLocalModel, setRemoveLocalModel] = useState<RouterModel | null>(null);
   const [customEndpointOpen, setCustomEndpointOpen] = useState(false);
   const [editingEndpoint, setEditingEndpoint] = useState<ProviderSetup | null>(null);
   const [addModelsQuery, setAddModelsQuery] = useState("");
@@ -180,6 +199,13 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
   // slowest thing this page starts; without a placeholder the models simply are
   // not there for the length of it and the click reads as having done nothing.
   const [pendingModels, setPendingModels] = useState<PendingCatalogModels>({});
+  // The credential dialog closes on submit, and the command behind it runs
+  // for as long as publication takes. Without this the page is identical
+  // either side of the key being accepted, so the wait reads as a click that
+  // did nothing. Cleared by the same await that already refreshed the
+  // snapshot, so the placeholder gives way to the real routes, never to the
+  // state it replaced.
+  const [providerMutations, setProviderMutations] = useState<ProviderMutations>({});
 
   // External model identity and picker visibility come from the router-owned
   // catalog. Native entries remain a Codex-only adapter concern and are merged
@@ -241,7 +267,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
       const current = entries.get(model.provider);
       entries.set(model.provider, {
         id: model.provider,
-        displayName: current?.displayName || providerDisplayName(model.provider),
+        displayName: current?.displayName || providerDisplayName(model.provider, t),
         setup: current?.setup,
         models: [...(current?.models ?? []), model],
         knownModels: current?.knownModels ?? [],
@@ -251,7 +277,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
       const current = entries.get(model.provider);
       entries.set(model.provider, {
         id: model.provider,
-        displayName: current?.displayName || providerDisplayName(model.provider),
+        displayName: current?.displayName || providerDisplayName(model.provider, t),
         setup: current?.setup,
         models: current?.models ?? [],
         knownModels: [...(current?.knownModels ?? []), model],
@@ -262,7 +288,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
       const rightConnected = providerConnected(right, enabledProviders);
       return Number(rightConnected) - Number(leftConnected) || left.displayName.localeCompare(right.displayName);
     });
-  }, [catalog?.knownModels, enabledProviders, models, setup?.customEndpoints, setup?.providers, target?.providers]);
+  }, [catalog?.knownModels, enabledProviders, models, setup?.customEndpoints, setup?.providers, target?.providers, t]);
   const directoryById = useMemo(() => new Map(directory.map((entry) => [entry.id, entry])), [directory]);
   const providerStates = useMemo(() => new Map(directory.map((entry) => [
     entry.id,
@@ -331,6 +357,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
     provider: ProviderSetup,
     label: string,
     action: () => Promise<unknown>,
+    { intent = "connecting" as ProviderMutation } = {},
   ) => {
     const invalidateCatalogs = () => {
       invalidateProviderCatalogRequests(catalogRequestGenerations.current, provider.catalogSources);
@@ -340,12 +367,21 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
     // before a later refresh/publish step rejects, and a discovery that lands
     // while the mutation is running must not show the previous account.
     invalidateCatalogs();
+    setProviderMutations((current) => ({ ...current, [provider.id]: intent }));
     try {
+      // runAction reconciles the snapshot before it resolves -- on failure too --
+      // so the busy state ends on a render that already carries the outcome.
       await runAction(label, async () => {
         await action();
       });
     } finally {
       invalidateCatalogs();
+      setProviderMutations((current) => {
+        if (!(provider.id in current)) return current;
+        const next = { ...current };
+        delete next[provider.id];
+        return next;
+      });
     }
   };
 
@@ -379,7 +415,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
           ...current,
           status: "error",
           refreshing: false,
-          error: error instanceof Error ? error.message : "Provider catalog could not be loaded.",
+          error: error instanceof Error ? error.message : t("models.add.catalogsFailed"),
         });
     }
   };
@@ -408,7 +444,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
     let published = false;
     setPendingModels((current) => addPendingCatalogModels(current, entry.id, selected));
     try {
-      await runAction(`Add ${selected.length} ${entry.displayName} model${selected.length === 1 ? "" : "s"}`, async () => {
+      await runAction(t("models.action.addModels", { count: selected.length, name: entry.displayName }), async () => {
         await api.addProviderModels(sourceId, selected);
         published = true;
       });
@@ -443,7 +479,18 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
 
   const removeEndpointModel = (entry: ProviderDirectoryEntry, model: RouterModel) => {
     if (!api) return;
-    void runAction(`Remove ${model.displayName}`, () => api.removeCustomEndpointModels(entry.id, [model.slug]));
+    void runAction(t("customEndpoint.action.removeModel", { name: model.displayName }), () => api.removeCustomEndpointModels(entry.id, [model.slug]));
+  };
+
+  // The same pruning for a locally curated model on an ordinary provider. The
+  // router resolves the slug against the overlay, so nothing here has to know
+  // how a provider's public slug relates to its upstream id.
+  const removeLocalCuratedModel = (model: RouterModel) => {
+    if (!api) return;
+    void runAction(
+      t("models.local.action.remove", { name: model.displayName }),
+      () => api.removeLocalModels([model.slug]),
+    );
   };
 
   useEffect(() => {
@@ -461,7 +508,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
   };
 
   const renderConnections = () => !dataReady.providers && !setup ? (
-    <section className="pm-connections pm-connections-loading" aria-label="Loading provider connections" aria-busy="true">
+    <section className="pm-connections pm-connections-loading" aria-label={t("models.loading.connections")} aria-busy="true">
       <SkeletonBlock />
       <SkeletonBlock />
       <SkeletonBlock />
@@ -470,6 +517,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
     <ConnectionsBar
       directory={directory}
       enabledProviders={enabledProviders}
+      pendingMutations={providerMutations}
       usageById={usageById}
       apiAvailable={Boolean(api)}
       platform={api?.platform}
@@ -488,13 +536,13 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
       onRemoveEndpointModel={removeEndpointModel}
       onEnabledChange={(entry, checked) => {
         if (!api) return;
-        void optimisticProviders.mutate(entry.id, checked, `${checked ? "Enable" : "Disable"} ${entry.displayName}`, () => api.setProviderEnabled(entry.id, checked));
+        void optimisticProviders.mutate(entry.id, checked, checked ? t("models.action.enableProvider", { name: entry.displayName }) : t("models.action.disableProvider", { name: entry.displayName }), () => api.setProviderEnabled(entry.id, checked));
       }}
       onSignIn={(entry) => {
         if (!api || !entry.setup) return;
         const label = entry.setup.action === "probe"
-          ? `Run ${entry.displayName} live compatibility test`
-          : `Start ${entry.displayName} sign-in`;
+          ? t("models.action.runProbe", { name: entry.displayName })
+          : t("models.action.startSignIn", { name: entry.displayName });
         void runProviderCredentialAction(entry.setup, label, () => api.connectProvider(entry.id));
       }}
       onConfigure={(entry) => entry.setup && setConfigurationProvider(entry.setup)}
@@ -506,16 +554,16 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
     <>
       <Dialog
         open={Boolean(endpointNotice)}
-        title={`${endpointNotice?.displayName || "Endpoint"} saved, but it did not answer`}
-        description="The endpoint and its key are stored. Its model list cannot be read until it responds, so there is nothing to choose from yet."
+        title={t("customEndpoint.notice.title", { name: endpointNotice?.displayName || t("customEndpoint.fallbackName") })}
+        description={t("customEndpoint.notice.description")}
         onClose={() => setEndpointNotice(null)}
       >
         <div className="pm-credential-warning">
           <ShieldCheck aria-hidden size={17} strokeWidth={1.7} />
-          <p>{endpointNotice?.reason} Check the base URL, the API key, and whether a VPN or firewall is blocking this address. You can still add a model by name and use it once the endpoint responds.</p>
+          <p>{backendText(endpointNotice?.reason, t)} {t("customEndpoint.notice.help")}</p>
         </div>
         <div className="dialog-actions">
-          <Button variant="secondary" onClick={() => setEndpointNotice(null)}>Close</Button>
+          <Button variant="secondary" onClick={() => setEndpointNotice(null)}>{t("models.config.close")}</Button>
           <Button
             variant="primary"
             onClick={() => {
@@ -525,7 +573,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
               if (entry?.setup) setNamedModelEndpoint(entry.setup);
             }}
           >
-            <Plus aria-hidden size={14} strokeWidth={1.7} /> Add a model by name
+            <Plus aria-hidden size={14} strokeWidth={1.7} /> {t("customEndpoint.named.title")}
           </Button>
         </div>
       </Dialog>
@@ -534,7 +582,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
         onClose={() => setNamedModelEndpoint(null)}
         onSave={async (provider, modelId) => {
           if (!api) return;
-          await runAction(`Add ${provider.id}/${modelId}`, () => api.addCustomEndpointModel(provider.id, modelId));
+          await runAction(t("customEndpoint.action.addModel", { model: `${provider.id}/${modelId}` }), () => api.addCustomEndpointModel(provider.id, modelId));
         }}
       />
       <CustomEndpointDialog
@@ -545,7 +593,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
           if (!api) return;
           if (editing) {
             let editCheck: CustomEndpointResult["check"];
-            await runProviderCredentialAction(editing, `Update ${endpoint.displayName}`, async () => {
+            await runProviderCredentialAction(editing, t("customEndpoint.action.update", { name: endpoint.displayName }), async () => {
               const { credential, ...fields } = endpoint;
               const result = await api.editCustomEndpoint(editing.id, fields);
               if (credential) await api.saveProviderCredential(editing.id, credential);
@@ -557,7 +605,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
             return;
           }
           let saved: CustomEndpointResult | undefined;
-          await runAction(`Add ${endpoint.displayName}`, async () => {
+          await runAction(t("customEndpoint.action.add", { name: endpoint.displayName }), async () => {
             saved = await api.addCustomEndpoint(endpoint);
           });
           if (!saved) return;
@@ -577,33 +625,48 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
       <CredentialDialog
         provider={credentialProvider}
         onSave={(provider, secret) => api
-          ? runProviderCredentialAction(provider, `Save ${provider.displayName} credential`, () => api.saveProviderCredential(provider.id, secret))
+          ? runProviderCredentialAction(provider, t("models.action.saveCredential", { name: provider.displayName }), () => api.saveProviderCredential(provider.id, secret))
           : Promise.resolve()}
         onClose={() => setCredentialProvider(null)}
       />
       <Dialog
         open={Boolean(configurationProvider)}
-        title={`Configure ${configurationProvider?.displayName || "provider"}`}
-        description="This provider uses local configuration rather than an API key."
+        title={t("models.config.title", { name: configurationProvider?.displayName || t("models.credential.provider") })}
+        description={t("models.config.description")}
         onClose={() => setConfigurationProvider(null)}
       >
         <div className="pm-credential-warning">
           <ShieldCheck aria-hidden size={17} strokeWidth={1.7} />
-          <p>{configurationProvider?.configurationNote || "Run the provider's local configuration command, then refresh this page."}</p>
+          <p>{backendText(configurationProvider?.configurationNote, t) || t("models.config.run")}</p>
         </div>
         <div className="dialog-actions">
-          <Button variant="secondary" onClick={() => setConfigurationProvider(null)}>Close</Button>
+          <Button variant="secondary" onClick={() => setConfigurationProvider(null)}>{t("models.config.close")}</Button>
         </div>
       </Dialog>
-      <Dialog open={Boolean(removeProvider)} title="Disconnect provider" description="The provider is withdrawn from installed clients before its managed credential is deleted." onClose={() => setRemoveProvider(null)}>
+      <Dialog open={Boolean(removeProvider)} title={t("models.disconnect.title")} description={t("models.disconnect.description")} onClose={() => setRemoveProvider(null)}>
         <div className="pm-credential-warning"><ShieldCheck aria-hidden size={17} strokeWidth={1.7} /><p>{removeProvider?.generic
-          ? "This removes the endpoint, its saved API key, and every model you added from it."
+          ? t("customEndpoint.removeBody")
           : removeProvider?.id === "antigravity-oauth"
-          ? "This removes only the router-owned OAuth client, session, and live proof. Official Antigravity or agy credentials are never read or changed."
-          : "If a credential also exists in the environment or Keychain, the router will still report it as connected."}</p></div>
+          ? t("models.disconnect.antigravity")
+          : t("models.disconnect.env")}</p></div>
         <div className="dialog-actions">
-          <Button variant="secondary" onClick={() => setRemoveProvider(null)}>Cancel</Button>
-          <Button variant="danger" onClick={() => { const provider = removeProvider; setRemoveProvider(null); if (provider && api) void runProviderCredentialAction(provider, `Remove ${provider.displayName} credential`, () => api.removeProviderCredential(provider.id)); }}><Trash2 aria-hidden size={14} strokeWidth={1.7} /> Disconnect</Button>
+          <Button variant="secondary" onClick={() => setRemoveProvider(null)}>{t("models.disconnect.cancel")}</Button>
+          <Button variant="danger" onClick={() => { const provider = removeProvider; setRemoveProvider(null); if (provider && api) void runProviderCredentialAction(provider, t("models.action.removeCredential", { name: provider.displayName }), () => api.removeProviderCredential(provider.id), { intent: "disconnecting" }); }}><Trash2 aria-hidden size={14} strokeWidth={1.7} /> {t("models.disconnect.confirm")}</Button>
+        </div>
+      </Dialog>
+      <Dialog
+        open={Boolean(removeLocalModel)}
+        title={t("models.local.removeTitle")}
+        description={t("models.local.removeDescription", { name: removeLocalModel?.displayName || "" })}
+        onClose={() => setRemoveLocalModel(null)}
+      >
+        {/* Name the slug: the operator may have curated several near-identical
+            ids on one provider, and the display name alone does not separate
+            them. */}
+        <div className="pm-credential-warning"><ShieldCheck aria-hidden size={17} strokeWidth={1.7} /><p>{t("models.local.removeBody", { slug: removeLocalModel?.slug || "" })}</p></div>
+        <div className="dialog-actions">
+          <Button variant="secondary" onClick={() => setRemoveLocalModel(null)}>{t("models.disconnect.cancel")}</Button>
+          <Button variant="danger" onClick={() => { const model = removeLocalModel; setRemoveLocalModel(null); if (model) removeLocalCuratedModel(model); }}><Trash2 aria-hidden size={14} strokeWidth={1.7} /> {t("models.local.removeConfirm")}</Button>
         </div>
       </Dialog>
     </>
@@ -615,11 +678,11 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
     return families.filter((family) => {
       if (activeProviderFilter !== "all" && !family.routes.some((model) => model.provider === activeProviderFilter)) return false;
       if (!needle) return true;
-      return `${family.displayName} ${family.routes.map((model) => `${model.displayName} ${model.slug} ${providerDisplayName(model.provider)}`).join(" ")}`
+      return `${family.displayName} ${family.routes.map((model) => `${model.displayName} ${model.slug} ${providerDisplayName(model.provider, t)}`).join(" ")}`
         .toLowerCase()
         .includes(needle);
     });
-  }, [activeProviderFilter, families, modelSearch]);
+  }, [activeProviderFilter, families, modelSearch, t]);
 
   // Row order never depends on a switch. Sorting by on/off would throw the row
   // you just clicked to the other end of the list, at the exact moment you are
@@ -650,19 +713,19 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
       <>
         <div className="providers-models-page models-page">
           <PageHeader
-            eyebrow="Models"
-            title="Models"
-            description="Choose which models your installed clients can use, and connect the accounts that serve them."
+            eyebrow={t("models.eyebrow")}
+            title={t("models.title")}
+            description={t("models.description")}
             onRefresh={onRefresh}
             refreshing={refreshing}
           />
           {renderConnections()}
           {!dataReady.snapshot ? (
-            <section className="panel-section pm-models-loading" aria-label="Loading models" aria-busy="true">
-              <PanelSkeleton label="Loading model routes" count={6} />
+            <section className="panel-section pm-models-loading" aria-label={t("models.loading.models")} aria-busy="true">
+              <PanelSkeleton label={t("models.loading.routes")} count={6} />
             </section>
           ) : (
-            <EmptyState icon={<SearchX size={22} />} title="Router snapshot unavailable" body="Start the router or refresh after setup completes." />
+            <EmptyState icon={<SearchX size={22} />} title={t("models.snapshotUnavailable")} body={t("models.snapshotUnavailableBody")} />
           )}
         </div>
         {renderConnectionDialogs()}
@@ -671,17 +734,19 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
   }
 
   const connectedProviderCount = directory.filter((entry) => providerConnected(entry, enabledProviders)).length;
+  const labels = statusLabels(t);
+  const allProviders = allProvidersLabel(t);
   const pendingSlugs = directory.flatMap((entry) => pendingCatalogModelIds(pendingModels, entry.id)
     .filter((slug) => !entry.models.some((model) => model.slug === slug)));
 
   const updatePicker = (slug: string, visible: boolean) => api
-    ? optimisticPicker.mutate(slug, visible, `${visible ? "Show" : "Hide"} ${slug}`, () => api.setPickerModel(slug, visible))
+    ? optimisticPicker.mutate(slug, visible, visible ? t("models.action.show", { name: slug }) : t("models.action.hide", { name: slug }), () => api.setPickerModel(slug, visible))
     : Promise.resolve();
   const updateSubagent = (slug: string, enabled: boolean) => api
-    ? optimisticSubagents.mutate(slug, enabled, `${enabled ? "Enable" : "Disable"} ${slug} as subagent`, () => api.setSubagentModel(slug, enabled))
+    ? optimisticSubagents.mutate(slug, enabled, enabled ? t("models.action.enableSubagent", { name: slug }) : t("models.action.disableSubagent", { name: slug }), () => api.setSubagentModel(slug, enabled))
     : Promise.resolve();
   const updateSubagentEffort = (slug: string, effort: string) => api
-    ? optimisticSubagentEfforts.mutate(slug, effort, `Set ${slug} subagent thinking to ${effortLabel(effort)}`, () => api.setSubagentEffort(slug, effort))
+    ? optimisticSubagentEfforts.mutate(slug, effort, t("models.action.setEffort", { name: slug, effort: effortLabel(effort, t) }), () => api.setSubagentEffort(slug, effort))
     : Promise.resolve();
 
   // The row-level switch speaks for the whole model: turning it on publishes
@@ -693,13 +758,13 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
     if (visible) {
       const route = preferredFamilyRoute({ ...family, routes: selectable }) ?? selectable[0];
       if (!route) return Promise.resolve();
-      return optimisticPicker.mutate(route.slug, true, `Show ${family.displayName}`, () => api.setPickerModel(route.slug, true));
+      return optimisticPicker.mutate(route.slug, true, t("models.action.show", { name: family.displayName }), () => api.setPickerModel(route.slug, true));
     }
     const withdraw = inPicker.filter((model) => !nativeClientManaged(model));
     if (!withdraw.length) return Promise.resolve();
     return optimisticPicker.mutateMany(
       withdraw.map((model) => [model.slug, false] as const),
-      `Hide ${family.displayName}`,
+      t("models.action.hide", { name: family.displayName }),
       async () => {
         for (const model of withdraw) await api.setPickerModel(model.slug, false);
       },
@@ -719,6 +784,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
       expanded={expandedFamilyId === family.id}
       onToggleExpanded={() => setExpandedFamilyId(expandedFamilyId === family.id ? null : family.id)}
       apiAvailable={Boolean(api)}
+      isConnecting={(providerId) => providerMutations[providerId] === "connecting"}
       providerNames={providerNames}
       pickerValue={(model) => optimisticPicker.value(model.slug, model.visible)}
       subagentValue={(model) => optimisticSubagents.value(model.slug, Boolean(subagentEnabled(target, model.slug, subagentSettings)))}
@@ -734,6 +800,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
         else if (entry.setup.kind === "configuration") setConfigurationProvider(entry.setup);
         else setCredentialProvider(entry.setup);
       }}
+      onRemoveLocal={(model) => setRemoveLocalModel(model)}
     />
   );
 
@@ -743,9 +810,9 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
     <>
       <div className="providers-models-page models-page">
         <PageHeader
-          eyebrow="Models"
-          title="Models"
-          description="Choose which models your installed clients can use, and connect the accounts that serve them."
+          eyebrow={t("models.eyebrow")}
+          title={t("models.title")}
+          description={t("models.description")}
           onRefresh={onRefresh}
           refreshing={refreshing}
         />
@@ -754,14 +821,14 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
 
         <section className="panel-section pm-model-catalog" id="model-catalog-controls">
           <div className="pm-model-toolbar">
-            <SearchField value={modelSearch} onChange={setModelSearch} placeholder="Search models" />
+            <SearchField value={modelSearch} onChange={setModelSearch} placeholder={t("models.searchModels")} />
             {/* The count describes the list underneath it. Reporting the whole
                 catalogue while a filter is narrowing the view made the filter
                 look broken. */}
             <span className="pm-results-count" aria-live="polite">
               {modelSearch || statusFilter !== "all" || activeProviderFilter !== "all"
-                ? `${visibleRows.length} of ${families.length} models`
-                : `${families.length} models`}
+                ? t("models.resultsCount", { shown: visibleRows.length, total: families.length })
+                : t("models.resultsCountAll", { total: families.length })}
             </span>
             {/* A short list reads whole. Filters and bulk switches only earn
                 their space once scrolling starts. */}
@@ -775,12 +842,12 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
                   onClick={() => setFilterMenuOpen((open) => !open)}
                 >
                   <Filter aria-hidden size={14} strokeWidth={1.7} />
-                  <span>Show</span>
-                  <strong>{STATUS_LABELS[statusFilter]}</strong>
+                  <span>{t("models.show")}</span>
+                  <strong>{labels[statusFilter]}</strong>
                   <ChevronDown aria-hidden size={14} strokeWidth={1.7} className={filterMenuOpen ? "is-open" : ""} />
                 </button>
                 {filterMenuOpen ? (
-                  <div className="pm-filter-menu" role="menu" aria-label="Filter models">
+                  <div className="pm-filter-menu" role="menu" aria-label={t("models.filterAria")}>
                     {(["all", "on", "off", "blocked"] as const).map((value) => (
                       <button
                         key={value}
@@ -793,7 +860,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
                           setFilterMenuOpen(false);
                         }}
                       >
-                        <span>{STATUS_LABELS[value]}</span>
+                        <span>{labels[value]}</span>
                         {statusFilter === value ? <Check aria-hidden size={14} strokeWidth={1.9} /> : null}
                       </button>
                     ))}
@@ -814,13 +881,13 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
                   onClick={() => setProviderFilterMenuOpen((open) => !open)}
                 >
                   <Filter aria-hidden size={14} strokeWidth={1.7} />
-                  <span>Provider</span>
-                  <strong>{activeProviderFilter === "all" ? ALL_PROVIDERS_LABEL : providerNames.get(activeProviderFilter) || activeProviderFilter}</strong>
+                  <span>{t("models.provider")}</span>
+                  <strong>{activeProviderFilter === "all" ? allProviders : providerNames.get(activeProviderFilter) || activeProviderFilter}</strong>
                   <ChevronDown aria-hidden size={14} strokeWidth={1.7} className={providerFilterMenuOpen ? "is-open" : ""} />
                 </button>
                 {providerFilterMenuOpen ? (
-                  <div className="pm-filter-menu pm-provider-filter-menu" role="menu" aria-label="Filter models by provider">
-                    {[{ id: "all", displayName: ALL_PROVIDERS_LABEL }, ...filterProviders].map((entry) => (
+                  <div className="pm-filter-menu pm-provider-filter-menu" role="menu" aria-label={t("models.filterByProviderAria")}>
+                    {[{ id: "all", displayName: allProviders }, ...filterProviders].map((entry) => (
                       <button
                         key={entry.id}
                         type="button"
@@ -846,48 +913,48 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
                 className="pm-icon-trigger"
                 aria-haspopup="menu"
                 aria-expanded={bulkMenuOpen}
-                aria-label="More model actions"
+                aria-label={t("models.moreActions")}
                 disabled={!api}
                 onClick={() => setBulkMenuOpen((open) => !open)}
               >
                 <MoreHorizontal aria-hidden size={15} strokeWidth={1.9} />
               </button>
               {bulkMenuOpen ? (
-                <div className="pm-filter-menu" role="menu" aria-label="Bulk model actions">
+                <div className="pm-filter-menu" role="menu" aria-label={t("models.bulkAria")}>
                   <button
                     type="button"
                     role="menuitem"
                     onClick={() => {
                       setBulkMenuOpen(false);
-                      if (api) void optimisticPicker.mutateMany(models.filter((model) => !nativeClientManaged(model)).map((model) => [model.slug, true] as const), "Show all router models", () => api.setPickerModels(true));
+                      if (api) void optimisticPicker.mutateMany(models.filter((model) => !nativeClientManaged(model)).map((model) => [model.slug, true] as const), t("models.action.showAll"), () => api.setPickerModels(true));
                     }}
                   >
-                    <span>Turn all on</span>
+                    <span>{t("models.turnAllOn")}</span>
                   </button>
                   <button
                     type="button"
                     role="menuitem"
                     onClick={() => {
                       setBulkMenuOpen(false);
-                      if (api) void optimisticPicker.mutateMany(models.filter((model) => !nativeClientManaged(model)).map((model) => [model.slug, false] as const), "Hide all router models", () => api.setPickerModels(false));
+                      if (api) void optimisticPicker.mutateMany(models.filter((model) => !nativeClientManaged(model)).map((model) => [model.slug, false] as const), t("models.action.hideAll"), () => api.setPickerModels(false));
                     }}
                   >
-                    <span>Turn all off</span>
+                    <span>{t("models.turnAllOff")}</span>
                   </button>
                 </div>
               ) : null}
             </div>
             <Button variant="primary" disabled={!api || !connectedProviderCount} onClick={() => openAddModels()}>
-              <Plus aria-hidden size={14} strokeWidth={1.9} /> Add models
+              <Plus aria-hidden size={14} strokeWidth={1.9} /> {t("models.addModels")}
             </Button>
           </div>
 
           {!connectedProviderCount && !families.length ? (
             <EmptyState
               icon={<Plus size={20} />}
-              title="Connect a provider to get started"
-              body="A provider is the account the router calls on your behalf. Connect one and its models appear here, ready to switch on."
-              action={<Button variant="primary" disabled={!api} onClick={() => setConnectMenuOpen(true)}>Connect provider</Button>}
+              title={t("models.connectToGetStarted")}
+              body={t("models.connectToGetStartedBody")}
+              action={<Button variant="primary" disabled={!api} onClick={() => setConnectMenuOpen(true)}>{t("models.connectProvider")}</Button>}
             />
           ) : readyRows.length || blockedRows.length || pendingSlugs.length ? (
             <>
@@ -900,7 +967,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
               {blockedRows.length ? (
                 <section className="pm-group" data-group="blocked">
                   <h3 className="pm-group-heading">
-                    <span>Needs a provider</span>
+                    <span>{t("models.needsProvider")}</span>
                     <small>{blockedRows.length}</small>
                   </h3>
                   <div className="pm-family-list">{blockedRows.map(renderRow)}</div>
@@ -910,10 +977,10 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
           ) : (
             <EmptyState
               icon={<SearchX size={20} />}
-              title="No models match"
+              title={t("models.noMatch")}
               body={modelSearch || statusFilter !== "all" || activeProviderFilter !== "all"
-                ? "Clear the search or the filters, or add models from a connected provider."
-                : "Add models from a connected provider to fill this list."}
+                ? t("models.noMatchFilteredBody")
+                : t("models.noMatchBody")}
             />
           )}
         </section>
@@ -939,6 +1006,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dat
 function ConnectionsBar({
   directory,
   enabledProviders,
+  pendingMutations,
   usageById,
   apiAvailable,
   platform,
@@ -961,6 +1029,7 @@ function ConnectionsBar({
 }: {
   directory: ProviderDirectoryEntry[];
   enabledProviders: Set<string>;
+  pendingMutations: ProviderMutations;
   usageById: Map<string, NonNullable<ProviderUsageSnapshot["providers"]>[number]>;
   apiAvailable: boolean;
   platform?: string;
@@ -981,6 +1050,7 @@ function ConnectionsBar({
   onAddNamedModel: (entry: ProviderDirectoryEntry) => void;
   onRemoveEndpointModel: (entry: ProviderDirectoryEntry, model: RouterModel) => void;
 }) {
+  const t = useI18n();
   const barRef = useRef<HTMLElement | null>(null);
   const setConnectMenuOpen = onConnectMenuOpen;
   // Every operator-added endpoint lives under the Custom container: one chip
@@ -989,8 +1059,17 @@ function ConnectionsBar({
   const endpoints = container ? directory.filter((entry) => entry.setup?.generic) : [];
   const chips = directory.filter((entry) => !endpoints.includes(entry));
   const isConnected = (entry: ProviderDirectoryEntry) => providerConnected(entry, enabledProviders) || (entry === container && endpoints.length > 0);
-  const connected = chips.filter(isConnected);
-  const available = chips.filter((entry) => !isConnected(entry));
+  // A custom endpoint is managed from inside the Custom chip, so a mutation on
+  // one of them has to surface on the container that stands for it.
+  const pendingOf = (entry: ProviderDirectoryEntry): ProviderMutation | undefined => pendingMutations[entry.id]
+    ?? (entry === container ? endpoints.map((endpoint) => pendingMutations[endpoint.id]).find(Boolean) : undefined);
+  // Placement is optimistic, the count is not: a provider whose key is still
+  // being published belongs where the operator will look for it, but it has
+  // not been proven connected yet.
+  const onStrip = (entry: ProviderDirectoryEntry) => isConnected(entry) || Boolean(pendingOf(entry));
+  const connected = chips.filter(onStrip);
+  const available = chips.filter((entry) => !onStrip(entry));
+  const connectedCount = chips.filter(isConnected).length;
   const openEndpoint = endpoints.find((entry) => entry.id === openProviderId);
 
   useEffect(() => {
@@ -1014,52 +1093,68 @@ function ConnectionsBar({
   }, [connectMenuOpen, onCloseProvider, onConnectMenuOpen, openProviderId]);
 
   return (
-    <section className="panel-section pm-connections" id="model-provider-directory" ref={barRef} aria-label="Provider connections">
+    <section className="panel-section pm-connections" id="model-provider-directory" ref={barRef} aria-label={t("models.providerConnectionsAria")}>
       <div className="pm-connections-label">
-        <strong>Connections</strong>
-        <small>{connected.length} of {chips.length} connected</small>
+        <strong>{t("models.connections")}</strong>
+        <small>{t("models.connectionsCount", { connected: connectedCount, total: chips.length })}</small>
       </div>
       <div className="pm-connections-chips">
-        {connected.map((entry) => (
-          <div className="pm-chip-wrap" key={entry.id}>
-            <button
-              type="button"
-              className="pm-chip"
-              data-state="connected"
-              aria-haspopup="dialog"
-              aria-expanded={openProviderId === entry.id || (entry === container && Boolean(openEndpoint))}
-              onClick={() => { setConnectMenuOpen(false); onOpenProvider(entry.id); }}
-            >
-              <ProviderLogo providerId={entry.id} displayName={entry.displayName} size="small" />
-              <span>{entry.displayName}</span>
-              <i className="pm-chip-dot" data-enabled={entry === container && endpoints.length ? endpoints.some(isEnabled) || (entry.models.length > 0 && isEnabled(entry)) : isEnabled(entry)} aria-hidden />
-            </button>
-            {[openProviderId === entry.id ? entry : entry === container ? openEndpoint : undefined].map((shown) => shown ? (
-              <ProviderMenu
-                key={shown.id}
-                entry={shown}
-                usage={usageById.get(shown.id)}
-                apiAvailable={apiAvailable}
-                platform={platform}
-                enabled={isEnabled(shown)}
-                endpoints={shown === container ? endpoints : undefined}
-                isEndpointEnabled={isEnabled}
-                onOpenEndpoint={onOpenProvider}
-                onBack={shown === openEndpoint ? () => onOpenProvider(entry.id) : undefined}
-                backLabel={entry.displayName}
-                onEnabledChange={(checked) => onEnabledChange(shown, checked)}
-                onSignIn={() => onSignIn(shown)}
-                onKey={() => onKey(shown)}
-                onRemove={() => onRemove(shown)}
-                onAddEndpoint={onAddEndpoint}
-                onEditEndpoint={() => onEditEndpoint(shown)}
-                onAddModels={() => onAddEndpointModels(shown)}
-                onAddNamedModel={() => onAddNamedModel(shown)}
-                onRemoveModel={(model) => onRemoveEndpointModel(shown, model)}
-              />
-            ) : null)}
-          </div>
-        ))}
+        {connected.map((entry) => {
+          const pending = pendingOf(entry);
+          return (
+            <div className="pm-chip-wrap" key={entry.id}>
+              <button
+                type="button"
+                className="pm-chip"
+                data-state={pending && !isConnected(entry) ? "connecting" : "connected"}
+                data-pending={pending || undefined}
+                aria-busy={pending ? true : undefined}
+                disabled={Boolean(pending)}
+                aria-haspopup="dialog"
+                aria-expanded={openProviderId === entry.id || (entry === container && Boolean(openEndpoint))}
+                onClick={() => { setConnectMenuOpen(false); onOpenProvider(entry.id); }}
+              >
+                <ProviderLogo providerId={entry.id} displayName={entry.displayName} size="small" />
+                <span>{entry.displayName}</span>
+                {/* The dot reports an account state this chip has not reached
+                    yet, so while the transaction runs its slot says what is
+                    running instead. */}
+                {pending ? (
+                  <span className="pm-chip-pending" role="status">
+                    <LoaderCircle className="spin" aria-hidden size={12} strokeWidth={2} />
+                    {pending === "disconnecting" ? t("models.connection.disconnecting") : t("models.connection.connecting")}
+                  </span>
+                ) : (
+                  <i className="pm-chip-dot" data-enabled={entry === container && endpoints.length ? endpoints.some(isEnabled) || (entry.models.length > 0 && isEnabled(entry)) : isEnabled(entry)} aria-hidden />
+                )}
+              </button>
+              {[openProviderId === entry.id ? entry : entry === container ? openEndpoint : undefined].map((shown) => shown ? (
+                <ProviderMenu
+                  key={shown.id}
+                  entry={shown}
+                  usage={usageById.get(shown.id)}
+                  apiAvailable={apiAvailable}
+                  platform={platform}
+                  enabled={isEnabled(shown)}
+                  endpoints={shown === container ? endpoints : undefined}
+                  isEndpointEnabled={isEnabled}
+                  onOpenEndpoint={onOpenProvider}
+                  onBack={shown === openEndpoint ? () => onOpenProvider(entry.id) : undefined}
+                  backLabel={entry.displayName}
+                  onEnabledChange={(checked) => onEnabledChange(shown, checked)}
+                  onSignIn={() => onSignIn(shown)}
+                  onKey={() => onKey(shown)}
+                  onRemove={() => onRemove(shown)}
+                  onAddEndpoint={onAddEndpoint}
+                  onEditEndpoint={() => onEditEndpoint(shown)}
+                  onAddModels={() => onAddEndpointModels(shown)}
+                  onAddNamedModel={() => onAddNamedModel(shown)}
+                  onRemoveModel={(model) => onRemoveEndpointModel(shown, model)}
+                />
+              ) : null)}
+            </div>
+          );
+        })}
         {available.length ? (
           <div className="pm-chip-wrap">
             <button
@@ -1070,10 +1165,10 @@ function ConnectionsBar({
               onClick={() => { onCloseProvider(); onConnectMenuOpen(!connectMenuOpen); }}
             >
               <Plus aria-hidden size={13} strokeWidth={2} />
-              <span>Connect provider</span>
+              <span>{t("models.connectProvider")}</span>
             </button>
             {connectMenuOpen ? (
-              <div className="pm-connect-menu" role="menu" aria-label="Providers you can connect">
+              <div className="pm-connect-menu" role="menu" aria-label={t("models.providersYouCanConnect")}>
                 {available.map((entry) => (
                   <button
                     key={entry.id}
@@ -1092,7 +1187,7 @@ function ConnectionsBar({
                   >
                     <ProviderLogo providerId={entry.id} displayName={entry.displayName} size="small" />
                     <span>{entry.displayName}</span>
-                    <small>{connectionMethod(entry)}</small>
+                    <small>{connectionMethod(entry, t)}</small>
                   </button>
                 ))}
               </div>
@@ -1145,13 +1240,14 @@ function ProviderMenu({
   onAddNamedModel: () => void;
   onRemoveModel: (model: RouterModel) => void;
 }) {
+  const t = useI18n();
   const setup = entry.setup;
   // The Custom container is a launcher, not an account: until it holds models
   // of its own there is nothing to switch off and no traffic to report.
   const launcher = setup?.kind === "per-model";
   const emptyLauncher = launcher && entry.models.length === 0;
   return (
-    <div className="pm-connection-menu" role="dialog" aria-label={`${entry.displayName} connection`}>
+    <div className="pm-connection-menu" role="dialog" aria-label={t("models.connection.dialog", { name: entry.displayName })}>
       {onBack ? (
         <button type="button" className="pm-connection-menu-back" onClick={onBack}>
           <ChevronLeft aria-hidden size={12} strokeWidth={1.8} /> {backLabel}
@@ -1161,40 +1257,40 @@ function ProviderMenu({
         <ProviderLogo providerId={entry.id} displayName={entry.displayName} size="large" />
         <div>
           <strong>{entry.displayName}</strong>
-          <small>{launcher ? launcherSummary(entry, endpoints?.length ?? 0) : connectionMethod(entry)}</small>
+          <small>{launcher ? launcherSummary(entry, endpoints?.length ?? 0, t) : connectionMethod(entry, t)}</small>
         </div>
       </div>
       <p className="pm-connection-menu-copy">
         {setup?.generic
-          ? `${setup.baseUrl} · ${setup.adapter === "openai-responses" ? "Responses API" : "Chat Completions"}${setup.hasKey ? "" : " · no API key"}`
+          ? `${setup.baseUrl} · ${setup.adapter === "openai-responses" ? "Responses API" : "Chat Completions"}${setup.hasKey ? "" : t("customEndpoint.noKeySuffix")}`
           : setup?.kind === "per-model"
-            ? "Add any OpenAI-compatible endpoint with its base URL and API key, then choose which of its models appear in the picker."
-            : setup?.planNote || connectionDetail(entry, usage?.account?.status, usage?.account?.message, platform === "darwin")}
+            ? t("customEndpoint.introduction")
+            : backendText(setup?.planNote, t) || connectionDetail(entry, t, usage?.account?.status, usage?.account?.message, platform === "darwin")}
       </p>
-      {usage?.requests && !emptyLauncher ? <small className="pm-connection-menu-usage">{usage.requests} {usage.requests === 1 ? "request" : "requests"} so far</small> : null}
+      {usage?.requests && !emptyLauncher ? <small className="pm-connection-menu-usage">{t(usage.requests === 1 ? "models.connection.oneRequestSoFar" : "models.connection.requestsSoFar", { count: usage.requests })}</small> : null}
       {setup ? (
         <>
           {emptyLauncher ? null : (
             <label className="pm-connection-menu-enable">
-              <span>Available to installed clients</span>
+              <span>{t("models.connection.available")}</span>
               <Toggle
                 checked={enabled}
                 disabled={!apiAvailable || !setup.configured}
-                label={`Make ${entry.displayName} available to installed clients`}
+                label={t("models.connection.makeAvailable", { name: entry.displayName })}
                 onChange={onEnabledChange}
               />
             </label>
           )}
           {setup.generic ? (
-            <div className="pm-endpoint-models" aria-label={`${entry.displayName} models`}>
+            <div className="pm-endpoint-models" aria-label={t("customEndpoint.modelsAria", { name: entry.displayName })}>
               <div className="pm-endpoint-models-head">
-                <strong>Models</strong>
+                <strong>{t("nav.models")}</strong>
                 <span className="pm-endpoint-models-buttons">
                   <Button variant="ghost" disabled={!apiAvailable || !setup.configured || setup.enabled === false} onClick={onAddModels}>
-                    <Plus aria-hidden size={13} strokeWidth={1.8} /> Add models
+                    <Plus aria-hidden size={13} strokeWidth={1.8} /> {t("models.addModels")}
                   </Button>
                   <Button variant="ghost" disabled={!apiAvailable || setup.enabled === false} onClick={onAddNamedModel}>
-                    <Pencil aria-hidden size={13} strokeWidth={1.8} /> By name
+                    <Pencil aria-hidden size={13} strokeWidth={1.8} /> {t("customEndpoint.byName")}
                   </Button>
                 </span>
               </div>
@@ -1210,8 +1306,8 @@ function ProviderMenu({
                         type="button"
                         className="pm-endpoint-model-remove"
                         disabled={!apiAvailable}
-                        aria-label={`Remove ${model.displayName}`}
-                        title="Remove this model"
+                        aria-label={t("customEndpoint.action.removeModel", { name: model.displayName })}
+                        title={t("customEndpoint.removeModel")}
                         onClick={() => onRemoveModel(model)}
                       >
                         <Trash2 aria-hidden size={13} strokeWidth={1.7} />
@@ -1220,13 +1316,13 @@ function ProviderMenu({
                   ))}
                 </ul>
               ) : (
-                <small>No models added yet.</small>
+                <small>{t("customEndpoint.noModels")}</small>
               )}
             </div>
           ) : null}
           {launcher && endpoints?.length ? (
-            <div className="pm-endpoint-models pm-endpoint-list" aria-label="Custom endpoints">
-              <div className="pm-endpoint-models-head"><strong>Endpoints</strong></div>
+            <div className="pm-endpoint-models pm-endpoint-list" aria-label={t("customEndpoint.listAria")}>
+              <div className="pm-endpoint-models-head"><strong>{t("customEndpoint.listTitle")}</strong></div>
               <ul>
                 {endpoints.map((endpoint) => (
                   <li key={endpoint.id}>
@@ -1234,7 +1330,7 @@ function ProviderMenu({
                       <i className="pm-chip-dot" data-enabled={isEndpointEnabled(endpoint)} aria-hidden />
                       <div>
                         <span>{endpoint.displayName}</span>
-                        <small>{endpoint.setup?.baseUrl} · {endpoint.models.length} {endpoint.models.length === 1 ? "model" : "models"}</small>
+                        <small>{endpoint.setup?.baseUrl} · {t(endpoint.models.length === 1 ? "customEndpoint.modelCountOne" : "customEndpoint.modelCount", { count: endpoint.models.length })}</small>
                       </div>
                       <ChevronRight aria-hidden size={12} strokeWidth={1.8} />
                     </button>
@@ -1246,33 +1342,33 @@ function ProviderMenu({
           <div className="pm-connection-menu-actions" data-solo={launcher}>
             {setup.generic ? (
               <Button variant="ghost" disabled={!apiAvailable} onClick={onEditEndpoint}>
-                <Pencil aria-hidden size={14} strokeWidth={1.7} /> Edit endpoint
+                <Pencil aria-hidden size={14} strokeWidth={1.7} /> {t("customEndpoint.edit")}
               </Button>
             ) : null}
             {setup.kind === "oauth" || setup.signIn ? (
               <Button
                 variant="ghost"
                 disabled={!apiAvailable || setup.action === "blocked" || (entry.id !== "antigravity-oauth" && platform !== "darwin")}
-                title={entry.id === "antigravity-oauth" || platform === "darwin" ? undefined : "Open the provider CLI in your own terminal on Windows or Linux."}
+                title={entry.id === "antigravity-oauth" || platform === "darwin" ? undefined : t("models.connection.terminalOnly")}
                 onClick={onSignIn}
               >
                 <LogIn aria-hidden size={14} strokeWidth={1.7} />
-                {setup.action === "probe" ? "Run live test" : setup.configured ? "Sign in again" : "Open sign-in"}
+                {setup.action === "probe" ? t("models.connection.runLiveTest") : setup.configured ? t("models.connection.signInAgain") : t("models.connection.openSignIn")}
               </Button>
             ) : null}
             {setup.kind === "per-model" ? (
               <Button variant="secondary" disabled={!apiAvailable} onClick={onAddEndpoint}>
-                <Plus aria-hidden size={14} strokeWidth={1.7} /> Add endpoint
+                <Plus aria-hidden size={14} strokeWidth={1.7} /> {t("customEndpoint.add")}
               </Button>
             ) : null}
             {setup.kind === "api" && entry.id !== "local" ? (
               <Button variant="ghost" disabled={!apiAvailable} onClick={onKey}>
-                <KeyRound aria-hidden size={14} strokeWidth={1.7} /> {setup.configured ? "Replace key" : "Add key"}
+                <KeyRound aria-hidden size={14} strokeWidth={1.7} /> {setup.configured ? t("models.connection.replaceKey") : t("models.connection.addKey")}
               </Button>
             ) : null}
             {((setup.kind === "api" && setup.configured) || setup.disconnectable) && entry.id !== "local" ? (
               <Button variant="ghost" disabled={!apiAvailable} onClick={onRemove}>
-                <Trash2 aria-hidden size={14} strokeWidth={1.7} /> {setup.generic ? "Remove endpoint" : "Disconnect"}
+                <Trash2 aria-hidden size={14} strokeWidth={1.7} /> {setup.generic ? t("customEndpoint.remove") : t("models.disconnect.confirm")}
               </Button>
             ) : null}
           </div>
@@ -1290,6 +1386,7 @@ function ModelFamilyRow({
   expanded,
   onToggleExpanded,
   apiAvailable,
+  isConnecting,
   providerNames,
   pickerValue,
   subagentValue,
@@ -1299,6 +1396,7 @@ function ModelFamilyRow({
   onSubagent,
   onEffort,
   onConnect,
+  onRemoveLocal,
 }: {
   family: ModelFamily;
   usable: RouterModel[];
@@ -1307,6 +1405,7 @@ function ModelFamilyRow({
   expanded: boolean;
   onToggleExpanded: () => void;
   apiAvailable: boolean;
+  isConnecting: (providerId: string) => boolean;
   providerNames: Map<string, string>;
   pickerValue: (model: RouterModel) => boolean;
   subagentValue: (model: RouterModel) => boolean;
@@ -1316,12 +1415,15 @@ function ModelFamilyRow({
   onSubagent: (model: RouterModel, enabled: boolean) => void;
   onEffort: (model: RouterModel, effort: string) => void;
   onConnect: (providerId: string) => void;
+  onRemoveLocal: (model: RouterModel) => void;
 }) {
+  const t = useI18n();
   const preferred = preferredFamilyRoute(family);
   const maker = brandForModel(preferred);
   const providerIds = [...new Set(family.routes.map((model) => model.provider))];
   const multiRoute = family.routes.length > 1;
   const blocked = usable.length === 0;
+  const connecting = providerIds.some(isConnecting);
   const managedByClient = usable.length > 0 && usable.every(nativeClientManaged);
   const triggerId = `family-trigger-${safeId(family.id)}`;
   const panelId = `family-panel-${safeId(family.id)}`;
@@ -1329,15 +1431,15 @@ function ModelFamilyRow({
   // One muted line under the name instead of a row of columns. Reading left to
   // right beats hunting the same fact in four different x-positions.
   const facts = [
-    providerIds.length > 1 ? `${providerIds.length} providers` : providerNames.get(providerIds[0]) || maker.name,
-    preferred?.contextWindow ? formatContext(preferred.contextWindow) : undefined,
-    family.routes.some((model) => model.inputModalities?.includes("image")) ? "Text + image" : "Text",
-    family.routes.some((model) => model.isFree) ? "Free" : undefined,
-    multiRoute ? `${family.routes.length} routes` : undefined,
+    providerIds.length > 1 ? t("models.fact.providers", { count: providerIds.length }) : providerNames.get(providerIds[0]) || maker.name,
+    preferred?.contextWindow ? formatContext(preferred.contextWindow, t) : undefined,
+    family.routes.some((model) => model.inputModalities?.includes("image")) ? t("models.fact.textImage") : t("models.fact.text"),
+    family.routes.some((model) => model.isFree) ? t("models.fact.free") : undefined,
+    multiRoute ? t("models.fact.routes", { count: family.routes.length }) : undefined,
   ].filter(Boolean);
 
   return (
-    <article className="pm-family-row" data-expanded={expanded} data-on={on} data-blocked={blocked}>
+    <article className="pm-family-row" data-expanded={expanded} data-on={on} data-blocked={blocked} data-connecting={connecting || undefined}>
       <div className="pm-family-summary">
         <button
           id={triggerId}
@@ -1357,17 +1459,19 @@ function ModelFamilyRow({
           </span>
         </button>
         <div className="pm-family-action">
-          {blocked ? (
+          {blocked && connecting ? (
+            <ConnectingSlot />
+          ) : blocked ? (
             <Button variant="secondary" disabled={!apiAvailable} onClick={() => onConnect(providerIds[0])}>
-              {providerIds.length > 1 ? "Connect a provider" : `Connect ${providerNames.get(providerIds[0]) || providerIds[0]}`}
+              {providerIds.length > 1 ? t("models.family.connectProvider") : t("models.family.connectName", { name: providerNames.get(providerIds[0]) || providerIds[0] })}
             </Button>
           ) : (
             <>
-              <span className="pm-family-state" aria-hidden>{on ? "On" : "Off"}</span>
+              <span className="pm-family-state" aria-hidden>{on ? t("models.status.on") : t("models.status.off")}</span>
               <Toggle
                 checked={on}
                 disabled={!apiAvailable || managedByClient}
-                label={managedByClient ? `${family.displayName} is managed by Codex` : `Use ${family.displayName} in Codex`}
+                label={managedByClient ? t("models.family.managedByCodex", { name: family.displayName }) : t("models.family.useInCodex", { name: family.displayName })}
                 onChange={onFamilyPicker}
               />
             </>
@@ -1378,25 +1482,30 @@ function ModelFamilyRow({
         {multiRoute ? (
           <>
             <div className="pm-family-route-note">
-              The same model reaches you through more than one account. Each one has its own credential, quota, and pricing.
+              {t("models.family.multiRouteNote")}
             </div>
             {/* Labelling every row cost 12 words for 4 switches, and every row
                 sized its own columns so nothing lined up down the list. One
                 header, one shared grid. */}
-            <div className="pm-route-table" role="list" aria-label={`${family.displayName} routes`}>
+            {/* The actions column exists only for a family that actually has a
+                locally curated route, so an all-checked-in family keeps the
+                column widths it had before removal was possible. */}
+            <div className="pm-route-table" role="list" data-removable={family.routes.some((model) => model.local) || undefined} aria-label={t("models.family.routesAria", { name: family.displayName })}>
               <div className="pm-route-head" aria-hidden="true">
-                <span>Account</span>
-                <span>Context</span>
-                <span>Input</span>
-                <span>In picker</span>
-                <span>Subagents</span>
-                <span>Thinking</span>
+                <span>{t("models.route.account")}</span>
+                <span>{t("models.route.context")}</span>
+                <span>{t("models.route.input")}</span>
+                <span>{t("models.route.inPicker")}</span>
+                <span>{t("models.route.subagents")}</span>
+                <span>{t("models.route.thinking")}</span>
+                {family.routes.some((model) => model.local) ? <span /> : null}
               </div>
               {family.routes.map((model) => (
                 <ModelRouteRow
                   key={model.slug}
                   model={model}
-                  providerName={providerNames.get(model.provider) || providerDisplayName(model.provider)}
+                  providerName={providerNames.get(model.provider) || providerDisplayName(model.provider, t)}
+                  connecting={isConnecting(model.provider)}
                   pickerVisible={pickerValue(model)}
                   selectedInSettings={subagentValue(model)}
                   subagentEffort={effortValue(model)}
@@ -1405,6 +1514,7 @@ function ModelFamilyRow({
                   onSubagentChange={(checked) => onSubagent(model, checked)}
                   onEffortChange={(effort) => onEffort(model, effort)}
                   onConnect={() => onConnect(model.provider)}
+                  onRemove={() => onRemoveLocal(model)}
                 />
               ))}
             </div>
@@ -1415,12 +1525,13 @@ function ModelFamilyRow({
           // the panel carries only what the summary had to leave out.
           <ModelDetails
             model={family.routes[0]}
-            providerName={providerNames.get(family.routes[0].provider) || providerDisplayName(family.routes[0].provider)}
+            providerName={providerNames.get(family.routes[0].provider) || providerDisplayName(family.routes[0].provider, t)}
             selectedInSettings={subagentValue(family.routes[0])}
             subagentEffort={effortValue(family.routes[0])}
             apiAvailable={apiAvailable}
             onSubagentChange={(checked) => onSubagent(family.routes[0], checked)}
             onEffortChange={(effort) => onEffort(family.routes[0], effort)}
+            onRemove={() => onRemoveLocal(family.routes[0])}
           />
         )}
       </div>
@@ -1436,6 +1547,7 @@ function ModelDetails({
   apiAvailable,
   onSubagentChange,
   onEffortChange,
+  onRemove,
 }: {
   model: RouterModel;
   providerName: string;
@@ -1444,20 +1556,22 @@ function ModelDetails({
   apiAvailable: boolean;
   onSubagentChange: (checked: boolean) => void;
   onEffortChange: (effort: string) => void;
+  onRemove: () => void;
 }) {
+  const t = useI18n();
   return (
     <dl className="pm-model-details">
       <div>
-        <dt>Model id</dt>
+        <dt>{t("models.details.modelId")}</dt>
         <dd className="pm-model-details-mono">{model.slug}</dd>
       </div>
       <div>
-        <dt>Route</dt>
+        <dt>{t("models.details.route")}</dt>
         <dd>{providerName} · {modelRouteKind(model)}</dd>
       </div>
       {routeUsable(model) ? (
         <div>
-          <dt>Subagents</dt>
+          <dt>{t("models.details.subagents")}</dt>
           {/* The effort popup extends below this definition-list cell. Keep
               this cell visibly overflowing; the generic text cells still
               ellipsize long ids and route descriptions. */}
@@ -1483,10 +1597,23 @@ function ModelDetails({
         </div>
       ) : (
         <div>
-          <dt>Status</dt>
-          <dd>Connect {providerName} to use this route.</dd>
+          <dt>{t("models.details.status")}</dt>
+          <dd>{t("models.details.connectToUse", { name: providerName })}</dd>
         </div>
       )}
+      {/* A single-route family never renders the route table, so without this
+          the only locally curated models that could be deleted would be the
+          ones that happen to share a name with other routes. */}
+      {model.local ? (
+        <div>
+          <dt>{t("models.details.curation")}</dt>
+          <dd>
+            <Button variant="secondary" disabled={!apiAvailable} onClick={onRemove}>
+              <Trash2 aria-hidden size={13} strokeWidth={1.7} /> {t("models.local.remove")}
+            </Button>
+          </dd>
+        </div>
+      ) : null}
     </dl>
   );
 }
@@ -1500,18 +1627,19 @@ function ModelDetails({
 // A registry-proven route and one the operator chose look the same here on
 // purpose: both are spawnable, and which of the two it is belongs in the
 // application record, not in front of someone picking a model.
-function subagentControl(model: RouterModel, selectedInSettings: boolean) {
+function subagentControl(model: RouterModel, selectedInSettings: boolean, t: Translate) {
   return {
     checked: selectedInSettings,
     hint: subagentCertification(model) === "v2"
-      ? "Codex can spawn subagents on this route."
-      : "Switch on to let Codex spawn subagents on this route. Verify it with an agent check before relying on it.",
+      ? t("models.subagent.v2Hint")
+      : t("models.subagent.enableHint"),
   };
 }
 
 function ModelRouteRow({
   model,
   providerName,
+  connecting,
   pickerVisible,
   selectedInSettings,
   subagentEffort,
@@ -1520,9 +1648,11 @@ function ModelRouteRow({
   onSubagentChange,
   onEffortChange,
   onConnect,
+  onRemove,
 }: {
   model: RouterModel;
   providerName: string;
+  connecting: boolean;
   pickerVisible: boolean;
   selectedInSettings: boolean;
   subagentEffort: string;
@@ -1531,36 +1661,44 @@ function ModelRouteRow({
   onSubagentChange: (checked: boolean) => void;
   onEffortChange: (effort: string) => void;
   onConnect: () => void;
+  onRemove: () => void;
 }) {
+  const t = useI18n();
   const identity = (
     <div className="pm-route-identity">
       <ProviderLogo providerId={model.provider} displayName={providerName} size="medium" />
       <div>
         <strong>{providerName}</strong>
-        {model.isFree ? <span className="pm-route-free">Free</span> : null}
+        {model.isFree ? <span className="pm-route-free">{t("models.fact.free")}</span> : null}
+        {/* Says why this one route can be deleted when its neighbours cannot:
+            the operator curated it locally, so nothing this checkout ships is
+            at stake. */}
+        {model.local ? <span className="pm-route-local">{t("models.fact.local")}</span> : null}
         <small title={model.slug}>{model.slug}</small>
       </div>
     </div>
   );
-  const context = model.contextWindow ? formatContext(model.contextWindow) : "—";
-  const input = model.inputModalities?.includes("image") ? "Text + image" : "Text";
+  const context = model.contextWindow ? formatContext(model.contextWindow, t) : "—";
+  const input = model.inputModalities?.includes("image") ? t("models.fact.textImage") : t("models.fact.text");
 
   if (!routeUsable(model)) {
     return (
-      <article className="pm-route-row" role="listitem" data-availability="known">
+      <article className="pm-route-row" role="listitem" data-availability="known" data-connecting={connecting || undefined}>
         {identity}
         <span className="pm-route-cell">{context}</span>
         <span className="pm-route-cell">{input}</span>
         {/* The same slot the switches occupy, so the right edge answers one
             question all the way down: what can I do with this route. */}
         <span className="pm-route-cell pm-route-connect">
-          <Button variant="secondary" disabled={!apiAvailable} onClick={onConnect}>Connect {providerName}</Button>
+          {connecting
+            ? <ConnectingSlot />
+            : <Button variant="secondary" disabled={!apiAvailable} onClick={onConnect}>{t("models.family.connectName", { name: providerName })}</Button>}
         </span>
       </article>
     );
   }
 
-  const subagent = subagentControl(model, selectedInSettings);
+  const subagent = subagentControl(model, selectedInSettings, t);
   return (
     <article className="pm-route-row" role="listitem" data-subagent={subagent.checked ? "enabled" : "disabled"}>
       {identity}
@@ -1570,7 +1708,7 @@ function ModelRouteRow({
         <Toggle
           checked={pickerVisible}
           disabled={!apiAvailable || nativeClientManaged(model)}
-          label={nativeClientManaged(model) ? `${model.displayName} is managed by Codex` : `Show ${model.displayName} through ${providerName} in the picker`}
+          label={nativeClientManaged(model) ? t("models.family.managedByCodex", { name: model.displayName }) : t("models.route.pickerLabel", { model: model.displayName, provider: providerName })}
           onChange={onPickerChange}
         />
       </span>
@@ -1593,6 +1731,20 @@ function ModelRouteRow({
           onEffortChange={onEffortChange}
         />
       </span>
+      {model.local ? (
+        <span className="pm-route-cell pm-route-remove">
+          <button
+            type="button"
+            className="pm-endpoint-model-remove"
+            disabled={!apiAvailable}
+            aria-label={t("models.local.removeAction", { model: model.displayName, provider: providerName })}
+            title={t("models.local.remove")}
+            onClick={onRemove}
+          >
+            <Trash2 aria-hidden size={13} strokeWidth={1.7} />
+          </button>
+        </span>
+      ) : null}
     </article>
   );
 }
@@ -1615,16 +1767,17 @@ function SubagentToggle({
   apiAvailable: boolean;
   onSubagentChange: (checked: boolean) => void;
 }) {
-  const subagent = subagentControl(model, selectedInSettings);
+  const t = useI18n();
+  const subagent = subagentControl(model, selectedInSettings, t);
   return (
     <div className="pm-model-control" title={subagent.hint}>
       <Toggle
         checked={subagent.checked}
         disabled={!apiAvailable}
-        label={`Use ${model.displayName} through ${providerName} as a subagent`}
+        label={t("models.route.subagentLabel", { model: model.displayName, provider: providerName })}
         onChange={onSubagentChange}
       />
-      <span>{subagent.checked ? "On" : "Off"}</span>
+      <span>{subagent.checked ? t("models.status.on") : t("models.status.off")}</span>
     </div>
   );
 }
@@ -1648,6 +1801,7 @@ function SubagentEffort({
   apiAvailable: boolean;
   onEffortChange: (effort: string) => void;
 }) {
+  const t = useI18n();
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const effortOptions = model.reasoningLevels ?? [];
@@ -1681,11 +1835,11 @@ function SubagentEffort({
         className="pm-effort-trigger"
         aria-haspopup="menu"
         aria-expanded={open}
-        aria-label={`${model.displayName} ${providerName} subagent thinking effort`}
+        aria-label={t("models.route.subagentEffortAria", { model: model.displayName, provider: providerName })}
         disabled={!apiAvailable}
         onClick={() => setOpen((current) => !current)}
       >
-        <span>{effortLabel(subagentEffort)}</span>
+        <span>{effortLabel(subagentEffort, t)}</span>
         <ChevronDown aria-hidden size={12} strokeWidth={1.8} className={open ? "is-open" : ""} />
       </button>
       {open ? (
@@ -1702,7 +1856,7 @@ function SubagentEffort({
                 if (effort !== subagentEffort) onEffortChange(effort);
               }}
             >
-              <span>{effortLabel(effort)}</span>
+              <span>{effortLabel(effort, t)}</span>
               {subagentEffort === effort ? <Check aria-hidden size={13} strokeWidth={1.9} /> : null}
             </button>
           ))}
@@ -1712,11 +1866,26 @@ function SubagentEffort({
   );
 }
 
+// What stands in the action slot of a row whose provider is mid-connection. It
+// names what is happening and leaves a blank exactly where the control that
+// does not exist yet will go, so the wait reads as the switch being prepared
+// rather than as a button that stopped working.
+function ConnectingSlot() {
+  const t = useI18n();
+  return (
+    <span className="pm-connecting" role="status">
+      <small>{t("models.connection.connecting")}</small>
+      <SkeletonBlock className="pm-pending-control" />
+    </span>
+  );
+}
+
 // Placeholder rows for models being published to the picker. They carry the
 // slug rather than a bare shimmer: the operator picked those names a moment
 // ago, and seeing them is what says the click landed on the right ones. Only
 // the controls that do not exist yet are left as blanks.
 function PendingModelRows({ slugs }: { slugs: string[] }) {
+  const t = useI18n();
   if (!slugs.length) return null;
   return (
     <>
@@ -1726,7 +1895,7 @@ function PendingModelRows({ slugs }: { slugs: string[] }) {
             <SkeletonBlock className="pm-pending-logo" />
             <div>
               <strong>{slug}</strong>
-              <small>Adding…</small>
+              <small>{t("models.pending.adding")}</small>
             </div>
           </div>
           <div className="pm-pending-meta" aria-hidden="true">
@@ -1739,10 +1908,6 @@ function PendingModelRows({ slugs }: { slugs: string[] }) {
       ))}
     </>
   );
-}
-
-function effortLabel(effort: string): string {
-  return effort === "default" ? "Default" : effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
 // One place to add a model, searching every connected provider at once. The
@@ -1771,6 +1936,7 @@ function AddModelsDialog({
   onAdd: (selection: CatalogModel[]) => void;
   onClose: () => void;
 }) {
+  const t = useI18n();
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [shownLimit, setShownLimit] = useState(120);
@@ -1816,35 +1982,35 @@ function AddModelsDialog({
   return (
     <Dialog
       open={open}
-      title="Add models"
-      description="Everything your connected providers offer. Adding a model makes it available to the router; use the picker switch to show it in your clients."
+      title={t("models.add.title")}
+      description={t("models.add.description")}
       onClose={onClose}
     >
       <div className="pm-add-models">
         <div className="pm-add-models-toolbar">
-          <SearchField value={query} onChange={setQuery} placeholder="Search every connected provider" />
+          <SearchField value={query} onChange={setQuery} placeholder={t("models.add.search")} />
           <span className="pm-results-count" aria-live="polite">
             {loading
-              ? "Loading catalogs"
-              : `${matching.length} of ${catalogModels.length} models${lastRead ? ` · read ${formatDateTime(lastRead)}` : ""}`}
+              ? t("models.add.loadingCatalogs")
+              : `${t("models.add.count", { shown: matching.length, total: catalogModels.length })}${lastRead ? t("models.add.read", { time: formatDateTime(lastRead, t) }) : ""}`}
           </span>
           <Button variant="ghost" disabled={disabled || loading} onClick={onReload}>
-            {loading ? "Asking providers" : "Reload"}
+            {loading ? t("models.add.asking") : t("models.add.reload")}
           </Button>
         </div>
 
-        {loading && !catalogModels.length ? <CatalogSkeleton label="Loading provider catalogs" /> : null}
+        {loading && !catalogModels.length ? <CatalogSkeleton label={t("models.add.loadingProviderCatalogs")} /> : null}
 
         {!loading && !catalogModels.length ? (
           <EmptyState
             icon={<SearchX size={20} />}
-            title={errors.length ? "Catalogs could not be loaded" : "No catalogs available"}
-            body={errors[0]?.error || "Connect a provider that publishes a model catalog, then reload."}
+            title={errors.length ? t("models.add.catalogsFailed") : t("models.add.noCatalogs")}
+            body={errors[0]?.error || t("models.add.noCatalogsBody")}
           />
         ) : null}
 
         {shown.length ? (
-          <div className="pm-add-models-list" role="list" aria-label="Provider catalog models">
+          <div className="pm-add-models-list" role="list" aria-label={t("models.add.catalogAria")}>
             {shown.map((model) => {
               const adding = (pendingModels[model.providerId]?.[model.modelId] ?? 0) > 0;
               const checked = model.registered || selectedKeys.has(model.key);
@@ -1873,12 +2039,12 @@ function AddModelsDialog({
                   </div>
                   <span className="pm-add-models-provider">{model.providerName}</span>
                   <div className="pm-add-models-meta">
-                    {model.contextWindow ? <span>{formatContext(model.contextWindow)}</span> : null}
-                    {model.isFree ? <Badge tone="success">Free</Badge> : null}
+                    {model.contextWindow ? <span>{formatContext(model.contextWindow, t)}</span> : null}
+                    {model.isFree ? <Badge tone="success">{t("models.add.free")}</Badge> : null}
                   </div>
-                  {adding ? <Badge tone="neutral">Adding</Badge>
-                    : model.registered ? <Badge tone="neutral">Added</Badge>
-                    : blocked ? <Badge tone="neutral">Not yet supported</Badge>
+                  {adding ? <Badge tone="neutral">{t("models.add.adding")}</Badge>
+                    : model.registered ? <Badge tone="neutral">{t("models.add.added")}</Badge>
+                    : blocked ? <Badge tone="neutral">{t("models.add.notSupported")}</Badge>
                     : null}
                 </label>
               );
@@ -1888,26 +2054,26 @@ function AddModelsDialog({
 
         {matching.length > shown.length ? (
           <div className="pm-add-models-more">
-            <span>{matching.length - shown.length} more models</span>
-            <Button variant="ghost" onClick={() => setShownLimit((current) => current + 120)}>Show 120 more</Button>
+            <span>{t("models.add.moreModels", { count: matching.length - shown.length })}</span>
+            <Button variant="ghost" onClick={() => setShownLimit((current) => current + 120)}>{t("models.add.showMore")}</Button>
           </div>
         ) : null}
 
         {catalogModels.length && !matching.length ? (
-          <div className="pm-add-models-empty">No catalog model matches this search.</div>
+          <div className="pm-add-models-empty">{t("models.add.noMatch")}</div>
         ) : null}
 
         <div className="dialog-actions">
           <span className="pm-add-models-hint">
-            Lists are stored locally and re-read in the background once a day. Up to {CATALOG_ADD_BATCH_LIMIT} at a time.
+            {t("models.add.hint", { limit: CATALOG_ADD_BATCH_LIMIT })}
           </span>
-          <Button variant="secondary" onClick={onClose}>Cancel</Button>
+          <Button variant="secondary" onClick={onClose}>{t("models.add.cancel")}</Button>
           <Button
             variant="primary"
             disabled={disabled || !selectedModels.length}
             onClick={() => { onAdd(selectedModels); setSelected([]); onClose(); }}
           >
-            {selectedModels.length ? `Add ${selectedModels.length} model${selectedModels.length === 1 ? "" : "s"}` : "Add models"}
+            {selectedModels.length ? t("models.add.addCount", { count: selectedModels.length, word: t(selectedModels.length === 1 ? "models.add.model" : "models.add.models") }) : t("models.addModels")}
           </Button>
         </div>
       </div>
@@ -1916,6 +2082,7 @@ function AddModelsDialog({
 }
 
 function CredentialDialog({ provider, onSave, onClose }: { provider: ProviderSetup | null; onSave: (provider: ProviderSetup, secret: string) => Promise<void>; onClose: () => void }) {
+  const t = useI18n();
   const [credential, setCredential] = useState("");
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -1927,19 +2094,20 @@ function CredentialDialog({ provider, onSave, onClose }: { provider: ProviderSet
   }
   function close() { setCredential(""); onClose(); }
   return (
-    <Dialog open={Boolean(provider)} title={provider?.configured ? `Replace ${provider.displayName} credential` : `Connect ${provider?.displayName || "provider"}`} description="The secret is sent once to the router's hidden standard-input prompt. It is never added to a command." onClose={close}>
+    <Dialog open={Boolean(provider)} title={provider?.configured ? t("models.credential.replace", { name: provider.displayName }) : t("models.credential.connect", { name: provider?.displayName || t("models.credential.provider") })} description={t("models.credential.description")} onClose={close}>
       <form className="pm-credential-form" onSubmit={(event) => void submit(event)}>
         {provider ? <div className="pm-credential-provider"><ProviderLogo providerId={provider.id} displayName={provider.displayName} size="large" /><div><strong>{provider.displayName}</strong><small>{provider.id}</small></div></div> : null}
-        <label htmlFor="provider-credential">{provider?.credentialLabel || "API key"}</label>
-        <input id="provider-credential" type="password" value={credential} onChange={(event) => setCredential(event.target.value)} autoComplete="off" spellCheck={false} placeholder="Enter credential" autoFocus />
-        <p><Link2 aria-hidden size={13} strokeWidth={1.7} /> The value is not placed in logs, command arguments, localStorage, or saved renderer state.</p>
-        <div className="dialog-actions"><Button type="button" variant="secondary" onClick={close}>Cancel</Button><Button type="submit" variant="primary" disabled={!credential.trim()}>Save credential</Button></div>
+        <label htmlFor="provider-credential">{backendText(provider?.credentialLabel, t) || t("models.credential.apiKey")}</label>
+        <input id="provider-credential" type="password" value={credential} onChange={(event) => setCredential(event.target.value)} autoComplete="off" spellCheck={false} placeholder={t("models.credential.placeholder")} autoFocus />
+        <p><Link2 aria-hidden size={13} strokeWidth={1.7} /> {t("models.credential.note")}</p>
+        <div className="dialog-actions"><Button type="button" variant="secondary" onClick={close}>{t("models.add.cancel")}</Button><Button type="submit" variant="primary" disabled={!credential.trim()}>{t("models.credential.save")}</Button></div>
       </form>
     </Dialog>
   );
 }
 
 function NamedModelDialog({ provider, onSave, onClose }: { provider: ProviderSetup | null; onSave: (provider: ProviderSetup, modelId: string) => Promise<void>; onClose: () => void }) {
+  const t = useI18n();
   const [modelId, setModelId] = useState("");
   const trimmed = modelId.trim();
   function close() { setModelId(""); onClose(); }
@@ -1954,15 +2122,15 @@ function NamedModelDialog({ provider, onSave, onClose }: { provider: ProviderSet
   return (
     <Dialog
       open={Boolean(provider)}
-      title="Add a model by name"
-      description="For a model the endpoint does not list, such as a private or preview one. Type the id exactly as the provider gave it to you; nothing checks it against their catalog."
+      title={t("customEndpoint.named.title")}
+      description={t("customEndpoint.named.description")}
       onClose={close}
     >
       <form className="pm-credential-form" onSubmit={(event) => void submit(event)}>
-        <label htmlFor="named-model-id">Model id</label>
+        <label htmlFor="named-model-id">{t("models.details.modelId")}</label>
         <input id="named-model-id" value={modelId} onChange={(event) => setModelId(event.target.value)} autoComplete="off" spellCheck={false} placeholder="provider-model-id" autoFocus />
-        <p><Link2 aria-hidden size={13} strokeWidth={1.7} /> It joins the picker as {provider ? `${provider.id}/` : ""}{trimmed || "<model id>"}. A wrong id fails on its first request, and you can remove it here.</p>
-        <div className="dialog-actions"><Button type="button" variant="secondary" onClick={close}>Cancel</Button><Button type="submit" variant="primary" disabled={!trimmed}>Add model</Button></div>
+        <p><Link2 aria-hidden size={13} strokeWidth={1.7} /> {t("customEndpoint.named.note", { model: `${provider ? `${provider.id}/` : ""}${trimmed || t("customEndpoint.named.placeholder")}` })}</p>
+        <div className="dialog-actions"><Button type="button" variant="secondary" onClick={close}>{t("models.add.cancel")}</Button><Button type="submit" variant="primary" disabled={!trimmed}>{t("customEndpoint.named.add")}</Button></div>
       </form>
     </Dialog>
   );
@@ -1971,6 +2139,7 @@ function NamedModelDialog({ provider, onSave, onClose }: { provider: ProviderSet
 type CustomEndpointInput = { displayName: string; baseUrl: string; adapter: "openai-chat" | "openai-responses"; credential?: string };
 
 function CustomEndpointDialog({ open, editing, onSave, onClose }: { open: boolean; editing: ProviderSetup | null; onSave: (endpoint: CustomEndpointInput, editing: ProviderSetup | null) => Promise<void>; onClose: () => void }) {
+  const t = useI18n();
   const [displayName, setDisplayName] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [adapter, setAdapter] = useState<CustomEndpointInput["adapter"]>("openai-chat");
@@ -2005,26 +2174,26 @@ function CustomEndpointDialog({ open, editing, onSave, onClose }: { open: boolea
   return (
     <Dialog
       open={open}
-      title={editing ? `Edit ${editing.displayName}` : "Add custom endpoint"}
+      title={editing ? t("customEndpoint.form.editTitle", { name: editing.displayName }) : t("customEndpoint.form.addTitle")}
       description={editing
-        ? `Model names keep their ${editing.id}/ prefix, so models you already added stay where they are.`
-        : "Any OpenAI-compatible API. After saving, choose which of its models appear in the picker; each is named after this endpoint so it never clashes with another provider's."}
+        ? t("customEndpoint.form.editDescription", { prefix: `${editing.id}/` })
+        : t("customEndpoint.form.addDescription")}
       onClose={close}
     >
       <form className="pm-credential-form" onSubmit={(event) => void submit(event)}>
-        <label htmlFor="custom-endpoint-name">Name</label>
-        <input id="custom-endpoint-name" value={displayName} onChange={(event) => setDisplayName(event.target.value)} autoComplete="off" spellCheck={false} placeholder="My provider" maxLength={120} autoFocus />
-        <label htmlFor="custom-endpoint-url">Base URL</label>
+        <label htmlFor="custom-endpoint-name">{t("customEndpoint.form.name")}</label>
+        <input id="custom-endpoint-name" value={displayName} onChange={(event) => setDisplayName(event.target.value)} autoComplete="off" spellCheck={false} placeholder={t("customEndpoint.form.namePlaceholder")} maxLength={120} autoFocus />
+        <label htmlFor="custom-endpoint-url">{t("customEndpoint.form.baseUrl")}</label>
         <input id="custom-endpoint-url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} autoComplete="off" spellCheck={false} placeholder="https://api.example.com/v1" />
-        <label htmlFor="custom-endpoint-adapter">API format</label>
+        <label htmlFor="custom-endpoint-adapter">{t("customEndpoint.form.format")}</label>
         <select id="custom-endpoint-adapter" value={adapter} onChange={(event) => setAdapter(event.target.value as CustomEndpointInput["adapter"])}>
           <option value="openai-chat">Chat Completions (/chat/completions)</option>
           <option value="openai-responses">Responses (/responses)</option>
         </select>
-        <label htmlFor="custom-endpoint-key">API key</label>
-        <input id="custom-endpoint-key" type="password" value={credential} onChange={(event) => setCredential(event.target.value)} autoComplete="off" spellCheck={false} placeholder={editing ? (editing.hasKey ? "Leave empty to keep the current key" : "Leave empty to stay keyless") : "Leave empty for a keyless local server"} />
-        <p><Link2 aria-hidden size={13} strokeWidth={1.7} /> The key is sent once to the router over standard input and stored in its protected local credential file. It is never placed in logs or command arguments.</p>
-        <div className="dialog-actions"><Button type="button" variant="secondary" onClick={close}>Cancel</Button><Button type="submit" variant="primary" disabled={!ready}>{editing ? "Save changes" : "Save and choose models"}</Button></div>
+        <label htmlFor="custom-endpoint-key">{t("models.credential.apiKey")}</label>
+        <input id="custom-endpoint-key" type="password" value={credential} onChange={(event) => setCredential(event.target.value)} autoComplete="off" spellCheck={false} placeholder={editing ? (editing.hasKey ? t("customEndpoint.form.keepKey") : t("customEndpoint.form.stayKeyless")) : t("customEndpoint.form.keylessLocal")} />
+        <p><Link2 aria-hidden size={13} strokeWidth={1.7} /> {t("customEndpoint.form.keyNote")}</p>
+        <div className="dialog-actions"><Button type="button" variant="secondary" onClick={close}>{t("models.add.cancel")}</Button><Button type="submit" variant="primary" disabled={!ready}>{editing ? t("customEndpoint.form.save") : t("customEndpoint.form.saveChoose")}</Button></div>
       </form>
     </Dialog>
   );
@@ -2045,52 +2214,52 @@ function providerConnected(entry: ProviderDirectoryEntry, enabledProviders: Set<
   return entry.models.some((model) => model.native) || enabledProviders.has(entry.id);
 }
 
-function providerDisplayName(providerId: string): string {
-  return providerId === "openai" ? "OpenAI native" : providerId;
+function providerDisplayName(providerId: string, t: Translate): string {
+  return providerId === "openai" ? t("models.provider.openaiNative") : providerId;
 }
 
-function launcherSummary(entry: ProviderDirectoryEntry, endpointCount: number): string {
+function launcherSummary(entry: ProviderDirectoryEntry, endpointCount: number, t: Translate): string {
   const parts = [
-    endpointCount ? `${endpointCount} ${endpointCount === 1 ? "endpoint" : "endpoints"}` : "",
-    entry.models.length ? `${entry.models.length} ${entry.models.length === 1 ? "model" : "models"}` : "",
+    endpointCount ? t(endpointCount === 1 ? "customEndpoint.endpointCountOne" : "customEndpoint.endpointCount", { count: endpointCount }) : "",
+    entry.models.length ? t(entry.models.length === 1 ? "customEndpoint.modelCountOne" : "customEndpoint.modelCount", { count: entry.models.length }) : "",
   ].filter(Boolean);
-  return parts.join(" · ") || "Bring your own endpoint";
+  return parts.join(" · ") || t("customEndpoint.bringYourOwn");
 }
 
-function connectionMethod(entry: ProviderDirectoryEntry): string {
-  if (entry.id === "openai") return "ChatGPT session";
-  if (entry.id === "local") return "Local runtime";
-  if (!entry.setup) return "Managed catalog";
-  if (entry.setup.action === "probe") return "Live test required";
-  if (entry.setup.action === "blocked") return "Disconnect required";
-  if (entry.setup.kind === "oauth") return "Sign-in";
-  if (entry.setup.kind === "configuration") return "Local configuration";
-  if (entry.setup.kind === "anonymous") return "No key needed";
-  if (entry.setup.generic) return "Custom endpoint";
-  if (entry.setup.kind === "per-model") return "Add an endpoint";
-  if (entry.setup.signIn) return "Key or sign-in";
-  return entry.setup.credentialLabel || "API key";
+function connectionMethod(entry: ProviderDirectoryEntry, t: Translate): string {
+  if (entry.id === "openai") return t("models.method.chatgpt");
+  if (entry.id === "local") return t("models.method.local");
+  if (!entry.setup) return t("models.method.managed");
+  if (entry.setup.action === "probe") return t("models.method.liveTest");
+  if (entry.setup.action === "blocked") return t("models.method.disconnectRequired");
+  if (entry.setup.kind === "oauth") return t("models.method.signIn");
+  if (entry.setup.kind === "configuration") return t("models.method.localConfig");
+  if (entry.setup.kind === "anonymous") return t("models.method.noKey");
+  if (entry.setup.generic) return t("customEndpoint.method");
+  if (entry.setup.kind === "per-model") return t("customEndpoint.addMethod");
+  if (entry.setup.signIn) return t("models.method.keyOrSignIn");
+  return backendText(entry.setup.credentialLabel, t) || t("models.method.apiKey");
 }
 
-function connectionDetail(entry: ProviderDirectoryEntry, accountStatus?: string, accountMessage?: string, canOpenTerminal?: boolean): string {
-  if (entry.id === "openai") return "Uses the signed-in ChatGPT session available to this Codex installation.";
-  if (!entry.setup) return "This provider catalog is managed by the router and has no separate credential action here.";
+function connectionDetail(entry: ProviderDirectoryEntry, t: Translate, accountStatus?: string, accountMessage?: string, canOpenTerminal?: boolean): string {
+  if (entry.id === "openai") return t("models.detail.openai");
+  if (!entry.setup) return t("models.detail.managed");
   if (entry.setup.kind === "configuration") {
     return entry.setup.configured
-      ? "Google Cloud Application Default Credentials and the protected Vertex project/location are ready."
-      : entry.setup.configurationNote || "Run the provider's local configuration command, then refresh this page.";
+      ? t("models.detail.configReady")
+      : backendText(entry.setup.configurationNote, t) || t("models.detail.configRun");
   }
-  if (entry.setup.kind === "anonymous") return "No API key is required. Make it available before routed prompts or catalog loading can use its endpoint.";
-  if (entry.setup.action === "probe") return entry.setup.probeNote || "Run the explicit live compatibility test; it sends a small prompt and uses provider quota.";
-  if (entry.setup.action === "blocked") return entry.setup.blockedNote || "Disconnect the incompatible router record before signing in again.";
-  if (accountStatus === "unavailable") return accountMessage || "Account usage is unavailable. Sign in again if the session expired.";
-  if (entry.setup.configured) return "Credential ready. You can take it away from your clients without disconnecting the account.";
+  if (entry.setup.kind === "anonymous") return t("models.detail.anonymous");
+  if (entry.setup.action === "probe") return backendText(entry.setup.probeNote, t) || t("models.detail.probe");
+  if (entry.setup.action === "blocked") return backendText(entry.setup.blockedNote, t) || t("models.detail.blocked");
+  if (accountStatus === "unavailable") return accountMessage || t("models.detail.unavailable");
+  if (entry.setup.configured) return t("models.detail.credentialReady");
   if (entry.setup.kind === "oauth") {
-    if (!canOpenTerminal) return "Run the official provider sign-in command in your own terminal, then refresh this page.";
-    return entry.setup.cliInstalled === false ? "The official CLI will be installed, then sign-in will open in your system terminal." : "Sign in through the official provider CLI in your system terminal, then refresh.";
+    if (!canOpenTerminal) return t("models.detail.oauthTerminal");
+    return entry.setup.cliInstalled === false ? t("models.detail.oauthInstall") : t("models.detail.oauthSignIn");
   }
-  if (entry.setup.signIn) return `Add ${entry.setup.credentialLabel || "an API key"}, or use the provider's browser sign-in.`;
-  return `Add ${entry.setup.credentialLabel || "an API key"} to connect this provider.`;
+  if (entry.setup.signIn) return t("models.detail.keyOrBrowser", { credential: backendText(entry.setup.credentialLabel, t) || t("models.detail.anApiKey") });
+  return t("models.detail.addKey", { credential: backendText(entry.setup.credentialLabel, t) || t("models.detail.anApiKey") });
 }
 
 function safeId(value: string): string { return value.replace(/[^a-zA-Z0-9_-]/g, "-"); }

@@ -66,7 +66,7 @@ test("Z.ai Coding Flash uses the proven GLM execution and deferred-tool surface 
   const model = MODEL_BY_SLUG.get("zai-coding/glm-5.3-flash");
   assert.equal(model?.searchTool?.mode, "standalone");
   assert.equal(model?.behaviorTemplate, "gpt-5.6-sol");
-  assert.equal(model?.instructionOverlay, "efficient-agentic");
+  assert.equal(model?.instructionOverlay, "efficient-agentic-v2");
   assert.notEqual(
     model?.multiAgentVersion,
     "v2",

@@ -24,6 +24,10 @@ import {
 } from "./lifecycle-state.mjs";
 import { controlCenterDestination, controlCenterNavigationURL } from "./navigation.mjs";
 
+import { interfaceLanguageFromLocale, interfaceMenuTemplates, isInterfaceLanguage } from "./interface-menu.mjs";
+
+let interfaceLanguage = "en";
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ICON = path.resolve(HERE, "..", "assets", "icon.png");
 const DEVELOPMENT_TRAY_TEMPLATE_ICON = path.resolve(HERE, "..", "assets", "trayTemplate.png");
@@ -211,7 +215,7 @@ function createWindow() {
   createdWindow.on("close", (event) => {
     // Close means hide only while a recoverable owner can bring the window
     // back (embedded macOS host or a live tray). Without that owner, destroy
-    // so window-all-closed can quit instead of stranding an invisible process.
+    // so the window-all-closed handler can quit instead of stranding an invisible process.
     if (isQuitting || createdWindow.isDestroyed()) return;
     if (!(nativeTrayOwnedByHost || trayIsAvailable())) return;
     event.preventDefault();
@@ -285,11 +289,7 @@ function createTray() {
   const createdTray = new Tray(image);
   try {
     createdTray.setToolTip("Codex Router");
-    createdTray.setContextMenu(Menu.buildFromTemplate([
-      { label: "Open Control Center", click: showWindow },
-      { type: "separator" },
-      { label: "Quit Codex Router", click: () => app.quit() },
-    ]));
+    createdTray.setContextMenu(Menu.buildFromTemplate(interfaceMenuTemplates(interfaceLanguage, { showWindow, quit: () => app.quit() }).tray));
     createdTray.on("click", showWindow);
   } catch (error) {
     createdTray.destroy();
@@ -297,6 +297,12 @@ function createTray() {
   }
   tray = createdTray;
   return tray;
+}
+
+function updateInterfaceMenus() {
+  const templates = interfaceMenuTemplates(interfaceLanguage, { showWindow, quit: () => app.quit() });
+  if (process.platform === "darwin") Menu.setApplicationMenu(Menu.buildFromTemplate(templates.application));
+  if (tray && !tray.isDestroyed()) tray.setContextMenu(Menu.buildFromTemplate(templates.tray));
 }
 
 function trayIsAvailable() {
@@ -351,6 +357,8 @@ if (primaryInstance && !quitForUpdateInvocation) {
   // lock. The ready bit is raised only after the full Electron boundary is set.
   publishLifecycleState();
   app.whenReady().then(() => {
+    interfaceLanguage = interfaceLanguageFromLocale(app.getLocale());
+    updateInterfaceMenus();
     if (process.platform !== "darwin") {
       Menu.setApplicationMenu(null);
     }
@@ -391,6 +399,11 @@ if (primaryInstance && !quitForUpdateInvocation) {
       BrowserWindow,
       shell,
       senderGuard: trustedRendererSender,
+    });
+    ipcMain.on("router-control:interface-language", (event, language) => {
+      if (!trustedRendererSender(event) || !isInterfaceLanguage(language)) return;
+      interfaceLanguage = language;
+      updateInterfaceMenus();
     });
     ipcMain.on("router-control:navigation-ready", (event) => {
       if (!trustedRendererSender(event)) return;

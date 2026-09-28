@@ -55,6 +55,7 @@ import {
   EmptyCompletionGuard,
   EmptyCompletionTerminalGuard,
   isEmptyCompletionPreludeLimitError,
+  preludeBudgetMs,
 } from "./empty-completion-guard.mjs";
 import { itemLifecycleNormalizerTransform } from "./item-lifecycle-normalizer.mjs";
 import {
@@ -65,8 +66,7 @@ import {
 import { moonshotSchemaRoute } from "./moonshot-schema-routes.mjs";
 import { reasoningTagStripperTransform } from "./reasoning-tag-stripper.mjs";
 import {
-  ZaiResponsesCompatTransform,
-  zaiResponsesCompatTransform,
+  messageEnvelopeCompatTransform,
 } from "./zai-responses-compat.mjs";
 import { reasoningSummaryCompatTransform } from "./grok-reasoning-summary-compat.mjs";
 import { earlyToolItemDoneTransform } from "./early-tool-item-done.mjs";
@@ -105,6 +105,8 @@ import { createHealthCache } from "./health-cache.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
 import { nativeContextVariantBase } from "./native-context-variants.mjs";
+import { normalizeNativeReasoningEffort } from "./native-reasoning-effort.mjs";
+import { foldResponsesSse, nativeInputAsList } from "./native-buffered-response.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
 import {
   autoReviewFallbackEngaged,
@@ -142,8 +144,14 @@ import {
   ResponseUsageTransform,
   tokenUsageFromPayload,
 } from "./response-usage.mjs";
+import {
+  isRemoteCompactV2Trigger,
+  skippableCompactionTokens,
+} from "./compaction-limit.mjs";
 import { fetchWithRetry } from "./upstream-retry.mjs";
+import { repairGeminiToolSchemas } from "./gemini-tool-schema.mjs";
 import { applyGrokApplyPatchGuidance } from "./grok-apply-patch-guidance.mjs";
+import { GROK_OAUTH_PROVIDER, isGrokOauthAgenticRoute } from "./grok-oauth-routes.mjs";
 import {
   GROK_STRUCTURED_PATCH_CODEC,
   grokStructuredPatchEnabled,
@@ -225,7 +233,7 @@ import {
 import { recordUsageEvent } from "./usage-events.mjs";
 import { createRequestProgress } from "./request-progress.mjs";
 import {
-  grokOauth46IngressContextBytes,
+  grokOauthIngressContextBytes,
   knownServiceTier,
   usageDiagnosticMetadata,
   utf8JsonBytes,
@@ -250,6 +258,12 @@ import { readHiddenModels } from "./model-picker-state.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 import { installedNativeVisionEngines } from "./vision-engines.mjs";
 import { ageToolResults } from "./tool-result-aging.mjs";
+import {
+  IMAGE_REJECTION_MAX_RETRIES,
+  boundImagePayload,
+  isImagePayloadRejection,
+  tighterImageBudget,
+} from "./prompt-image-budget.mjs";
 import {
   nativeToolResultAgingEnabled,
   toolResultAgingEnabled,
@@ -392,11 +406,18 @@ function fetchForRoute(route, url, init) {
 // it advertises that tier (checked-in or curated `serviceTiers`), so a failover
 // candidate or a compaction for another route never inherits a tier it did not
 // offer.
+// A Grok OAuth route that publishes a tier of its own. The registry entry
+// decides, so a second Grok model joins by declaring `serviceTiers` rather
+// than by being named here.
+function offersGrokOauthServiceTier(route) {
+  return route?.provider === GROK_OAUTH_PROVIDER && Boolean(route.serviceTiers?.length);
+}
+
 function applyRoutedServiceTier(body, payload, route) {
   if (!route?.serviceTiers?.some((entry) => entry?.id === payload.service_tier)) {
     delete body.service_tier;
   }
-  if (route?.slug !== "grok-oauth/grok-4.6") return body;
+  if (!offersGrokOauthServiceTier(route)) return body;
   const tier = knownServiceTier(payload.service_tier);
   // Locked LiteLLM loses the Responses service_tier argument at its Chat
   // bridge. extra_body reaches the forwarder without changing other routes.
@@ -960,6 +981,22 @@ function normalizeNativePromptCacheCompatibility(payload) {
   return payload;
 }
 
+const loggedNativeEffortNormalizations = new Set();
+
+function normalizeNativeEffortCompatibility(payload) {
+  const changes = normalizeNativeReasoningEffort(payload);
+  for (const change of changes) {
+    const key = `${payload.model}:${change.field}:${change.from}:${change.to}`;
+    if (loggedNativeEffortNormalizations.has(key)) continue;
+    loggedNativeEffortNormalizations.add(key);
+    console.error(
+      `[codex-router] normalized stale native reasoning effort model=${payload.model} ` +
+      `field=${change.field} from=${change.from} to=${change.to}`,
+    );
+  }
+  return payload;
+}
+
 function routedHeaders() {
   return {
     Authorization: `Bearer ${INTERNAL_KEY}`,
@@ -1133,6 +1170,16 @@ function needsStrictOpenCodeToolCompatibility(route) {
 // restriction. Command Code answers the identical `Recursive JSON schemas are
 // not currently supported` on every model behind either of its provider
 // variants (issue #626), so it is gated provider-wide rather than per model.
+//
+// A route that documents the limitation on itself -- `toolSchemaRecursion:
+// "flatten"` in its own registry fragment -- opts in here as well. The
+// api-forwarder repair only sees top-level `type: "function"` tools, so a
+// Responses-native endpoint that keeps Codex's `type: "namespace"` entries,
+// and the recursive `inputSchema` children inside them, needs the repair here
+// in the shape that endpoint actually validates. Moonshot-flavored routes stay
+// out: a blanked cycle-closing ref there must keep the type it declared, which
+// the shared non-recursive pass does not recover, and those routes already run
+// the pass below.
 const NON_RECURSIVE_SCHEMA_PROVIDER_IDS = new Set(["commandcode", "commandcode-messages"]);
 
 function needsNonRecursiveToolSchemaCompatibility(route) {
@@ -1141,7 +1188,19 @@ function needsNonRecursiveToolSchemaCompatibility(route) {
     NON_RECURSIVE_SCHEMA_PROVIDER_IDS.has(providerId) ||
     needsZenFreeToolCompatibility(route) ||
     (providerId === "opencode-go-responses" &&
-      route.upstreamModel === "muse-spark-1.2-contributor")
+      route.upstreamModel === "muse-spark-1.2-contributor") ||
+    (route?.toolSchemaRecursion === "flatten" &&
+      !needsMoonshotSchemaCompatibility(route))
+  );
+}
+
+// This route rejected image_gen's nullable array after upstream conversion
+// produced anyOf with sibling fields. Match the provider/model pair so aliases
+// of the same upstream receive the repair without changing other routes.
+function needsCommandCodeGeminiToolSchemaCompatibility(route) {
+  return (
+    providerForModel(route)?.id === "commandcode" &&
+    route.upstreamModel === "google/gemini-3.8-flash"
   );
 }
 
@@ -2253,7 +2312,6 @@ async function readVisionEvidence({ url, engine, nativeCall, effort, question, k
 // ordinary tool loop did not (#256).
 function carryReasoningThroughInput(input, {
   nativeThinking = false,
-  removeCarriedReasoning = false,
   dropReasoning = false,
 } = {}) {
   if (!Array.isArray(input) || input.length < 2) return;
@@ -2287,7 +2345,7 @@ function carryReasoningThroughInput(input, {
     } else if (text && next) {
       if (next.type === "function_call" || next.type === "custom_tool_call") {
         input[end - 1] = assistantTextItem(text, nativeThinking);
-        if (removeCarriedReasoning) removed = end - index - 1;
+        removed = end - index - 1;
       } else if (next.type === "message" && next.role === "assistant") {
         // Merged into the assistant message rather than inserted in front of
         // it. A separate message would put two assistant turns back to back,
@@ -2296,11 +2354,11 @@ function carryReasoningThroughInput(input, {
         // LiteLLM folds a following function_call into the assistant message
         // it already emitted.
         input[end] = mergeAssistantText(next, text, nativeThinking);
-        if (removeCarriedReasoning) removed = end - index;
+        removed = end - index;
       }
     }
-    // Native Responses providers retain their existing item semantics. On
-    // Chat routes remove only a run successfully carried onto an assistant;
+    // Only Chat routes reach this helper (#840). Remove only a run
+    // successfully carried onto an assistant (or deliberately dropped);
     // unrelated or trailing reasoning must not be silently discarded.
     if (removed) input.splice(index, removed);
     index = end - removed - 1;
@@ -2719,6 +2777,75 @@ function extractUserMessages(input) {
   return messages;
 }
 
+// A streamed compaction arrives as Responses SSE. The terminal
+// `response.completed` event carries the same full response object a
+// non-streaming call would have returned, so unwrapping it keeps the rest of
+// the compaction path (text extraction, usage metering) unchanged.
+//
+// The parser follows SSE framing rather than trusting one-line JSON: a data
+// payload is every `data:` line since the last blank line joined with "\n",
+// CRLF is tolerated, and comment/id/retry lines are ignored. Gateways in the
+// wild end their stream without a terminal event, so
+// `response.output_text.delta` text accumulates as a fallback answer — never
+// after a failed or incomplete terminal, whose partial output must not
+// masquerade as a summary. The observed event mix rides back to the caller
+// for its failure log either way.
+function responsesSseToResponse(bytes) {
+  const payloads = [];
+  let dataLines = [];
+  const flush = () => {
+    if (dataLines.length) {
+      payloads.push(dataLines.join("\n"));
+      dataLines = [];
+    }
+  };
+  for (const rawLine of bytes.toString("utf8").split("\n")) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+    else if (line === "") flush();
+  }
+  flush();
+
+  let completed;
+  let terminalFailed = false;
+  const deltas = [];
+  let usage;
+  const events = new Map();
+  for (const payload of payloads) {
+    let event;
+    try {
+      event = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    const type = typeof event?.type === "string" ? event.type : "unknown";
+    events.set(type, (events.get(type) || 0) + 1);
+    if (type === "response.completed" && event.response && typeof event.response === "object") {
+      completed = event.response;
+      if (event.response.usage && typeof event.response.usage === "object") usage = event.response.usage;
+    } else if (type === "response.failed" || type === "response.incomplete") {
+      // A failed or incomplete terminal means the summarizer never finished;
+      // the caller must classify this as a failed attempt, never accept it.
+      terminalFailed = true;
+    }
+    if (type === "response.output_text.delta" && typeof event.delta === "string") deltas.push(event.delta);
+    if (event?.usage && typeof event.usage === "object") usage = event.usage;
+  }
+  const summary = [...events].map(([type, count]) => `${type}x${count}`).join(",") || "no-events";
+  // A failed or incomplete terminal poisons the whole attempt: even a later
+  // completed event cannot be trusted as a finished summary, so the caller
+  // classifies the attempt as failed instead of checkpointing it.
+  if (completed && !terminalFailed) return { response: completed, summary, terminalFailed };
+  if (deltas.length && !terminalFailed) {
+    return {
+      response: { output_text: deltas.join(""), ...(usage ? { usage } : {}) },
+      summary: `${summary} (rebuilt from deltas)`,
+      terminalFailed,
+    };
+  }
+  return { response: undefined, summary, terminalFailed };
+}
+
 // The v1 compact response shape follows Codex's replacement-history contract.
 function compactOutput(input, checkpoint) {
   const budget = 80_000;
@@ -2913,7 +3040,11 @@ async function summarizeWith(
   let body = {
     ...payload,
     model: route.gatewayModel,
-    stream: false,
+    // Some OpenAI-Responses gateways (Codex LBs) refuse non-streaming
+    // requests outright ("Stream must be set to true"). Only those generic
+    // providers stream the summarizer; every other route keeps the plain
+    // non-streaming call it already worked with.
+    stream: providerForModel(route)?.generic === true,
     // An empty tool list already disables tool use on every forwarder, and
     // xAI rejects tool_choice "none" paired with it, so the field is omitted
     // rather than sent redundantly.
@@ -2994,13 +3125,31 @@ async function summarize(request, payload, route, signal, { allowFailover = true
   // decide which source types and machine outcomes enter a kcr2 checkpoint.
   const prepared = prepareCompaction(normalized);
   const agingEnabled = toolResultAgingEnabled();
-  const aged = ageToolResults(normalized, {
-    enabled: agingEnabled,
-    // The client has already decided this conversation needs compaction. Dense
-    // RTK-style shaping gives its summarizer more distinct evidence without
-    // changing ordinary turns, and every shaped result keeps the exact rerun path.
-    denseShaping: agingEnabled,
-  });
+  // Compaction replays every image the conversation still holds, and it runs
+  // exactly when the conversation is at its largest, so it is the request most
+  // likely to cross the provider's per-request image ceiling. It is reduced by
+  // the same function as a routed turn. The per-image token charge is the
+  // conversation's route; a failover hop reuses this input, and the byte budget
+  // that stops a 413 does not depend on the route.
+  const reduce = (imageLimits) => {
+    const reduced = prepareProviderInput(normalized, route, {
+      agingEnabled,
+      // The client has already decided this conversation needs compaction.
+      // Dense RTK-style shaping gives its summarizer more distinct evidence
+      // without changing ordinary turns, and every shaped result keeps the
+      // exact rerun path.
+      denseShaping: agingEnabled,
+      imageLimits,
+    });
+    // The image counts ride on the aging stats so every compaction return path
+    // meters them without each one having to carry a second field.
+    return {
+      input: reduced.input,
+      stats: { ...reduced.toolResultAging, ...reduced.imageBudget },
+    };
+  };
+  let aged = reduce();
+  let imageRetries = 0;
 
   // The models this compaction may be moved to, in order, starting with the one
   // the conversation is on. A provider already known to be empty is dropped
@@ -3060,13 +3209,44 @@ async function summarize(request, payload, route, signal, { allowFailover = true
         toolResultAging: aged.stats,
       };
     }
-    const parsed = JSON.parse(bytes.toString("utf8"));
+    const contentType = String(sent.upstream.headers.get("content-type") || "");
+    let parsed;
+    // A streamed attempt that yields nothing usable, or ends failed or
+    // incomplete, is classified exactly like an ordinary upstream rejection:
+    // it must reach the same failover, cooldown, and metering handling rather
+    // than short-circuiting into a synthetic terminal result.
+    let upstreamOk = sent.upstream.ok;
+    let upstreamStatus = sent.upstream.status;
+    let failureBodyText;
+    if (contentType.includes("text/event-stream")) {
+      const unwrapped = responsesSseToResponse(bytes);
+      parsed = unwrapped.response;
+      if (!parsed) {
+        console.error(
+          `[codex-router] compaction stream ended without a usable response model=${attemptRoute.slug}` +
+            ` events=${unwrapped.summary}${unwrapped.terminalFailed ? " terminal=failed" : ""}`,
+        );
+        upstreamOk = false;
+        upstreamStatus = 502;
+        parsed = {
+          error: {
+            message: unwrapped.terminalFailed
+              ? "Compact stream ended with a failed or incomplete response."
+              : "Compact stream ended without a completed response.",
+            events: unwrapped.summary,
+          },
+        };
+        failureBodyText = JSON.stringify(parsed);
+      }
+    } else {
+      parsed = JSON.parse(bytes.toString("utf8"));
+    }
     // Compaction is a plain non-streaming call, so the usage block (when the
     // provider sends one) is already in hand. `tokenUsageFromPayload` returns
     // undefined when it is absent, and `recordUsageEvent` then omits the token
     // fields entirely rather than metering an invented zero.
     const usage = tokenUsageFromPayload(parsed);
-    if (sent.upstream.ok) {
+    if (upstreamOk) {
       clearProviderCooldown(attemptRoute.provider);
       const answer = extractResponseText(parsed);
       // finalizeCheckpoint turns empty model output into a structurally valid
@@ -3093,21 +3273,35 @@ async function summarize(request, payload, route, signal, { allowFailover = true
     // metered on its own row exactly as on the turn path -- otherwise a
     // compaction the router rescued would leave no trace of the provider that
     // could not serve it.
-    const bodyText = bytes.toString("utf8");
-    failed.push({ route: attemptRoute, status: sent.upstream.status, usage });
+    const bodyText = failureBodyText ?? bytes.toString("utf8");
+    failed.push({ route: attemptRoute, status: upstreamStatus, usage });
+    // A provider that still refuses the image content gets the same model again
+    // with half of it. A refused compaction is retried by the client before
+    // every following turn, so leaving it refused stalls the session for good.
+    const imageLimits = imageRetries < IMAGE_REJECTION_MAX_RETRIES &&
+      isImagePayloadRejection({ status: upstreamStatus, bodyText })
+      ? tighterImageBudget(aged.stats)
+      : undefined;
+    if (imageLimits && !signal?.aborted) {
+      imageRetries += 1;
+      aged = reduce(imageLimits);
+      logImageRejectionRetry(attemptRoute, "compaction", imageRetries, aged.stats);
+      index -= 1;
+      continue;
+    }
     // The first failure is the one reported if every attempt fails: it came
     // from the model the conversation is actually on, which is the one the
     // operator can do something about.
     last ??= {
       ok: false,
-      status: gatewayErrorStatus({ status: sent.upstream.status, bodyText }),
+      status: gatewayErrorStatus({ status: upstreamStatus, bodyText }),
       payload: parsed,
       usage,
       toolResultAging: aged.stats,
       route: attemptRoute,
     };
     const verdict = classifyRoutedFailure({
-      status: sent.upstream.status,
+      status: upstreamStatus,
       bodyText,
       retryAfterSeconds: retryAfterSeconds(sent.upstream.headers),
     });
@@ -3141,7 +3335,7 @@ async function summarize(request, payload, route, signal, { allowFailover = true
           attemptRoute,
           hops[0],
           "compaction/context_length",
-          sent.upstream.status,
+          upstreamStatus,
           "retrying",
         );
         continue;
@@ -3155,7 +3349,7 @@ async function summarize(request, payload, route, signal, { allowFailover = true
         attemptRoute,
         attempts[index + 1],
         `compaction/${verdict.reason}`,
-        sent.upstream.status,
+        upstreamStatus,
         "retrying",
       );
     }
@@ -3524,20 +3718,21 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   const input = deepSeekResponses
     ? deepSeekResponsesInput(bridged)
     : Array.isArray(bridged) ? [...bridged] : bridged;
-  // Legacy Chat routes retain their existing reasoning carry. The native
-  // DeepSeek route already has exactly one plaintext reasoning item and must
-  // not copy it into an assistant message for Chat translation.
-  if (!deepSeekResponses) {
-    // Three replay channels, not two. A Chat route inside the native-reasoning
-    // contract carries its thinking as `thinking` parts for the forwarder to
-    // restore as reasoning_content; a Chat route outside it drops the thinking
-    // rather than replaying it as visible prose (#755); a native Responses
-    // provider keeps its existing item semantics untouched.
-    const nativeChatReasoning = chatCompletionsProvider && usesNativeChatReasoning(route);
+  // Only Chat Completions routes carry reasoning. Two replay channels: a Chat
+  // route inside the native-reasoning contract carries its thinking as
+  // `thinking` parts for the forwarder to restore as reasoning_content; a Chat
+  // route outside it drops the thinking rather than replaying it as visible
+  // prose (#755). A native Responses provider -- DeepSeek's dedicated route
+  // and every `openai-responses` provider, generic ones included -- keeps its
+  // reasoning items exactly as sent. The carry is not a no-op with its flags
+  // off: it rewrote reasoning before a tool call into assistant `output_text`
+  // and copied reasoning before an answer into the visible message, which a
+  // thinking model reads as something it once said and loops on (#840).
+  if (chatCompletionsProvider && !deepSeekResponses) {
+    const nativeChatReasoning = usesNativeChatReasoning(route);
     carryReasoningThroughInput(input, {
       nativeThinking: nativeChatReasoning,
-      removeCarriedReasoning: chatCompletionsProvider,
-      dropReasoning: chatCompletionsProvider && !nativeChatReasoning,
+      dropReasoning: !nativeChatReasoning,
     });
   }
   // Models marked requiresTrailingUserTurn reject requests ending with a model
@@ -3580,6 +3775,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     const flattened = chatProviderToolSurface(tools, provider?.id, {
       input,
       toolChoice: payload.tool_choice,
+      upstreamModel: route.upstreamModel,
     });
     namespacesFlattened = flattened.flattened;
     flattenedNamespaces = flattened.namespaces;
@@ -3732,6 +3928,10 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     }
     tools = contract.tools;
   }
+  if (needsCommandCodeGeminiToolSchemaCompatibility(route)) {
+    // Normalize the complete inventory once, including stored search results.
+    tools = repairGeminiToolSchemas(tools);
+  }
   // Stored call history and forced choices must use the same tool names as the
   // provider-facing list, or the model/request validator sees two identities.
   if (namespacesFlattened) {
@@ -3778,7 +3978,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     }
   }
   // Append V4A examples to the native custom apply_patch description for
-  // grok-oauth/grok-4.6 only, before LiteLLM translates that custom tool.
+  // the agentic grok-oauth routes only, before LiteLLM translates that tool.
   tools = applyGrokApplyPatchGuidance(tools, route);
   let routed = {
     ...payload,
@@ -3855,7 +4055,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     searchMode: searchCompatibility.searchMode,
     namespacesFlattened,
     flattenedNamespaces,
-    grokStructuredPatch: route.slug === "grok-oauth/grok-4.6"
+    grokStructuredPatch: isGrokOauthAgenticRoute(route)
       ? {
           enabled: patchHook || grokStructuredPatchEnabled(route),
           applied: structuredPatch,
@@ -3883,21 +4083,68 @@ async function prepareRoutedRequest({
   route,
   normalizedInput,
   agingEnabled,
+  imageLimits,
 }) {
-  const aged = ageToolResults(normalizedInput, {
-    enabled: agingEnabled,
+  const prepared = prepareProviderInput(normalizedInput, route, {
+    agingEnabled,
+    imageLimits,
   });
   const built = await buildRoutedRequest({
     request,
     payload,
     route,
-    agedInput: aged.input,
+    agedInput: prepared.input,
   });
   return {
     ...built,
-    agedInput: aged.input,
-    toolResultAging: aged.stats,
+    agedInput: prepared.input,
+    toolResultAging: prepared.toolResultAging,
+    imageBudget: prepared.imageBudget,
   };
+}
+
+// The one place a conversation is reduced before it leaves for a provider.
+// Every provider-bound path - a routed turn, each failover hop, compaction -
+// goes through here, so a new path cannot forget the image budget the way
+// compaction once did (it aged tool results, skipped the budget, and a
+// screenshot-heavy session's compaction hit OpenRouter's 413 on every retry).
+//
+// A conversation replays every image it still holds, so a long session can
+// cross the provider's per-request image ceiling on its own. The payload is
+// bounded after aging, from the same pristine input. The token budget is
+// charged at this route's per-image bound, so a resold route that pays 4096
+// tokens a screenshot is trimmed sooner than a native route that pays 1024.
+// `imageLimits` tightens the budget for a resend after a provider refused the
+// image content anyway.
+function prepareProviderInput(
+  normalizedInput,
+  route,
+  { agingEnabled, denseShaping = false, imageLimits } = {},
+) {
+  const aged = ageToolResults(normalizedInput, {
+    enabled: agingEnabled,
+    denseShaping,
+  });
+  const bounded = boundImagePayload(aged.input, {
+    ...imageLimits,
+    tokensPerImage: maxImageTokensForRoute(route),
+  });
+  return {
+    input: bounded.input,
+    toolResultAging: aged.stats,
+    imageBudget: bounded.stats,
+  };
+}
+
+// Not gated on QUIET: a router that silently dropped screenshots the model was
+// shown would be indistinguishable from one that never had to.
+function logImageRejectionRetry(route, path, attempt, stats) {
+  console.error(
+    `[codex-router] image payload refused, resending with fewer images ` +
+      `${attempt}/${IMAGE_REJECTION_MAX_RETRIES} model=${route.slug} path=${path} ` +
+      `images=${stats.imageReferencesSeen - stats.imageReferencesDropped}/${stats.imageReferencesSeen} ` +
+      `image-bytes=${stats.imageBytesAfter}`,
+  );
 }
 
 // The models this turn could be moved to, best first. Deliberately computed
@@ -4165,7 +4412,9 @@ async function handleResponses(request, response, requestUrl) {
   let usage;
   let estimatedInputTokens;
   let toolResultAging;
+  let imageBudget;
   let pendingInterrupts = [];
+  let bufferNativeStream = false;
   let emptyCompletion = false;
   let emptyCompletionRetried = false;
   // The model the operator actually asked for, when this turn ended up being
@@ -4295,15 +4544,56 @@ async function handleResponses(request, response, requestUrl) {
       model: route?.slug || requestedModel || undefined,
       ...activityMetadataFromHeaders(request.headers),
     });
-    diagnostics.contextBytes = grokOauth46IngressContextBytes(payload, route);
-    if (route?.slug === "grok-oauth/grok-4.6") diagnostics.requestedServiceTier = payload.service_tier;
+    diagnostics.contextBytes = grokOauthIngressContextBytes(payload, route);
+    if (offersGrokOauthServiceTier(route)) diagnostics.requestedServiceTier = payload.service_tier;
     const compactV1 = /\/responses\/compact$/.test(requestUrl.pathname);
     // Codex remote compaction V2 uses the ordinary Responses endpoint with a
     // terminal trigger. Detect the protocol shape before route dispatch so the
     // native path can also preserve the full tool results being summarized.
-    const compactV2 =
-      Array.isArray(payload.input) &&
-      payload.input.at(-1)?.type === "compaction_trigger";
+    const compactV2 = isRemoteCompactV2Trigger(payload);
+
+    // The same normalization the routed compaction path would do, hoisted so
+    // the budget is judged on the bytes that actually go upstream and so the
+    // checkpoint below reuses the one pass rather than repeating it.
+    const skipNormalized =
+      route && compactV2 ? normalizeRoutedInput(payload.input.slice(0, -1)) : undefined;
+    const skipEstimatedTokens = skipNormalized
+      ? skippableCompactionTokens(skipNormalized, route)
+      : undefined;
+
+    if (skipEstimatedTokens !== undefined) {
+      const prepared = prepareCompaction(skipNormalized);
+      const checkpoint = finalizeCheckpoint("", prepared);
+      const item = {
+        type: "compaction",
+        id: `cmp_${randomUUID().replaceAll("-", "")}`,
+        encrypted_content: encodeCheckpoint(checkpoint),
+      };
+      if (payload.stream === false) {
+        writeJson(response, 200, compactionSnapshot(payload.model, item));
+      } else {
+        writeCompactionSse(response, payload.model, checkpoint);
+      }
+      if (!QUIET) {
+        console.error(
+          `[codex-router] skipped-unnecessary-compaction model=${route.slug} provider=${route.provider} estimated-input=${skipEstimatedTokens}`,
+        );
+      }
+      recordObservedUsage(
+        {
+          model: route.slug,
+          provider: canonicalProviderId(route.provider),
+          status: 200,
+          durationMs: Date.now() - startedAt,
+        },
+        diagnostics,
+      );
+      usage = undefined;
+      finalStatus = 200;
+      activityStatus = 200;
+      usageRecorded = true;
+      return;
+    }
 
     if (route && (compactV1 || compactV2)) {
       const compaction = await handleRoutedCompaction(
@@ -4360,25 +4650,32 @@ async function handleResponses(request, response, requestUrl) {
     // retry -- reads these, so all of them have to move together or the turn
     // would be relayed through one model's namespace map while another model
     // answered it.
-    const adoptRoute = (nextRoute, built) => {
-      failoverFrom ??= route.slug;
-      route = nextRoute;
+    // Adopts a rebuilt request for the same model - a resend with fewer images
+    // after the provider refused the image content - and is the request half of
+    // adopting another model below.
+    const adoptBuilt = (built) => {
       namespacesFlattened = built.namespacesFlattened;
       flattenedNamespaces = built.flattenedNamespaces;
       diagnostics.grokStructuredPatch = built.grokStructuredPatch;
-      // Grok 4.6 ingress measurements describe the request sent to Grok. The
-      // serving row of another model must not inherit them.
-      diagnostics.contextBytes = grokOauth46IngressContextBytes(payload, route);
-      diagnostics.requestedServiceTier =
-        route.slug === "grok-oauth/grok-4.6" ? payload.service_tier : undefined;
       setRoutingDiagnostics(built);
       pendingInterrupts = built.pendingInterrupts;
       agedInput = built.agedInput;
       toolResultAging = built.toolResultAging;
+      imageBudget = built.imageBudget;
       target = built.target;
       headers = built.headers;
       routedBody = built.body;
       builtSearchMode = built.searchMode;
+    };
+    const adoptRoute = (nextRoute, built) => {
+      failoverFrom ??= route.slug;
+      route = nextRoute;
+      adoptBuilt(built);
+      // Grok OAuth ingress measurements describe the request sent to Grok. The
+      // serving row of another model must not inherit them.
+      diagnostics.contextBytes = grokOauthIngressContextBytes(payload, route);
+      diagnostics.requestedServiceTier =
+        offersGrokOauthServiceTier(route) ? payload.service_tier : undefined;
       // The tray Island has to name the model that is actually answering.
       activity.setRoute({
         provider: canonicalProviderId(route.provider),
@@ -4407,6 +4704,7 @@ async function handleResponses(request, response, requestUrl) {
         agingEnabled,
       });
       toolResultAging = built.toolResultAging;
+      imageBudget = built.imageBudget;
       agedInput = built.agedInput;
       namespacesFlattened = built.namespacesFlattened;
       flattenedNamespaces = built.flattenedNamespaces;
@@ -4495,9 +4793,15 @@ async function handleResponses(request, response, requestUrl) {
       // the log still name the model the picker showed.
       const variantBase = nativeContextVariantBase(native.model);
       if (variantBase) native.model = variantBase;
+      normalizeNativeEffortCompatibility(native);
       normalizeNativePromptCacheCompatibility(native);
-      if (Array.isArray(payload.input)) {
-        native.input = normalizeNativeInput(payload.input, {
+      // The backend answers a string `input` with a bare "Input must be a
+      // list" 400. Like the rest of the substituted-caller normalization, only
+      // a generic client's shorthand is rewritten, into the one user message
+      // it means (#862); a caller with its own credential is relayed as sent.
+      if (substitutedCaller) native.input = nativeInputAsList(native.input);
+      if (Array.isArray(native.input)) {
+        native.input = normalizeNativeInput(native.input, {
           // Every substituted caller needs provenance-safe full reasoning.
           // V1 compaction alone has a stored-reference contract, so it keeps
           // bare rs_ references while ordinary/V2 stateless replay drops them.
@@ -4529,6 +4833,14 @@ async function handleResponses(request, response, requestUrl) {
       if (!compactV1) delete native.previous_response_id;
       if (substitutedCaller) {
         normalizeNativeForSubstitutedCaller(native, { compact: compactV1 });
+        // The backend only streams ("Stream must be set to true"). A generic
+        // client that asked for one JSON object still gets one: ask for the
+        // stream and fold it below (#862). Compaction V1 is its own JSON
+        // endpoint and is left alone.
+        if (!compactV1 && native.stream !== true) {
+          native.stream = true;
+          bufferNativeStream = true;
+        }
       }
       target = nativeTarget(requestUrl.pathname);
       headers = nativeHeaders(request);
@@ -4607,6 +4919,54 @@ async function handleResponses(request, response, requestUrl) {
         console.error(
           `[codex-router] routed transport retry 1/1 model=${route.slug} path=${requestUrl.pathname}`,
         );
+        upstream = await fetchObservedUpstream(target, {
+          method: "POST",
+          headers,
+          body: routedBody,
+          signal: controller.signal,
+        });
+        upstreamRetries = (upstreamRetries || 0) + 1;
+        upstreamStatus = upstream.status;
+        upstreamLatencyMs = Date.now() - startedAt;
+        failedBodyText = upstream.ok
+          ? undefined
+          : await boundedResponseText(
+              upstream,
+              MAX_BUFFERED_RESPONSE_BYTES,
+              controller.signal,
+            );
+        verdict = upstream.ok
+          ? { swap: false }
+          : classifyRoutedFailure({
+              status: upstream.status,
+              bodyText: failedBodyText,
+              retryAfterSeconds: retryAfterSeconds(upstream.headers),
+            });
+      }
+      // The image budget is a measurement, not the provider's contract. A
+      // provider that still refuses the image content gets the same model again
+      // with half of it, oldest first, rather than a turn the session can never
+      // get past. Nothing has been relayed, so the resend is invisible to Codex.
+      for (
+        let attempt = 1;
+        !upstream.ok &&
+        attempt <= IMAGE_REJECTION_MAX_RETRIES &&
+        nothingRelayed(response) &&
+        !controller.signal.aborted &&
+        isImagePayloadRejection({ status: upstream.status, bodyText: failedBodyText });
+        attempt += 1
+      ) {
+        const imageLimits = tighterImageBudget(imageBudget);
+        if (!imageLimits) break;
+        adoptBuilt(await prepareRoutedRequest({
+          request,
+          payload,
+          route,
+          normalizedInput,
+          agingEnabled,
+          imageLimits,
+        }));
+        logImageRejectionRetry(route, requestUrl.pathname, attempt, imageBudget);
         upstream = await fetchObservedUpstream(target, {
           method: "POST",
           headers,
@@ -4774,10 +5134,27 @@ async function handleResponses(request, response, requestUrl) {
     // predicate is structural (this request, these bytes, an explicit zero),
     // so it cannot fire on a provider that reports correctly and it disables
     // itself the moment the upstream starts reporting again.
+    if (
+      bufferNativeStream &&
+      upstream.ok &&
+      /text\/event-stream/i.test(upstream.headers.get("content-type") || "")
+    ) {
+      const folded = foldResponsesSse(
+        (await readResponseBody(upstream, {
+          maxBytes: MAX_BUFFERED_RESPONSE_BYTES,
+          signal: controller.signal,
+        })).toString("utf8"),
+      );
+      upstream = new Response(JSON.stringify(folded.body), {
+        status: folded.status,
+        headers: { "content-type": "application/json" },
+      });
+      upstreamStatus = upstream.status;
+    }
     const upstreamContentType = upstream.headers.get("content-type") || "";
-    const createResponsePipeline = (contentType) => {
+    const createResponsePipeline = (contentType, preludeMs = EMPTY_COMPLETION_PRELUDE_MS) => {
       const usageObserver = new ResponseUsageTransform(contentType, {
-        grokServiceTier: route?.slug === "grok-oauth/grok-4.6",
+        grokServiceTier: offersGrokOauthServiceTier(route),
         onEvent: (payload) => activity.progress.event(payload),
         estimatedInputTokens:
           ZERO_INPUT_ESTIMATE && route
@@ -4788,18 +5165,14 @@ async function handleResponses(request, response, requestUrl) {
             : undefined,
       });
       const transforms = [activity.progress.byteObserver(), usageObserver];
-      let envelopeCompat = route
-        ? zaiResponsesCompatTransform(route.provider, contentType)
+      // LiteLLM's Chat Completions bridge can stream assistant text after a
+      // reasoning item with no message envelope, on the reasoning item's own
+      // output index (Z.ai GLM-5.3, OpenRouter MiMo). Codex logs every such
+      // delta as `OutputTextDelta without active item`. The factory refuses
+      // native traffic and providers that do not cross that bridge.
+      const envelopeCompat = route
+        ? messageEnvelopeCompatTransform(providerForModel(route), contentType)
         : undefined;
-      // Z.ai Responses streams from GLM-5.3 can start assistant text after
-      // reasoning without its message envelope. Keep that repair provider-scoped.
-      if (
-        !envelopeCompat &&
-        route?.provider === "zai-coding" &&
-        String(contentType).toLowerCase().includes("text/event-stream")
-      ) {
-        envelopeCompat = new ZaiResponsesCompatTransform();
-      }
       if (envelopeCompat) transforms.push(envelopeCompat);
       // LiteLLM's Chat Completions bridge streams reasoning under hashed
       // per-delta ids that Codex drops; rebuild one reasoning item. Grok OAuth
@@ -4867,10 +5240,10 @@ async function handleResponses(request, response, requestUrl) {
         route && EMPTY_COMPLETION_RETRY
           ? new EmptyCompletionGuard(contentType, {
               maxPreludeBytes: EMPTY_COMPLETION_PRELUDE_BYTES,
-              maxPreludeMs: EMPTY_COMPLETION_PRELUDE_MS,
+              maxPreludeMs: preludeMs,
               maxStreamStallMs: canonicalProviderId(route.provider) === "grok-oauth"
                 ? GROK_STREAM_STALL_MS
-                : EMPTY_COMPLETION_PRELUDE_MS,
+                : preludeMs,
             })
           : undefined;
       if (guard) {
@@ -4925,7 +5298,15 @@ async function handleResponses(request, response, requestUrl) {
       }
       return { transforms, usageObserver, guard, leakedToolCalls };
     };
-    const firstPipeline = createResponsePipeline(upstreamContentType);
+    // The guard's pre-content budget scales with this request's size: a large
+    // prompt's prefill is legitimately longer than a small one's, and a flat
+    // budget turns that into a stated "empty completion" (measured 2026-09-21
+    // on a ~577k-token turn).
+    const requestPreludeMs = preludeBudgetMs({
+      baseMs: EMPTY_COMPLETION_PRELUDE_MS,
+      requestBytes: typeof body?.length === "number" ? body.length : 0,
+    });
+    const firstPipeline = createResponsePipeline(upstreamContentType, requestPreludeMs);
     usageTransform = firstPipeline.usageObserver;
     emptyCompletionGuard = firstPipeline.guard;
     const leakedToolCallRecovery = firstPipeline.leakedToolCalls;
@@ -5132,7 +5513,7 @@ async function handleResponses(request, response, requestUrl) {
           upstream2 = compatibleRetry;
           clearStagedResponseHead(response);
           const retryContentType = preparedRetry.pipelineContentType;
-          const secondPipeline = createResponsePipeline(retryContentType);
+          const secondPipeline = createResponsePipeline(retryContentType, requestPreludeMs);
           retryUsageTransform = secondPipeline.usageObserver;
           retryEmptyCompletionGuard = secondPipeline.guard;
           let retryPreludeFailureKind;
@@ -5241,6 +5622,7 @@ async function handleResponses(request, response, requestUrl) {
       ...usage,
       estimatedInputTokens,
       ...toolResultAging,
+      ...imageBudget,
       retries: (upstreamRetries || 0) + (usage?.retries || 0) || undefined,
       ...(emptyCompletion ? { emptyCompletion: true } : {}),
       ...(emptyCompletionRetried ? { emptyCompletionRetried: true } : {}),
@@ -5276,6 +5658,10 @@ async function handleResponses(request, response, requestUrl) {
         }${estimatedInputTokens ? ` estimated-input-tokens=${estimatedInputTokens}` : ""}${
           toolResultAging?.toolResultBytesSaved
             ? ` aged-tool-results=${toolResultAging.toolResultsAged} saved-tool-bytes=${toolResultAging.toolResultBytesSaved}`
+            : ""
+        }${
+          imageBudget?.imageBytesSaved || imageBudget?.imageTokensSaved
+            ? ` trimmed-images=${imageBudget.imageReferencesDropped} saved-image-bytes=${imageBudget.imageBytesSaved} saved-image-tokens=${imageBudget.imageTokensSaved}`
             : ""
         }${
           emptyCompletionRetried ? " empty-completion-retried=true" : ""
@@ -5411,6 +5797,7 @@ async function handleResponses(request, response, requestUrl) {
         ...usage,
         estimatedInputTokens,
         ...toolResultAging,
+        ...imageBudget,
         ...(emptyCompletion ? { emptyCompletion: true } : {}),
         ...(emptyCompletionPreludeLimit
           ? { emptyCompletionPreludeLimit }
@@ -5451,6 +5838,7 @@ async function handleResponses(request, response, requestUrl) {
           ...usage,
           estimatedInputTokens,
           ...toolResultAging,
+          ...imageBudget,
           retries: (upstreamRetries || 0) + (usage?.retries || 0) || undefined,
         }, diagnostics);
         usageRecorded = true;
@@ -5486,6 +5874,7 @@ async function handleResponses(request, response, requestUrl) {
           ...usage,
           estimatedInputTokens,
           ...toolResultAging,
+          ...imageBudget,
           ...(emptyCompletion ? { emptyCompletion: true } : {}),
           ...(emptyCompletionRetried ? { emptyCompletionRetried: true } : {}),
         }, diagnostics);
@@ -5512,6 +5901,7 @@ async function handleResponses(request, response, requestUrl) {
         ...usage,
         estimatedInputTokens,
         ...toolResultAging,
+        ...imageBudget,
         ...(response.headersSent ? { streamAborted: true } : {}),
         ...(emptyCompletion ? { emptyCompletion: true } : {}),
         ...(emptyCompletionRetried ? { emptyCompletionRetried: true } : {}),
