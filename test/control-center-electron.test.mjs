@@ -266,7 +266,7 @@ test("a rejected browser handoff terminates the detached Codex login", async () 
   }
 });
 
-test("Control Center navigation accepts only one fixed widget destination", () => {
+test("Control Center navigation accepts only one fixed destination", () => {
   assert.deepEqual(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT, "usage"]), {
     destination: "usage",
     sourceId: undefined,
@@ -281,7 +281,12 @@ test("Control Center navigation accepts only one fixed widget destination", () =
     ]),
     { destination: "usage", sourceId: "deepseek" },
   );
-  assert.equal(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT, "settings"]), undefined);
+  // The tray's Settings item; its widget-facing URL parser still refuses it.
+  assert.deepEqual(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT, "settings"]), {
+    destination: "settings",
+    sourceId: undefined,
+  });
+  assert.equal(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT, "models"]), undefined);
   assert.equal(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT]), undefined);
   assert.equal(controlCenterDestination([
     "electron", ".", NAVIGATION_ARGUMENT, "usage", NAVIGATION_SOURCE_ARGUMENT, "deep_seek",
@@ -298,11 +303,15 @@ test("Control Center navigation URLs are exact and source bounded", () => {
   assert.deepEqual(controlCenterNavigationURL(
     "codex-router://control-center/usage",
   ), { destination: "usage", sourceId: undefined });
+  assert.deepEqual(controlCenterNavigationURL(
+    "codex-router://control-center/settings",
+  ), { destination: "settings", sourceId: undefined });
   for (const value of [
     "https://control-center/usage",
     "codex-router://other/usage",
     "codex-router://control-center//usage",
-    "codex-router://control-center/settings",
+    "codex-router://control-center/models",
+    "codex-router://control-center/settings/",
     "codex-router://control-center/usage?source=deep_seek",
     "codex-router://control-center/usage?source=openai&source=deepseek",
     "codex-router://control-center/usage?next=settings",
