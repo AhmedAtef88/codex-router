@@ -92,7 +92,18 @@ try {
     # Control Center directory explicitly before packaging.
     Push-Location -LiteralPath $App
     try {
-      & (Join-Path $App "node_modules\.bin\electron-builder.cmd") --win dir --publish never "--config.directories.output=$StagingRoot" 2>&1 | Out-Host
+      # Same PowerShell 5.1 stderr hazard as the npm block above:
+      # electron-builder writes progress and status lines -- occasionally an
+      # empty one -- to stderr, and the Stop preference would turn that into a
+      # terminating ErrorRecord after the package was already built. Run it
+      # under Continue; $LASTEXITCODE below still decides success.
+      $ElectronBuilderErrorAction = $ErrorActionPreference
+      $ErrorActionPreference = "Continue"
+      try {
+        & (Join-Path $App "node_modules\.bin\electron-builder.cmd") --win dir --publish never "--config.directories.output=$StagingRoot" 2>&1 | Out-Host
+      } finally {
+        $ErrorActionPreference = $ElectronBuilderErrorAction
+      }
       if ($LASTEXITCODE -ne 0) { throw "Control Center packaging failed." }
     } finally {
       Pop-Location

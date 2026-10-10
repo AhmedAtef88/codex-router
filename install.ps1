@@ -346,6 +346,13 @@ try {
   if ((Get-InstallStep "python-deps") -eq "skip") {
     Write-Host "LiteLLM already matches the pinned versions; skipping the Python install."
   } elseif (Get-Command "uv" -ErrorAction SilentlyContinue) {
+    # PowerShell 5.1 turns a native command's stderr into an ErrorRecord, and
+    # the Stop preference at the top of this file makes the first one
+    # terminating. uv reports progress and its dependency summary on stderr,
+    # so a plain `& uv ...` aborted the installer mid-install. Every uv call
+    # runs under Continue; the $LASTEXITCODE checks below still decide success.
+    $UvErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     $VenvHomeOk = (& node src/install-plan.mjs venv-home-ok 2>$null | Select-Object -Last 1) -eq "ok"
     $VenvRuntimeOk = $false
     if (Test-Path $Python) {
@@ -359,9 +366,9 @@ try {
     if (-not (Test-Path $Python)) {
       if (Test-Path ".venv") {
         Write-Host "The virtual environment's Python launcher is missing; recreating the venv."
-        & uv venv --clear --python 3.12 .venv
+        & uv venv --clear --python 3.12 .venv 2>&1 | Out-Host
       } else {
-        & uv venv --python 3.12 .venv
+        & uv venv --python 3.12 .venv 2>&1 | Out-Host
       }
       if ($LASTEXITCODE -ne 0) { throw "uv could not create the Python environment." }
     } elseif (-not $VenvHomeOk -or -not $VenvRuntimeOk) {
@@ -371,7 +378,7 @@ try {
       # into: the launcher may still exist while pyvenv.cfg points at a
       # vanished home.
       Write-Host "The virtual environment's interpreter home is missing; recreating the venv."
-      & uv venv --clear --python 3.12 .venv
+      & uv venv --clear --python 3.12 .venv 2>&1 | Out-Host
       if ($LASTEXITCODE -ne 0) { throw "uv could not create the Python environment." }
     }
     # requirements/python.txt is the hash-verified transitive closure of the
@@ -379,10 +386,11 @@ try {
     # in that tree verify against the lock before it is executed; without it
     # only the two top-level packages were pinned and the rest was whatever
     # PyPI resolved that day. Regenerate with bin/lock-python, never by hand.
-    & uv pip install --python $Python --require-hashes -r requirements/python.txt
+    & uv pip install --python $Python --require-hashes -r requirements/python.txt 2>&1 | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "LiteLLM installation failed." }
     & node src/install-plan.mjs record python-deps
     if ($LASTEXITCODE -ne 0) { throw "Recording the Python dependency state failed." }
+    $ErrorActionPreference = $UvErrorAction
   } else {
     $VenvHomeOk = (& node src/install-plan.mjs venv-home-ok 2>$null | Select-Object -Last 1) -eq "ok"
     $VenvRuntimeOk = $false
